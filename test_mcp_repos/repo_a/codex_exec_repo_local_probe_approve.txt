@@ -1,1 +1,0 @@
-{"result":"{\"host\": \"gpu-a\", \"repo_root\": \"/net/levsha/scratch2/tingran/github/gpu-mcp/test_mcp_repos/repo_a\", \"returncode\": 0, \"script_path\": \"/net/levsha/scratch2/tingran/github/gpu-mcp/test_mcp_repos/repo_a/jobs/ok_job.py\", \"status\": \"ok\", \"stderr\": \"\", \"stdout\": \"repo-a-ran\\n\"}"}

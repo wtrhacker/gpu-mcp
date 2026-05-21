@@ -1,5 +1,0 @@
-Exact tool result:
-
-```json
-{"result":"{\"host\": \"gpu-b\", \"repo_root\": \"/net/levsha/scratch2/tingran/github/gpu-mcp/test_mcp_repos/repo_b\", \"returncode\": 0, \"script_path\": \"/net/levsha/scratch2/tingran/github/gpu-mcp/test_mcp_repos/repo_b/jobs/ok_job.py\", \"status\": \"ok\", \"stderr\": \"\", \"stdout\": \"repo-b-ran\\n\"}"}
-```

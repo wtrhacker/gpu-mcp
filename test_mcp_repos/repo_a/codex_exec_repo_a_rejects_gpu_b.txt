@@ -1,7 +1,0 @@
-Exact tool result:
-
-```text
-Wall time: 0.0038 seconds
-Output:
-{"result":"{\"error\": \"host not allowed: gpu-b\", \"status\": \"rejected\"}"}
-```

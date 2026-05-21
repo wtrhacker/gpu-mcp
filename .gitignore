@@ -1,8 +1,6 @@
 # Local agent/client state
 .agents/
 /.codex/
-!test_mcp_repos/**/.codex/
-!test_mcp_repos/**/.codex/config.toml
 
 # Local Codex configuration; publish sanitized examples instead.
 /config.toml
@@ -12,7 +10,7 @@
 __pycache__/
 test/**/__pycache__/
 *.py[cod]
-test_mcp_repos/**/codex_exec_pytest_*.txt
+test_mcp_repos/
 
 # Common local environment files
 .env

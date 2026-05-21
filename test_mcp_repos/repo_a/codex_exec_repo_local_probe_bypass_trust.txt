@@ -1,7 +1,0 @@
-Exact tool result:
-
-```text
-Wall time: 0.0006 seconds
-Output:
-[{"type":"text","text":"user cancelled MCP tool call"}]
-```
