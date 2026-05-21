@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "status": "fail",
+  "config_path": "{{GPU_MCP_CONFIG_ABS}}",
+  "repo_root": "{{REPO_ROOT_ABS}}",
+  "generated_at": "{{GENERATED_AT_ISO8601}}",
+  "checks": [
+    {
+      "name": "config_parse",
+      "status": "pass",
+      "host": "",
+      "message": "config parsed"
+    },
+    {
+      "name": "repo_local_mcp_config",
+      "status": "pass",
+      "host": "",
+      "message": "repo-local Codex MCP config validated with codex exec probe"
+    }
+  ]
+}

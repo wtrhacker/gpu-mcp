@@ -1,0 +1,30 @@
+# Repo-local GPU MCP policy template.
+# Installer fills every {{PLACEHOLDER}} before running tests or registering MCP.
+# Public release note: keep this templated; do not commit a lab-specific filled policy.
+
+schema_version = 1
+repo_root = "{{REPO_ROOT_ABS}}"
+
+nodes = [
+  "{{GPU_HOST_1}}",
+  "{{GPU_HOST_2}}",
+]
+
+script_roots = [
+  "{{SCRIPT_ROOT_1}}",
+]
+
+write_roots = [
+  "{{WRITE_ROOT_1}}",
+]
+
+output_roots = [
+  "{{OUTPUT_ROOT_1}}",
+]
+
+allowed_gpu_names = [
+  "{{GPU_NAME_1}}",
+]
+
+min_free_memory_mib = {{MIN_FREE_MEMORY_MIB}}
+sync_timeout_sec = {{SYNC_TIMEOUT_SEC}}

@@ -1,0 +1,14 @@
+[project]
+name = "gpu-mcp"
+version = "0.0.0"
+description = "Config-driven GPU cluster MCP server experiments and contracts."
+requires-python = ">=3.11"
+dependencies = [
+    "mcp",
+]
+
+[project.optional-dependencies]
+test = [
+    "jsonschema",
+    "pytest",
+]

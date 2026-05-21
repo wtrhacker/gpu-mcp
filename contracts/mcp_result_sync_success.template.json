@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "status": "ok",
+  "code": "sync_job_completed",
+  "message": "Python GPU job completed",
+  "details": {
+    "host": "{{GPU_HOST_1}}",
+    "gpu_index": "{{GPU_INDEX}}",
+    "stdout": "{{SYNC_JOB_STDOUT}}"
+  }
+}

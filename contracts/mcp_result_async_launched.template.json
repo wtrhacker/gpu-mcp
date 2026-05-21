@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "status": "ok",
+  "code": "async_job_launched",
+  "message": "Python GPU job launched",
+  "details": {
+    "host": "{{GPU_HOST_1}}",
+    "gpu_index": "{{GPU_INDEX}}",
+    "pid": "{{REMOTE_PID}}",
+    "output_file": "{{OUTPUT_FILE_ABS}}",
+    "launch": "{{LAUNCH_MODE}}"
+  }
+}

@@ -1,0 +1,9 @@
+schema_version = 1
+repo_root = '/net/levsha/scratch2/tingran/github/gpu-mcp/test_mcp_repos/repo_b'
+nodes = ['gpu-b']
+script_roots = ['jobs']
+write_roots = ['results']
+output_roots = ['results']
+allowed_gpu_names = []
+min_free_memory_mib = 0
+sync_timeout_sec = 5

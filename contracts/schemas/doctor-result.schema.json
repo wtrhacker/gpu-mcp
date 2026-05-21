@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/gpu-mcp/doctor-result.schema.json",
+  "title": "GPU MCP Doctor Result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "status",
+    "config_path",
+    "repo_root",
+    "generated_at",
+    "checks"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "status": { "enum": ["pass", "fail"] },
+    "config_path": { "type": "string" },
+    "repo_root": { "type": "string" },
+    "generated_at": { "type": "string" },
+    "checks": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/check" }
+    }
+  },
+  "$defs": {
+    "check": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "status", "host", "message"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "status": { "enum": ["pass", "fail", "skip"] },
+        "host": { "type": "string" },
+        "message": { "type": "string" },
+        "details": {
+          "type": "object",
+          "additionalProperties": {
+            "type": ["string", "number", "boolean", "null"]
+          }
+        }
+      }
+    }
+  }
+}

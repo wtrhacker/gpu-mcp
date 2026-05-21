@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "status": "error",
+  "code": "host_not_allowed",
+  "message": "{{HOST_NOT_ALLOWED}} is not allowed by repo policy",
+  "details": {
+    "host": "{{HOST_NOT_ALLOWED}}",
+    "config_path": "{{GPU_MCP_CONFIG_ABS}}"
+  }
+}

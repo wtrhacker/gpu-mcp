@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/gpu-mcp/mcp-result.schema.json",
+  "title": "GPU MCP Structured Result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "status", "code", "message", "details"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "status": { "enum": ["ok", "error"] },
+    "code": { "type": "string" },
+    "message": { "type": "string" },
+    "details": {
+      "type": "object",
+      "additionalProperties": {
+        "type": ["string", "number", "boolean", "null"]
+      }
+    }
+  }
+}

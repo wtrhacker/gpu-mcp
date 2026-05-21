@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/gpu-mcp/bootstrap-inventory.schema.json",
+  "title": "GPU MCP Bootstrap Host Inventory",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "generated_at",
+    "generated_by",
+    "ssh_user",
+    "key_path",
+    "key_fingerprint",
+    "hosts"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "generated_at": { "type": "string" },
+    "generated_by": { "type": "string" },
+    "ssh_user": { "type": "string", "minLength": 1 },
+    "key_path": { "type": "string", "minLength": 1 },
+    "key_fingerprint": { "type": "string", "minLength": 1 },
+    "hosts": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/host" }
+    }
+  },
+  "$defs": {
+    "host": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "host",
+        "status",
+        "remote_hostname",
+        "host_key_checked",
+        "verified_at",
+        "error"
+      ],
+      "properties": {
+        "host": { "type": "string", "minLength": 1 },
+        "status": { "enum": ["verified", "failed"] },
+        "remote_hostname": { "type": "string" },
+        "host_key_checked": { "type": "boolean" },
+        "verified_at": { "type": "string" },
+        "error": { "type": "string" }
+      }
+    }
+  }
+}

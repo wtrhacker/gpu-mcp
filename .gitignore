@@ -1,0 +1,20 @@
+# Local agent/client state
+.agents/
+/.codex/
+!test_mcp_repos/**/.codex/
+!test_mcp_repos/**/.codex/config.toml
+
+# Local Codex configuration; publish sanitized examples instead.
+/config.toml
+
+# Runtime logs and caches
+.gpu_mcp_logs/
+__pycache__/
+test/**/__pycache__/
+*.py[cod]
+test_mcp_repos/**/codex_exec_pytest_*.txt
+
+# Common local environment files
+.env
+.venv/
+venv/

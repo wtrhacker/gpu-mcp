@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "generated_at": "{{GENERATED_AT_ISO8601}}",
+  "generated_by": "gpu_mcp_bootstrap_ssh.py",
+  "ssh_user": "{{SSH_USER}}",
+  "key_path": "{{GPU_MCP_SSH_KEY_ABS}}",
+  "key_fingerprint": "{{GPU_MCP_SSH_KEY_FINGERPRINT}}",
+  "hosts": [
+    {
+      "host": "{{GPU_HOST_1}}",
+      "status": "verified",
+      "remote_hostname": "{{GPU_HOST_1_REMOTE_HOSTNAME}}",
+      "host_key_checked": true,
+      "verified_at": "{{HOST_1_VERIFIED_AT_ISO8601}}",
+      "error": ""
+    },
+    {
+      "host": "{{GPU_HOST_2}}",
+      "status": "failed",
+      "remote_hostname": "",
+      "host_key_checked": false,
+      "verified_at": "{{HOST_2_VERIFIED_AT_ISO8601}}",
+      "error": "{{HOST_2_ERROR}}"
+    }
+  ]
+}
