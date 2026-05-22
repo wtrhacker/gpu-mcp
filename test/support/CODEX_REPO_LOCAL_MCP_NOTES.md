@@ -50,7 +50,10 @@ host: gpu-b
 repo root: test_mcp_repos/repo_b
 ```
 
-Both repo-local Codex configs register the lightweight MCP server:
+Both repo-local Codex configs register the lightweight test proxy. These
+historical fixture names are test-only; the production GPU MCP server name is
+`gpu-cluster-mcp` in every repo, with repo-specific behavior coming only from
+the `--config` path.
 
 ```toml
 [mcp_servers.repo-a-gpu-probe]
@@ -70,7 +73,7 @@ approval_mode = "approve"
 ```
 
 Repo B uses the same shape, but points to repo B's config and uses the server
-name `repo-b-gpu-probe`.
+name `repo-b-gpu-probe` for proxy-test isolation only.
 
 ## Results
 

@@ -23,13 +23,7 @@ import importlib
 import pytest
 
 
-pytestmark = [
-    pytest.mark.contract,
-    pytest.mark.xfail(
-        reason="Codex raw remote command ban validation is not implemented yet",
-        strict=True,
-    ),
-]
+pytestmark = pytest.mark.contract
 
 
 @pytest.fixture()

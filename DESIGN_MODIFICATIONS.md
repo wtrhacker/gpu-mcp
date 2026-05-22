@@ -146,7 +146,9 @@ check objects as JSON so the AI and human see the same facts.
 Deliverables:
 
 - Rewrite `GPU_MCP_README.md` into a public setup guide.
-- Keep a clear local-plus-remote MCP probe requirement.
+- Keep a clear distinction between optional local smoke checks and required
+  remote end-to-end acceptance. Local-only MCP probes do not prove install
+  success.
 - Explain the safety model without overselling it.
 
 Acceptance criteria:
@@ -307,10 +309,16 @@ repo-local Codex config. The entry should start the server with:
 --config /absolute/path/to/that/repo/gpu-mcp.toml
 ```
 
+The new implementation uses one stable MCP server name everywhere:
+`gpu-cluster-mcp`. Every repo-local `.codex/config.toml` uses that exact name;
+repo-specific behavior comes only from the `--config` path. Do not create
+per-repo names such as `gpu-cluster-mcp-a`, and do not reuse the legacy
+`gpu-cluster` entry during migration or testing.
+
 The required tool approval mode for noninteractive `codex exec` probes is:
 
 ```toml
-[mcp_servers.<server>.tools.run_python_on_gpu]
+[mcp_servers.gpu-cluster-mcp.tools.run_python_on_gpu]
 approval_mode = "approve"
 ```
 
@@ -454,8 +462,12 @@ The README should tell an AI agent to:
 13. Create a repo-local `gpu-mcp.toml` in the confirmed research repo.
 14. Configure repo-local MCP client config so this repo starts the server with
     `--config /absolute/path/to/gpu-mcp.toml`.
-15. Run local and remote probes through the MCP tools.
-16. Update `progress.md` after every completed step or blocker.
+15. Optionally run a local MCP smoke probe to catch configuration mistakes.
+16. Run required remote acceptance through `codex exec` and the real installed
+    MCP on a non-local host verified by bootstrap.
+17. Run a required policy-rejection probe, such as a job that attempts to write
+    outside approved write roots.
+18. Update `progress.md` after every completed step or blocker.
 
 Safety-relevant values should be approved by the human. Non-critical defaults should be automatic.
 

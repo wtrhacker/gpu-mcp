@@ -25,13 +25,7 @@ import jsonschema
 import pytest
 
 
-pytestmark = [
-    pytest.mark.contract,
-    pytest.mark.xfail(
-        reason="AI-facing doctor implementation is not written yet",
-        strict=True,
-    ),
-]
+pytestmark = pytest.mark.contract
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FIXTURE_ROOT = REPO_ROOT / "test_mcp_repos" / "doctor_contract"
@@ -80,7 +74,7 @@ def _write_codex_config(repo: Path, config_path: Path, *, approval_mode: str = "
     codex_config.write_text(
         "\n".join(
             [
-                "[mcp_servers.gpu-cluster]",
+                "[mcp_servers.gpu-cluster-mcp]",
                 'command = "/usr/bin/python3"',
                 "args = [",
                 '  "/opt/gpu-mcp/gpu_mcp_server.py",',
@@ -91,7 +85,7 @@ def _write_codex_config(repo: Path, config_path: Path, *, approval_mode: str = "
                 "startup_timeout_sec = 20",
                 "tool_timeout_sec = 10",
                 "",
-                "[mcp_servers.gpu-cluster.tools.run_python_on_gpu]",
+                "[mcp_servers.gpu-cluster-mcp.tools.run_python_on_gpu]",
                 f"approval_mode = {approval_mode!r}",
                 "",
             ]
@@ -132,6 +126,16 @@ def test_doctor_cli_has_one_check_command_with_absolute_config(
     assert args.json is True
 
 
+def test_doctor_main_uses_provided_cli_arguments(doctor_module, repo_fixture, capsys):
+    config = _write_policy(repo_fixture)
+
+    exit_code = doctor_module.main(["check", "--config", str(config), "--json"])
+
+    assert exit_code == 0
+    result = json.loads(capsys.readouterr().out)
+    _assert_doctor_result(result, status="pass")
+
+
 def test_doctor_cli_rejects_old_mcp_config_subcommand(doctor_module):
     with pytest.raises(doctor_module.DoctorError, match="check|mcp-config"):
         doctor_module.parse_cli_args(["mcp-config", "--client", "codex"])
@@ -147,7 +151,7 @@ def test_doctor_validates_repo_local_codex_config_points_to_policy(
 
     assert result["status"] == "ok"
     assert result["config_path"] == str(config)
-    assert result["server_name"] == "gpu-cluster"
+    assert result["server_name"] == "gpu-cluster-mcp"
 
 
 def test_doctor_rejects_global_or_stale_fixed_repo_mcp_config(
@@ -160,6 +164,17 @@ def test_doctor_rejects_global_or_stale_fixed_repo_mcp_config(
     _write_codex_config(repo_fixture, stale_config)
 
     with pytest.raises(doctor_module.DoctorError, match="stale|repo"):
+        doctor_module.validate_repo_local_codex_config(repo_fixture, config)
+
+
+def test_doctor_requires_stable_gpu_cluster_mcp_server_name(
+    doctor_module, repo_fixture
+):
+    config = _write_policy(repo_fixture)
+    codex_config = _write_codex_config(repo_fixture, config)
+    codex_config.write_text(codex_config.read_text().replace("gpu-cluster-mcp", "repo-a-gpu-probe"))
+
+    with pytest.raises(doctor_module.DoctorError, match="gpu-cluster-mcp"):
         doctor_module.validate_repo_local_codex_config(repo_fixture, config)
 
 
@@ -179,7 +194,7 @@ def test_doctor_uses_codex_exec_probe_not_codex_mcp_list(doctor_module, repo_fix
 
     result = doctor_module.run_codex_mcp_probe(
         repo=repo_fixture,
-        tool_name="gpu-cluster/run_python_on_gpu",
+        tool_name="gpu-cluster-mcp/run_python_on_gpu",
         expected_repo_root=repo_fixture,
         codex_runner={
             "mcp_list": "Name gpu-cluster /old/global/path",
@@ -206,7 +221,7 @@ def test_doctor_rejects_probe_when_codex_exec_returns_wrong_repo(
     with pytest.raises(doctor_module.DoctorError, match="repo"):
         doctor_module.run_codex_mcp_probe(
             repo=repo_fixture,
-            tool_name="gpu-cluster/run_python_on_gpu",
+            tool_name="gpu-cluster-mcp/run_python_on_gpu",
             expected_repo_root=repo_fixture,
             codex_runner={
                 "exec_result": {

@@ -27,8 +27,9 @@ Configured hosts:
 - [ ] Repo-local Codex MCP config installed
 - [ ] Codex restarted or reloaded after MCP config change
 - [ ] `codex exec` probe sees and can call the repo-local MCP tool
-- [ ] Local probe succeeded through MCP
-- [ ] Remote probe succeeded through MCP
+- [ ] Optional local smoke probe succeeded through MCP, if run
+- [ ] Required remote acceptance probe succeeded through real `codex exec`
+- [ ] Required policy-rejection probe blocked unsafe work
 
 ## Blockers
 
@@ -38,4 +39,4 @@ None yet.
 
 Local:
 Remote:
-
+Policy rejection:

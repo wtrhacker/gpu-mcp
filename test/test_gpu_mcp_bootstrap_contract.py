@@ -24,13 +24,7 @@ import jsonschema
 import pytest
 
 
-pytestmark = [
-    pytest.mark.contract,
-    pytest.mark.xfail(
-        reason="human-first bootstrap contract is not implemented yet",
-        strict=True,
-    ),
-]
+pytestmark = pytest.mark.contract
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FIXTURE_ROOT = REPO_ROOT / "test_mcp_repos" / "bootstrap_contract"

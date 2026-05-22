@@ -15,7 +15,33 @@ import sys, os, json, time, subprocess, re, shlex, ast, runpy, builtins, io, has
 from pathlib import Path
 from typing import Optional
 
+from gpu_mcp_config import ConfigError, GpuMcpPolicy, load_policy
+
 # ── Constants ────────────────────────────────────────────────────────────────
+
+
+def _pop_config_arg(argv: list[str]) -> str:
+    """Remove server-level --config before FastMCP sees argv."""
+    if "--config" not in argv:
+        return os.environ.get("GPU_MCP_CONFIG", "").strip()
+    index = argv.index("--config")
+    try:
+        value = argv[index + 1]
+    except IndexError:
+        print("ERROR: --config requires an absolute gpu-mcp.toml path", file=sys.stderr)
+        raise SystemExit(2)
+    del argv[index : index + 2]
+    return value
+
+
+GPU_MCP_CONFIG_PATH = _pop_config_arg(sys.argv)
+CONFIG_POLICY: GpuMcpPolicy | None = None
+if GPU_MCP_CONFIG_PATH:
+    try:
+        CONFIG_POLICY = load_policy(Path(GPU_MCP_CONFIG_PATH).expanduser())
+    except ConfigError as exc:
+        print(f"ERROR: invalid GPU MCP config: {exc}", file=sys.stderr)
+        raise SystemExit(2)
 
 REPO_ROOT = Path(__file__).resolve().parent
 PYTHON = os.environ.get("GPU_MCP_PYTHON", "").strip() or sys.executable
@@ -221,6 +247,15 @@ NODES = [
     "kulibin.mit.edu",
     "stevens.mit.edu",
 ]
+
+if CONFIG_POLICY is not None:
+    REPO_ROOT = CONFIG_POLICY.repo_root
+    NODES = list(CONFIG_POLICY.nodes)
+    APPROVED_SCRIPT_ROOTS = list(CONFIG_POLICY.script_roots)
+    APPROVED_WRITE_ROOTS = list(CONFIG_POLICY.write_roots)
+    APPROVED_OUTPUT_ROOTS = list(CONFIG_POLICY.output_roots)
+    GPU_MCP_WRITE_ROOTS_RAW = os.pathsep.join(str(path) for path in APPROVED_WRITE_ROOTS)
+SYNC_TIMEOUT_SEC = CONFIG_POLICY.sync_timeout_sec if CONFIG_POLICY is not None else 300
 
 SSH_CONNECT_TIMEOUT = 8
 
@@ -692,6 +727,8 @@ def _gpu_job_env(gpu_index: int) -> dict[str, str]:
     }
     if GPU_MCP_WRITE_ROOTS_RAW:
         env["GPU_MCP_WRITE_ROOTS"] = GPU_MCP_WRITE_ROOTS_RAW
+    if GPU_MCP_CONFIG_PATH:
+        env["GPU_MCP_CONFIG"] = str(Path(GPU_MCP_CONFIG_PATH).expanduser().resolve())
     return env
 
 
@@ -1288,7 +1325,7 @@ def run_python_on_gpu(
                     check=False,
                     capture_output=True,
                     text=True,
-                    timeout=300,
+                    timeout=SYNC_TIMEOUT_SEC,
                     env=env,
                     cwd=str(REPO_ROOT),
                 )
@@ -1305,7 +1342,7 @@ def run_python_on_gpu(
             result = c.run(
                 _remote_repo_command(f"env {env_prefix} {command}"),
                 hide=True,
-                timeout=300,
+                timeout=SYNC_TIMEOUT_SEC,
             )
             return result.stdout
         except Exception as e:

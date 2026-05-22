@@ -20,13 +20,7 @@ from dataclasses import dataclass
 import pytest
 
 
-pytestmark = [
-    pytest.mark.contract,
-    pytest.mark.xfail(
-        reason="config-driven kill_gpu_process implementation is not written yet",
-        strict=True,
-    ),
-]
+pytestmark = pytest.mark.contract
 
 
 @dataclass(frozen=True)

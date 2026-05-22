@@ -18,13 +18,7 @@ import importlib
 import pytest
 
 
-pytestmark = [
-    pytest.mark.contract,
-    pytest.mark.xfail(
-        reason="Codex protected-probe file mutation guard is not written yet",
-        strict=True,
-    ),
-]
+pytestmark = pytest.mark.contract
 
 
 @pytest.fixture()
