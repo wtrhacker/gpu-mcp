@@ -84,6 +84,9 @@ Policy mutation and policy activation are separate operations:
 - If the human rejects the preview, the agent calls `reject_policy_reload` or
   the implementation's equivalent token-discard path, then stops. A rejected
   token is invalidated and cannot later be used for reload.
+- If the human asks to replace a rejected inactive candidate, the hook should
+  allow a narrow direct edit of `gpu-mcp.toml` while continuing to block normal
+  GPU work. The agent must preview the edited candidate again before reload.
 
 The optional Codex hook is an agent-workflow layer. It catches policy edits
 early, interrupts confused agent behavior, and tells the agent what to do next.
@@ -168,6 +171,8 @@ Allowed while stale:
 - `preview_policy_reload`;
 - `reload_policy` with a valid token;
 - `reject_policy_reload` or the implementation's equivalent token-discard path;
+- a narrow direct edit of `gpu-mcp.toml` when the human explicitly asks to
+  replace the inactive candidate;
 - a future `policy_status`-style diagnostic that only explains the active hash,
   file hash, and next procedural step.
 
@@ -225,7 +230,9 @@ The same-session policy maintenance flow is:
 6. If the human rejects it, the agent calls `reject_policy_reload(token=...)`
    or the implementation's equivalent token-discard path, does not reload, and
    stops. The candidate file remains inactive until the human edits, reverts, or
-   asks for a new preview.
+   asks for a new preview. If the human asks to supersede the candidate, the
+   hook may allow a narrow direct edit of `gpu-mcp.toml`; the agent then calls
+   `preview_policy_reload` again.
 7. If the human approves it, the agent calls `reload_policy(token=...)`.
 8. Server verifies that the current file hash still matches the previewed hash.
 9. Server records the approved hash and audit history.
@@ -320,6 +327,13 @@ A Codex hook should be small, final-purpose, and workflow-oriented:
   `preview_policy_reload` only if the human intended the edit;
 - allow recovery tools such as `preview_policy_reload`, `reload_policy`, and
   `reject_policy_reload` while stale;
+- allow a narrow direct edit of `gpu-mcp.toml` while stale when the human asks
+  to replace the inactive candidate;
+  This exception must be target-based, not tool-name-only: structured edit
+  events may carry `file_path`, while patch-style events may carry the patch
+  body as `patch`, `cmd`, top-level `command`, or a raw string. The hook should
+  allow the edit only when every touched file resolves to the discovered
+  `gpu-mcp.toml`;
 - tell the agent not to revert the policy file silently and not to keep trying
   cluster actions until the human has reviewed the state;
 - include the human-edited versus Codex-edited branch in the hook output,
@@ -475,6 +489,15 @@ policy by itself.
 
 Rejected because it lets a policy edit become active without a checkpoint. That
 is exactly the bypass shape the policy system is meant to prevent.
+
+### MCP Tool For Candidate Editing
+
+Rejected after live testing. A special MCP tool for rewriting the inactive
+candidate was more complex than the problem: new MCP tools are not available in
+already-running Codex sessions, and a fresh MCP server may refuse startup while
+`gpu-mcp.toml` is stale. The correct recovery path is hook-level: keep normal
+GPU work blocked while stale, but allow a narrowly targeted edit of
+`gpu-mcp.toml` itself, followed by a fresh `preview_policy_reload`.
 
 ### Hook As Security Boundary
 

@@ -89,6 +89,8 @@ What it proves:
   human approval checkpoint;
 - the hook allows `preview_policy_reload`, `reload_policy`, and
   `reject_policy_reload` to run while stale so the agent can recover;
+- the hook allows a narrow direct edit of `gpu-mcp.toml` while stale, so a
+  rejected inactive candidate can be replaced without activating it first;
 - when the policy file is approved, the hook emits no replacement JSON.
 
 Recent focused run:
@@ -158,17 +160,27 @@ continue. The current safe behavior is still to block normal GPU work while
 stale, but the recovery design should allow the rejected candidate to be
 discarded or superseded without activating it.
 
-Desired follow-up behavior:
+Implemented follow-up behavior:
 
 - `reject_policy_reload` invalidates the pending token and leaves the active
   policy unchanged;
 - stale-policy blocking continues to refuse normal GPU/cluster work;
-- the recovery surface should include a narrow way to discard or supersede the
-  inactive candidate, or should clearly route that step to a human file edit;
-- any superseded candidate invalidates older reload tokens and requires a fresh
-  `preview_policy_reload`;
+- the hook allows a narrow direct edit of `gpu-mcp.toml` to supersede an
+  inactive candidate without activating the rejected one;
+- the hook must recognize the edit target across the event shapes Codex has
+  used in practice: structured `file_path` edit payloads, patch payloads in
+  `patch`/`cmd`, top-level `command`, and raw string patch bodies;
+- the allow rule is target-based: every touched path must resolve to the
+  discovered `gpu-mcp.toml`; mixed patches or edits to other files still block;
+- any superseded candidate requires a fresh `preview_policy_reload`;
 - the agent must not call `reload_policy` for a rejected/cancelled candidate
   unless the human explicitly approves that exact preview again.
+
+A short-lived alternative was a dedicated MCP tool to rewrite the inactive
+candidate. That was dropped: it was harder to reason about, required MCP schema
+refresh in running sessions, and did not solve fresh-start stale-policy refusal.
+The final solution is smaller: let the hook permit only the policy-file edit,
+then return to preview/reload.
 
 ## Modality 4: Headless Codex Hook Behavior
 
@@ -216,8 +228,8 @@ The current design keeps the approval boundary narrow:
 
 The repo-local `.codex/config.toml` and setup docs put the required human
 prompt on `reload_policy`. `preview_policy_reload` and `reject_policy_reload`
-are not the security checkpoint, although a client UI may still ask the human to
-confirm those tool calls as conservative friction.
+are not the activation checkpoint, although a client UI may still ask the human
+to confirm those tool calls as conservative friction.
 
 ## Final Acceptance Checks
 

@@ -102,6 +102,7 @@ def test_policy_hook_finds_policy_from_subdirectory_and_blocks_stale_policy(tmp_
     assert "Do not revert it" in reason
     assert "If the human edited this file" in reason
     assert "If you edited this file" in reason
+    assert "Only edit gpu-mcp.toml while stale after explicit human rejection" in reason
     assert "preview_policy_reload" in reason
     assert "only if they want to proceed" not in reason
 
@@ -123,6 +124,125 @@ def test_policy_hook_allows_reload_tools_while_policy_is_stale(tmp_path):
         "mcp__gpu_cluster_mcp__reject_policy_reload",
     ):
         assert hook.check_policy_drift(repo, store_path=store, tool_name=tool_name) is None
+
+
+def test_policy_hook_allows_narrow_policy_file_edit_while_stale(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    config = _write_config(repo)
+    store = tmp_path / "approved-policies.json"
+    approval = importlib.import_module("gpu_mcp_policy_approval")
+    policy = importlib.import_module("gpu_mcp_config").load_policy(config)
+    approval.approve_policy(policy, store_path=store, diff_summary=["initial approval"])
+    config.write_text(config.read_text().replace("nodes = ['gpu-a']", "nodes = ['gpu-a', 'gpu-b']"))
+    hook = importlib.import_module("gpu_mcp_policy_hook")
+
+    allowed = hook.check_policy_drift(
+        repo,
+        store_path=store,
+        tool_name="Edit",
+        tool_input={"file_path": str(config)},
+    )
+    blocked = hook.check_policy_drift(
+        repo,
+        store_path=store,
+        tool_name="Edit",
+        tool_input={"file_path": str(repo / "README.md")},
+    )
+
+    assert allowed is None
+    assert blocked is not None
+    assert blocked["decision"] == "block"
+
+
+def test_policy_hook_allows_patch_event_for_policy_file_only_while_stale(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    config = _write_config(repo)
+    store = tmp_path / "approved-policies.json"
+    approval = importlib.import_module("gpu_mcp_policy_approval")
+    policy = importlib.import_module("gpu_mcp_config").load_policy(config)
+    approval.approve_policy(policy, store_path=store, diff_summary=["initial approval"])
+    config.write_text(config.read_text().replace("nodes = ['gpu-a']", "nodes = ['gpu-a', 'gpu-b']"))
+    hook = importlib.import_module("gpu_mcp_policy_hook")
+
+    allowed = hook.check_policy_drift(
+        repo,
+        store_path=store,
+        tool_name="functions.apply_patch",
+        tool_input={
+            "patch": "*** Begin Patch\n*** Update File: gpu-mcp.toml\n@@\n*** End Patch\n"
+        },
+    )
+    blocked = hook.check_policy_drift(
+        repo,
+        store_path=store,
+        tool_name="functions.apply_patch",
+        tool_input={
+            "patch": "*** Begin Patch\n*** Update File: README.md\n@@\n*** End Patch\n"
+        },
+    )
+
+    assert allowed is None
+    assert blocked is not None
+    assert blocked["decision"] == "block"
+
+
+def test_policy_hook_main_allows_top_level_patch_command_for_policy_file_while_stale(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    config = _write_config(repo)
+    store = tmp_path / "approved-policies.json"
+    approval = importlib.import_module("gpu_mcp_policy_approval")
+    policy = importlib.import_module("gpu_mcp_config").load_policy(config)
+    approval.approve_policy(policy, store_path=store, diff_summary=["initial approval"])
+    config.write_text(config.read_text().replace("nodes = ['gpu-a']", "nodes = ['gpu-a', 'gpu-b']"))
+
+    completed = subprocess.run(
+        [sys.executable, str(HOOK), "--store", str(store)],
+        input=json.dumps({
+            "hook_event_name": "PreToolUse",
+            "cwd": str(repo),
+            "tool_name": "apply_patch",
+            "command": "*** Begin Patch\n*** Update File: gpu-mcp.toml\n@@\n*** End Patch\n",
+        }),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+    assert completed.returncode == 0
+    assert completed.stdout == ""
+
+
+def test_policy_hook_allows_raw_string_patch_input_for_policy_file_while_stale(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    config = _write_config(repo)
+    store = tmp_path / "approved-policies.json"
+    approval = importlib.import_module("gpu_mcp_policy_approval")
+    policy = importlib.import_module("gpu_mcp_config").load_policy(config)
+    approval.approve_policy(policy, store_path=store, diff_summary=["initial approval"])
+    config.write_text(config.read_text().replace("nodes = ['gpu-a']", "nodes = ['gpu-a', 'gpu-b']"))
+    hook = importlib.import_module("gpu_mcp_policy_hook")
+
+    allowed = hook.check_policy_drift(
+        repo,
+        store_path=store,
+        tool_name="apply_patch",
+        tool_input="*** Begin Patch\n*** Update File: gpu-mcp.toml\n@@\n*** End Patch\n",
+    )
+    blocked = hook.check_policy_drift(
+        repo,
+        store_path=store,
+        tool_name="apply_patch",
+        tool_input="*** Begin Patch\n*** Update File: gpu-mcp.toml\n*** Update File: README.md\n@@\n*** End Patch\n",
+    )
+
+    assert allowed is None
+    assert blocked is not None
+    assert blocked["decision"] == "block"
 
 
 def test_policy_hook_search_is_bounded(tmp_path):

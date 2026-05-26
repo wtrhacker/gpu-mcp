@@ -208,6 +208,11 @@ Intentional same-session policy edits must use the explicit reload flow:
 4. call `reload_policy` with the returned token only after explicit approval,
    or call `reject_policy_reload` if the human rejects the candidate.
 
+If the human rejects or cancels a candidate and then asks for a different
+candidate, make only the requested `gpu-mcp.toml` edit and return to
+`preview_policy_reload`. Do not activate the rejected candidate just to make
+another edit.
+
 Do not edit policy as a workaround inside a blocked GPU task.
 
 ## 5. Local MCP Probe

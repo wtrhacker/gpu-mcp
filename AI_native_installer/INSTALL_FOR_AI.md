@@ -45,9 +45,10 @@ Install flow:
 10. Ensure `run_python_on_gpu` and `kill_gpu_process` use
    `approval_mode = "approve"`, while `reload_policy` uses
    `approval_mode = "prompt"`. For the policy-edit flow, `reload_policy` is
-   the human approval checkpoint; Codex shows that prompt only in the human UI,
-   and the agent only sees the MCP result after approval. `preview_policy_reload`
-   and `reject_policy_reload` should remain callable for recovery while stale.
+   the policy activation checkpoint; Codex shows that prompt only in the human
+   UI, and the agent only sees the MCP result after approval.
+   `preview_policy_reload` and `reject_policy_reload` should remain callable
+   for recovery while stale.
 11. Add the repo-local `PreToolUse` and `PostToolUse` hooks that run
     `gpu_mcp_policy_hook.py`, then ask the human to review and trust them in
     Codex. Treat the hooks as agent guidance; the server remains the policy
@@ -68,4 +69,6 @@ for a policy change, treat that as a separate policy-edit task: propose the
 diff, call `preview_policy_reload`, show the raw preview output including
 `diff_summary` and hashes, get explicit approval, and call `reload_policy`
 before continuing GPU work. If the human rejects the candidate, call
-`reject_policy_reload` and stop that policy-edit task.
+`reject_policy_reload` and stop that policy-edit task. If the human then asks
+for a different candidate, make only the requested `gpu-mcp.toml` edit and show
+its fresh preview instead of activating the rejected candidate.
