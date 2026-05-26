@@ -134,6 +134,42 @@ sound like the agent should ask before preview. That was too slow and not the
 right boundary. The runtime text and ADR were changed so the agent previews
 immediately and asks only before `reload_policy`.
 
+### Rejected Candidate Superseding
+
+Another live walkthrough intentionally cancelled the `reload_policy` approval
+after a comment-only policy edit had already been previewed. The important
+positive observation was that broad normal work stayed blocked while the policy
+file was stale against the active server hash. That is the intended safety
+posture from ADR 0002's stale-policy refusal section.
+
+The weaker UX was the recovery path after cancellation:
+
+```text
+policy edit -> preview succeeds -> human cancels reload
+-> policy file remains stale against the active hash
+-> normal reads/edits/tools are blocked by the hook
+-> agent is pressured to activate the rejected candidate before making a new
+   candidate edit
+```
+
+That pressure is not the desired long-term workflow. A cancelled or rejected
+reload means the candidate must not become active merely so the agent can
+continue. The current safe behavior is still to block normal GPU work while
+stale, but the recovery design should allow the rejected candidate to be
+discarded or superseded without activating it.
+
+Desired follow-up behavior:
+
+- `reject_policy_reload` invalidates the pending token and leaves the active
+  policy unchanged;
+- stale-policy blocking continues to refuse normal GPU/cluster work;
+- the recovery surface should include a narrow way to discard or supersede the
+  inactive candidate, or should clearly route that step to a human file edit;
+- any superseded candidate invalidates older reload tokens and requires a fresh
+  `preview_policy_reload`;
+- the agent must not call `reload_policy` for a rejected/cancelled candidate
+  unless the human explicitly approves that exact preview again.
+
 ## Modality 4: Headless Codex Hook Behavior
 
 This was tested with `codex exec` to understand what hooks can and cannot do in
