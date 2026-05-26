@@ -6,11 +6,9 @@ These tests port the useful parts of the stale hard-coded server tests into the
 future config-driven API. They do not require a launch registry for v1; the v1
 contract is owner check plus fingerprint confirmation before signaling.
 
-Expected future API:
-
-- `gpu_mcp_kill.KillPolicyError`
-- `gpu_mcp_kill.inspect_gpu_process(policy, host, pid, remote_runner) -> dict`
-- `gpu_mcp_kill.kill_gpu_process(policy, host, pid, fingerprint=None, signal="TERM", remote_runner=...) -> dict`
+These deterministic tests use `support.kill_policy_contract_helper`.
+The real battlefield suite exercises the live MCP tool implemented in
+`gpu_mcp_server.py`.
 """
 
 import importlib
@@ -31,7 +29,7 @@ class KillPolicy:
 
 @pytest.fixture()
 def kill_module():
-    return importlib.import_module("gpu_mcp_kill")
+    return importlib.import_module("support.kill_policy_contract_helper")
 
 
 def test_kill_inspects_owned_process_without_signal(kill_module):

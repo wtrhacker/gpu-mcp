@@ -9,6 +9,7 @@ Initial commands:
 ```bash
 python gpu_mcp_doctor.py check --config /absolute/path/to/repo/gpu-mcp.toml
 python gpu_mcp_doctor.py check --config /absolute/path/to/repo/gpu-mcp.toml --json
+python gpu_mcp_doctor.py approve-policy --config /absolute/path/to/repo/gpu-mcp.toml --yes
 ```
 
 `--config` is required and must be absolute. Doctor derives `repo_root` from
@@ -17,7 +18,13 @@ match the same repo. v1 should not expose separate `preflight`, `ssh`,
 `nvidia`, or `mcp-config` public commands; those are internal check names in
 the JSON result.
 
-Required checks:
+Default `check` output must be honest about what it did and did not prove. It
+always validates local config, approval state, repo-local Codex config, and
+timeout alignment. Live remote/Codex checks that require site state should be
+reported as `skip` unless the caller supplies the needed probe inputs or runs a
+full acceptance flow.
+
+Readiness checks:
 
 - config parsing and path policy;
 - dedicated-key SSH for configured hosts;
@@ -29,6 +36,12 @@ Required checks:
 - blocked `codex exec` probes for those commands when approvals are disabled;
 - no raw-command probe may include `--ignore-rules`;
 - client `tool_timeout_sec > sync_timeout_sec`.
+
+`approve-policy` is the explicit human approval checkpoint for a repo policy.
+It validates the policy, writes the approved hash and audit history to
+`~/gpu-mcp/state/approved-policies.json`, and lets the MCP server start or
+reload that policy. It should be run only after the human has reviewed the
+safety-relevant policy values.
 
 Doctor JSON should be stable:
 

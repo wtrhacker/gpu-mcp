@@ -1,51 +1,61 @@
 # GPU MCP Setup
 
-This is the complete install test for `gpu-cluster`, a Codex stdio MCP server that runs approved Python files on GPUs mounted on the same shared filesystem.
+This is the setup guide for `gpu-cluster-mcp`, a Codex stdio MCP server that
+runs approved Python files on GPU hosts mounted on the same shared filesystem.
 
-It is written for a fresh Unix account where nothing about Codex MCP, SSH keys, or the Python environment should be assumed to already work.
+The AI-native installer entry point is
+`AI_native_installer/INSTALL_FOR_AI.md`. This README is the human-facing
+overview and should not be treated as a replacement for the installer
+checklist.
 
-The agent installing this must prove two things:
+The install must prove two things:
 
-1. `localhost` probe works through MCP.
-2. one non-local GPU host probe works through MCP.
+1. Repo-local Codex config can load the MCP with this repo's `gpu-mcp.toml`.
+2. At least one non-local GPU host works through MCP.
 
-Do not mark the install complete after only `localhost`.
+Do not mark the install complete after only a local smoke probe.
 
 ## 0. Values
 
-For this repo:
+There are two locations:
 
 ```text
-REPO=/net/levsha/scratch2/tingran/test_repo
-PY=/home/tingran/miniconda3/bin/python
-SERVER=/net/levsha/scratch2/tingran/test_repo/gpu_mcp_server.py
-PROBE=/net/levsha/scratch2/tingran/test_repo/gpu_mcp_probe.py
+GPU_MCP_INSTALL=/home/USER/gpu-mcp
+RESEARCH_REPO=/shared/path/to/research-repo
+PY=/absolute/path/to/python
+SERVER=/home/USER/gpu-mcp/gpu_mcp_server.py
+BOOTSTRAP=/home/USER/gpu-mcp/gpu_mcp_bootstrap.py
 KEY=~/.ssh/gpu_mcp_key
-BOOTSTRAP=/net/levsha/scratch2/tingran/test_repo/gpu_mcp_bootstrap_ssh.py
+INVENTORY=~/.cache/gpu-mcp/bootstrap_hosts.json
 ```
 
-For another repo or user, replace these values everywhere. The `PY` executable must have `mcp`, `fabric`, `paramiko`, and the GPU library used by jobs available. The remote host names must also be listed in `NODES` inside `gpu_mcp_server.py`.
+The MCP code is installed once. Each research repo gets its own
+`gpu-mcp.toml` and `.codex/config.toml`.
+
+The `PY` executable must have the runtime dependencies for the MCP server and
+the GPU libraries needed by jobs. Hostnames are not hard-coded in Python; they
+come from the human bootstrap inventory and the repo-local `gpu-mcp.toml`.
 
 ## 1. Python Preflight
 
 Run on the control host, meaning the machine where Codex itself is running:
 
 ```bash
-cd /net/levsha/scratch2/tingran/test_repo
-/home/tingran/miniconda3/bin/python -c "import mcp.server.fastmcp; import fabric; import paramiko; import gpu_mcp_server; print('gpu_mcp_server imports OK')"
-/home/tingran/miniconda3/bin/python -m py_compile gpu_mcp_server.py gpu_mcp_probe.py gpu_mcp_bootstrap_ssh.py
+cd "$GPU_MCP_INSTALL"
+"$PY" -c "import mcp.server.fastmcp; import paramiko; import fabric; print('GPU MCP Python deps OK')"
+"$PY" -m py_compile gpu_mcp_server.py gpu_mcp_bootstrap.py
 ```
 
 Required output:
 
 ```text
-gpu_mcp_server imports OK
+GPU MCP Python deps OK
 ```
 
 If this fails, do not edit Codex config yet. Fix the Python environment first. At minimum, the server Python needs:
 
 ```bash
-/home/tingran/miniconda3/bin/python -m pip install mcp fabric paramiko
+"$PY" -m pip install mcp paramiko fabric
 ```
 
 Do this in the intended environment for `PY`, not in a random shell Python. The probe also needs either CUDA JAX or CUDA Torch on the host where the probe runs.
@@ -61,88 +71,144 @@ Codex on CONTROL_HOST -> gpu_mcp_server.py -> SSH to REMOTE_HOST -> guarded Pyth
 The MCP server uses a dedicated key at `~/.ssh/gpu_mcp_key` by default. First check whether that route already works:
 
 ```bash
-/home/tingran/miniconda3/bin/python /net/levsha/scratch2/tingran/test_repo/gpu_mcp_bootstrap_ssh.py --verify-only blob.mit.edu
+"$PY" "$BOOTSTRAP" --verify-only --hosts-file "$GPU_MCP_INSTALL/hosts.txt" --inventory "$INVENTORY"
 ```
 
-If the key is missing or the target fails verification, ask the user to run the interactive bootstrap in a real terminal on the control host:
+If the key is missing or targets fail verification, the human should create
+`$GPU_MCP_INSTALL/hosts.txt` with one intended GPU host per line, then run the
+interactive bootstrap in a real terminal on the control host:
 
 ```bash
-/home/tingran/miniconda3/bin/python /net/levsha/scratch2/tingran/test_repo/gpu_mcp_bootstrap_ssh.py
+"$PY" "$BOOTSTRAP" --install --hosts-file "$GPU_MCP_INSTALL/hosts.txt" --inventory "$INVENTORY"
 ```
 
-With no host arguments, the bootstrap uses every host in `NODES` inside `gpu_mcp_server.py`. To inspect that list:
-
-```bash
-/home/tingran/miniconda3/bin/python /net/levsha/scratch2/tingran/test_repo/gpu_mcp_bootstrap_ssh.py --list-hosts
-```
-
-The bootstrap follows the saunasub model: it asks once for the user's normal SSH password, appends the dedicated public key to each destination `~/.ssh/authorized_keys`, then verifies no-prompt login with the exact key MCP will use. The password is not written to the repo or Codex config.
+The bootstrap asks once for the user's normal SSH password, appends the
+dedicated public key to each destination `~/.ssh/authorized_keys`, then
+verifies no-prompt login with the exact key MCP will use. The password is not
+written to the repo or Codex config.
 
 Root is not required if the user can log in normally and write their own destination-side `~/.ssh/authorized_keys`. Some historical nodes may be offline or not provisioned for this account; the MCP install requires at least one non-local GPU target that verifies with the dedicated key.
 
-## 3. Codex Config
+## 3. Repo-Local Codex Config
 
-Edit the user-level Codex config on the control host:
+Do not put repo-specific MCP policy paths in global `~/.codex/config.toml`.
+Each research repo should contain its own Codex config:
 
 ```text
-~/.codex/config.toml
+$RESEARCH_REPO/.codex/config.toml
 ```
 
-There must be exactly one `[mcp_servers.gpu-cluster]` table. Replace any old `gpu-cluster` table with:
+Use the same MCP name in every repo:
 
 ```toml
-[mcp_servers.gpu-cluster]
-command = "/home/tingran/miniconda3/bin/python"
-args = ["/net/levsha/scratch2/tingran/test_repo/gpu_mcp_server.py"]
-cwd = "/net/levsha/scratch2/tingran/test_repo"
+[mcp_servers.gpu-cluster-mcp]
+command = "/absolute/path/to/python"
+args = [
+  "/home/USER/gpu-mcp/gpu_mcp_server.py",
+  "--config",
+  "/shared/path/to/research-repo/gpu-mcp.toml"
+]
 enabled = true
 startup_timeout_sec = 20
-tool_timeout_sec = 120
-enabled_tools = [
-  "check_gpus",
-  "check_gpu_processes",
-  "cluster_info",
-  "kill_gpu_process",
-  "run_python_on_gpu",
-]
+tool_timeout_sec = 360
+
+[mcp_servers.gpu-cluster-mcp.tools.run_python_on_gpu]
+approval_mode = "approve"
+
+[mcp_servers.gpu-cluster-mcp.tools.kill_gpu_process]
+approval_mode = "approve"
+
+[mcp_servers.gpu-cluster-mcp.tools.check_gpu_processes]
+approval_mode = "approve"
+
+[mcp_servers.gpu-cluster-mcp.tools.reload_policy]
+# Codex shows this prompt only in the human UI. After approval, the agent sees
+# the normal MCP result and cannot tell from the result that approval happened.
+approval_mode = "prompt"
+
+[[hooks.PreToolUse]]
+matcher = ".*"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "/absolute/path/to/python /home/USER/gpu-mcp/gpu_mcp_policy_hook.py"
+timeout = 5
+statusMessage = "Checking GPU MCP policy drift"
+
+[[hooks.PostToolUse]]
+matcher = ".*"
+
+[[hooks.PostToolUse.hooks]]
+type = "command"
+command = "/absolute/path/to/python /home/USER/gpu-mcp/gpu_mcp_policy_hook.py"
+timeout = 5
+statusMessage = "Checking GPU MCP policy drift"
 ```
 
-By default, the MCP SSH username is the Unix user running Codex, and remote jobs run with the same Python executable used to launch the MCP server. If either default is wrong, add one env table and include only the keys needed:
+The server does not rely on `cwd` and does not read `GPU_MCP_CONFIG`. The
+`--config` argument is the policy source.
+
+The legacy global `[mcp_servers.gpu-cluster]` entry may exist for older live
+sessions, but new installs should use repo-local `gpu-cluster-mcp`.
+
+Restart Codex after editing this file. Use `/hooks` in Codex to review and
+trust the repo-local hook definition. The hook is workflow feedback: it warns
+the agent if `gpu-mcp.toml` has changed but has not been reloaded. The server's
+startup, preview/reload, and stale-policy checks remain the actual safety
+boundary if a client does not support hooks.
+
+## 4. Repo Policy
+
+Create `$RESEARCH_REPO/gpu-mcp.toml` from
+`contracts/gpu-mcp.template.toml`. The installer AI should propose values from
+the bootstrap inventory, but the human approves safety-relevant policy:
 
 ```toml
-[mcp_servers.gpu-cluster.env]
-GPU_MCP_USER = "USER"
-GPU_MCP_PYTHON = "/ABS/PATH/TO/python"
-GPU_MCP_SSH_KEY = "/ABS/PATH/TO/.ssh/gpu_mcp_key"
+schema_version = 1
+repo_root = "/shared/path/to/research-repo"
+nodes = ["gpu01.example.edu"]
+script_roots = ["jobs"]
+write_roots = ["results"]
+output_roots = [".gpu_mcp_logs"]
+sync_timeout_sec = 300
 ```
 
-Use only one `[mcp_servers.gpu-cluster.env]` table. If later steps add `GPU_MCP_WRITE_ROOTS`, put it in the same table.
+`nodes` is a repo-specific allowlist. The bootstrap inventory proves a host is
+reachable; it does not grant repo permission by itself.
 
-Codex CLI uses `~/.codex/config.toml`. Do not rely on repo-local `.codex/config.toml`, and do not rely on `.mcp.json`.
+Remote GPU jobs use a standalone safe runner staged into the research repo under
+`.gpu_mcp_runner/`. Remote hosts do not need the full MCP server installation
+path, but they must be able to see the research repo, the job script, and the
+staged runner through the shared filesystem. Keep `.gpu_mcp_runner/` out of
+version control.
 
-Restart Codex after editing this file.
-
-## 4. Tool Registration
-
-After restart:
+Approve the policy before starting Codex with this MCP server:
 
 ```bash
-codex mcp get gpu-cluster
+python /home/USER/gpu-mcp/gpu_mcp_doctor.py approve-policy \
+  --config /absolute/path/to/research-repo/gpu-mcp.toml \
+  --yes
 ```
 
-Required fields:
+The approval record is stored outside the repo under
+`~/gpu-mcp/state/approved-policies.json`. If `gpu-mcp.toml` changes later, the
+MCP server refuses normal cluster tools until the changed policy is previewed
+and explicitly reloaded, and it refuses to start in a new session until the
+changed policy is approved.
 
-```text
-enabled: true
-enabled_tools: check_gpus, check_gpu_processes, cluster_info, kill_gpu_process, run_python_on_gpu
-command: /home/tingran/miniconda3/bin/python
-args: /net/levsha/scratch2/tingran/test_repo/gpu_mcp_server.py
-cwd: /net/levsha/scratch2/tingran/test_repo
-```
+Validate readiness with `gpu_mcp_doctor.py check --config
+/absolute/path/to/research-repo/gpu-mcp.toml`, then run the real battlefield
+suite when doing full acceptance.
 
-Inside Codex, `/mcp` must show the same five tools. `Auth: Unsupported` is normal. `Tools: (none)` is a failure.
+Intentional same-session policy edits must use the explicit reload flow:
 
-If tools are missing, inspect `~/.codex/log/codex-tui.log`. Usual causes are: Codex was not restarted, wrong Python path, missing Python packages, duplicate `gpu-cluster` config, or project config not trusted.
+1. edit `gpu-mcp.toml` because the human asked for a policy change;
+2. call `preview_policy_reload`;
+3. show the raw safety-relevant diff and hash output to the human;
+4. call `reload_policy` with the returned token only after explicit approval,
+   or call `reject_policy_reload` if the human rejects the candidate.
+
+Do not edit policy as a workaround inside a blocked GPU task.
 
 ## 5. Local MCP Probe
 
@@ -150,9 +216,9 @@ Use the MCP tool, not a direct shell invocation of Python:
 
 ```text
 run_python_on_gpu(
-  host="localhost",
+  host="gpu01.example.edu",
   gpu_index=0,
-  script_path="/net/levsha/scratch2/tingran/test_repo/gpu_mcp_probe.py",
+  script_path="/shared/path/to/research-repo/jobs/probe.py",
   args=["--sleep", "0"],
   async_mode=false
 )
@@ -192,13 +258,15 @@ Host blocks are labeled `local` when checked on the control host itself and `ssh
 
 ## 7. Remote MCP Probe
 
-After SSH works, run the probe through the MCP tool to a non-local host. Do not substitute a direct `ssh python ...` command for this test. The `host` value must be accepted by `NODES` in `gpu_mcp_server.py`.
+After SSH works, run the probe through the MCP tool to a non-local host. Do
+not substitute a direct `ssh python ...` command for this test. The `host`
+value must be allowed by this repo's `gpu-mcp.toml`.
 
 ```text
 run_python_on_gpu(
   host="REMOTE_HOST",
   gpu_index=0,
-  script_path="/net/levsha/scratch2/tingran/test_repo/gpu_mcp_probe.py",
+  script_path="/shared/path/to/research-repo/jobs/probe.py",
   args=["--sleep", "0"],
   async_mode=false
 )
@@ -217,7 +285,7 @@ As in the local probe, GPU proof can come from either JAX CUDA output or Torch C
 If local probe works but remote probe fails, the MCP is mounted but the remote route is not installed. Check:
 
 ```text
-1. REMOTE_HOST is listed in NODES.
+1. REMOTE_HOST is listed in this repo's `gpu-mcp.toml`.
 2. SSH from the control host to that remote host works without prompts.
 3. The remote host mounts the same repo path.
 4. The remote host has a working GPU Python/JAX/Torch environment.
@@ -231,7 +299,7 @@ stateless and does not keep a registry. First call it without a fingerprint to
 inspect exactly one process:
 
 ```text
-kill_gpu_process(host="blob.mit.edu", pid=1234)
+kill_gpu_process(host="gpu01.example.edu", pid=1234)
 ```
 
 The response includes the owner, process start time, process group, command
@@ -243,7 +311,7 @@ To signal the process, call the tool again with the returned fingerprint:
 
 ```text
 kill_gpu_process(
-  host="blob.mit.edu",
+  host="gpu01.example.edu",
   pid=1234,
   fingerprint="gpu-mcp-kill-v1:...",
   signal="KILL"
@@ -260,14 +328,14 @@ command is Python, inference code, or MCP-launched.
 Async job logs must end in `.log` and be under one of:
 
 ```text
-/net/levsha/scratch2/tingran/test_repo/.gpu_mcp_logs
-/tmp/gpu_mcp_logs
+/shared/path/to/research-repo/.gpu_mcp_logs
+/tmp/gpu_mcp_logs_for_this_repo
 ```
 
 Example:
 
 ```text
-output_file="/net/levsha/scratch2/tingran/test_repo/.gpu_mcp_logs/job.log"
+output_file=".gpu_mcp_logs/job.log"
 ```
 
 This path is only for stdout/stderr capture. It is not the general result directory for a script.
@@ -276,30 +344,35 @@ This path is only for stdout/stderr capture. It is not the general result direct
 
 Scripts launched through `run_python_on_gpu` run under a safety guard. The guard blocks destructive APIs, subprocess launch, socket connections, and writes outside approved write roots. Local and remote jobs both run from the shared repo root, so relative result paths are relative to the repo.
 
+This is not a hostile-code sandbox. It is a guardrail for trusted lab scripts
+and common AI-generated mistakes. The guard controls execution, subprocess,
+network, and write behavior; it does not prevent a script from reading files
+that the Unix user can already read.
+
 By default, script writes are allowed under:
 
 ```text
-/net/levsha/scratch2/tingran/test_repo
-/tmp/gpu_mcp_logs
-/tmp/gpu_mcp_outputs
-/tmp/gpu_mcp_matplotlib_cache
+the configured write_roots in gpu-mcp.toml
 ```
 
 For durable job results, prefer a path inside the repo, for example:
 
 ```text
-/net/levsha/scratch2/tingran/test_repo/simulation_results/my_gpu_run
+/shared/path/to/research-repo/simulation_results/my_gpu_run
 ```
 
-If a result directory outside the repo is needed, add `GPU_MCP_WRITE_ROOTS` to the same env table in `~/.codex/config.toml`. Use colon-separated paths:
+If a scratch/log directory outside the repo is needed, add an explicit
+`/tmp/...` root to `write_roots` or `output_roots` in `gpu-mcp.toml`. Other
+outside-repo roots are not part of v1.
+
+Async output directories must already exist and must not be symlinks. The MCP
+will not create output directories at job launch time.
 
 ```toml
-[mcp_servers.gpu-cluster.env]
-GPU_MCP_USER = "USER"
-GPU_MCP_WRITE_ROOTS = "/ABS/PATH/TO/results:/ABS/PATH/TO/other_results"
+write_roots = ["results", "/tmp/gpu_mcp_outputs_for_this_repo"]
 ```
 
-Then restart Codex. The same absolute paths must be valid on the control host and remote GPU hosts.
+The same absolute paths must be valid on the control host and remote GPU hosts.
 
 If a job fails with:
 
@@ -307,16 +380,19 @@ If a job fails with:
 GPU MCP blocked write outside approved roots
 ```
 
-move the script output under an approved write root or add the intended result directory to `GPU_MCP_WRITE_ROOTS`.
+move the script output under an approved write root or update `gpu-mcp.toml`
+with human approval.
 
 ## 11. Completion Criteria
 
-The installation is complete only when all five are true:
+The installation is complete only when these are true:
 
 ```text
-1. codex mcp get gpu-cluster lists the five expected tools.
-2. /mcp inside Codex lists the five expected tools.
-3. check_gpus(samples=1, threshold=10) returns cluster GPU status through MCP.
-4. run_python_on_gpu(... host="localhost" ..., gpu_mcp_probe.py ...) returns used_gpu=True.
-5. run_python_on_gpu(... host="REMOTE_HOST" ..., gpu_mcp_probe.py ...) returns used_gpu=True.
+1. repo-local .codex/config.toml registers gpu-cluster-mcp with --config.
+2. gpu-mcp.toml contains the human-approved repo policy.
+3. doctor check passes for the repo-local policy/config.
+4. raw remote command prompt rules are verified without --ignore-rules.
+5. a non-local run_python_on_gpu probe succeeds through MCP.
+6. the full real battlefield suite passes, or any omitted family is explicitly
+   documented as unsafe to run in the current environment.
 ```

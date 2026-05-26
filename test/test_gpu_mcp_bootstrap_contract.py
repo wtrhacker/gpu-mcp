@@ -101,6 +101,16 @@ def test_bootstrap_rejects_hosts_and_hosts_file_together(modules, fixture_root):
         )
 
 
+def test_bootstrap_rejects_symlink_key_path(modules, fixture_root):
+    gpu_mcp_bootstrap, _, _ = modules
+    target = fixture_root / "outside_key"
+    key_link = fixture_root / "gpu_mcp_key"
+    key_link.symlink_to(target)
+
+    with pytest.raises(gpu_mcp_bootstrap.BootstrapError, match="symlink"):
+        gpu_mcp_bootstrap.ensure_key(key_link)
+
+
 def test_bootstrap_writes_inventory_for_verified_and_failed_hosts(modules, fixture_root):
     gpu_mcp_bootstrap, _, _ = modules
     inventory_path = fixture_root / "bootstrap_hosts.json"
@@ -119,8 +129,12 @@ def test_bootstrap_writes_inventory_for_verified_and_failed_hosts(modules, fixtu
     _assert_bootstrap_inventory(inventory)
     assert inventory["hosts"][0]["host"] == "gpu-a"
     assert inventory["hosts"][0]["status"] == "verified"
+    assert "host_key_checked" not in inventory["hosts"][0]
+    assert inventory["hosts"][0]["host_key_recorded"] is True
+    assert inventory["hosts"][0]["host_key_policy"] in {"accept-new", "preexisting"}
     assert inventory["hosts"][1]["host"] == "gpu-b"
     assert inventory["hosts"][1]["status"] == "failed"
+    assert inventory["hosts"][1]["host_key_policy"] == "not-recorded"
 
 
 def test_hosts_file_is_only_bootstrap_input_not_runtime_permission(

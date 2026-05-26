@@ -33,7 +33,8 @@
         "host",
         "status",
         "remote_hostname",
-        "host_key_checked",
+        "host_key_recorded",
+        "host_key_policy",
         "verified_at",
         "error"
       ],
@@ -41,7 +42,8 @@
         "host": { "type": "string", "minLength": 1 },
         "status": { "enum": ["verified", "failed"] },
         "remote_hostname": { "type": "string" },
-        "host_key_checked": { "type": "boolean" },
+        "host_key_recorded": { "type": "boolean" },
+        "host_key_policy": { "enum": ["accept-new", "preexisting", "not-recorded"] },
         "verified_at": { "type": "string" },
         "error": { "type": "string" }
       }

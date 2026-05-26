@@ -6,11 +6,14 @@ import json
 from pathlib import Path
 
 import jsonschema
+import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CONTRACTS = REPO_ROOT / "contracts"
 SCHEMAS = CONTRACTS / "schemas"
+
+pytestmark = pytest.mark.contract
 
 
 def _load_json(path: Path) -> dict:
@@ -35,4 +38,3 @@ def test_mcp_result_templates_match_schema():
     schema = _load_json(SCHEMAS / "mcp-result.schema.json")
     for path in sorted(CONTRACTS.glob("mcp_result_*.template.json")):
         jsonschema.validate(instance=_load_json(path), schema=schema)
-

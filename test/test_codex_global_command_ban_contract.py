@@ -87,6 +87,21 @@ def test_allow_rules_do_not_count_as_raw_remote_blocks(codex_config_module):
         codex_config_module.validate_remote_command_prompt_rules(rules_text)
 
 
+def test_conflicting_allow_rule_rejects_remote_command_policy(codex_config_module):
+    rules_text = "\n".join(
+        [
+            'prefix_rule(pattern=["ssh"], decision="prompt")',
+            'prefix_rule(pattern=["ssh"], decision="allow")',
+            'prefix_rule(pattern=["scp"], decision="prompt")',
+            'prefix_rule(pattern=["sftp"], decision="prompt")',
+            'prefix_rule(pattern=["rsync"], decision="prompt")',
+        ]
+    )
+
+    with pytest.raises(codex_config_module.CodexConfigError, match="conflict|allow"):
+        codex_config_module.validate_remote_command_prompt_rules(rules_text)
+
+
 def test_remote_command_probe_argv_uses_approval_never_without_ignore_rules(
     codex_config_module, tmp_path
 ):
@@ -94,6 +109,8 @@ def test_remote_command_probe_argv_uses_approval_never_without_ignore_rules(
 
     assert argv[:3] == ["codex", "--ask-for-approval", "never"]
     assert "exec" in argv
+    assert "--sandbox" in argv
+    assert argv[argv.index("--sandbox") + 1] == "read-only"
     assert "--ignore-rules" not in argv
     assert "ssh" in " ".join(argv)
 

@@ -88,7 +88,7 @@ def scan_python_script_safety(path: str | Path) -> list[str]:
         return [f"syntax error: {exc}"]
 
     issues: list[str] = []
-    forbidden_imports = {"subprocess", "socket"}
+    forbidden_imports = {"ctypes", "subprocess", "socket"}
     forbidden_calls = {
         ("os", "system"),
         ("os", "popen"),
@@ -139,9 +139,15 @@ def run_python_on_gpu(
 
     if async_mode:
         if output_file is None:
-            raise PolicyError("async output_file is required")
-        validate_output_path(policy, output_file)
-        return _result("ok", "async_launched", "async launch accepted", {"host": host})
+            output_path = policy.output_roots[0] / f"gpu_python_job_{id(script)}.log"
+        else:
+            output_path = validate_output_path(policy, output_file)
+        return _result(
+            "ok",
+            "async_launched",
+            "async launch accepted",
+            {"host": host, "output_file": str(output_path)},
+        )
 
     try:
         completed = subprocess.run(

@@ -1,5 +1,12 @@
 from __future__ import annotations
 
+"""Test-support implementation for kill-process policy contracts.
+
+The live MCP server implements the real `kill_gpu_process` tool in
+`gpu_mcp_server.py`. This helper is used only by deterministic unit tests so
+they can verify the intended safety rules without SSH, GPUs, or real processes.
+"""
+
 import hashlib
 import signal as signal_module
 from typing import Callable

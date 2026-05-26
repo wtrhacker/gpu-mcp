@@ -42,6 +42,8 @@ def ensure_key(key_path: str | Path) -> Path:
     """Create the dedicated GPU MCP SSH key if it does not already exist."""
     private_key = Path(key_path).expanduser()
     public_key = Path(f"{private_key}.pub")
+    if private_key.is_symlink() or public_key.is_symlink():
+        raise BootstrapError("dedicated key path must not be a symlink")
     private_key.parent.mkdir(parents=True, exist_ok=True)
     private_key.parent.chmod(0o700)
 
@@ -183,7 +185,8 @@ def _probe_hosts(
             results[host] = {
                 "status": "verified",
                 "remote_hostname": remote_hostname,
-                "host_key_checked": True,
+                "host_key_recorded": True,
+                "host_key_policy": "accept-new",
                 "verified_at": _now(),
             }
             print(f"    verified dedicated-key login: {remote_hostname}", flush=True)
@@ -191,7 +194,8 @@ def _probe_hosts(
             results[host] = {
                 "status": "failed",
                 "error": str(exc),
-                "host_key_checked": False,
+                "host_key_recorded": False,
+                "host_key_policy": "not-recorded",
                 "verified_at": _now(),
             }
             print(f"    FAILED: {exc}", flush=True)
@@ -257,7 +261,13 @@ def bootstrap_hosts(
                 "host": host,
                 "status": status,
                 "remote_hostname": result.get("remote_hostname", "") if status == "verified" else "",
-                "host_key_checked": bool(result.get("host_key_checked", status == "verified")),
+                "host_key_recorded": bool(result.get("host_key_recorded", status == "verified")),
+                "host_key_policy": str(
+                    result.get(
+                        "host_key_policy",
+                        "accept-new" if status == "verified" else "not-recorded",
+                    )
+                ),
                 "verified_at": result.get("verified_at", generated_at),
                 "error": result.get("error", "") if status != "verified" else "",
             }

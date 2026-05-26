@@ -4,9 +4,14 @@
 
 # Local Codex configuration; publish sanitized examples instead.
 /config.toml
+/hosts.txt
+/gpu-mcp.toml
+/jobs/
+/results/
 
 # Runtime logs and caches
 .gpu_mcp_logs/
+.gpu_mcp_runner/
 __pycache__/
 test/**/__pycache__/
 *.py[cod]

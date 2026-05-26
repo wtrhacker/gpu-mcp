@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-"""Executable behavior contract for the config-driven GPU MCP server.
+"""Executable behavior contract for repo-local GPU MCP policy enforcement.
 
-These tests intentionally target the future public API, not the old hard-coded
-`gpu_mcp_server.py` globals. They should stay xfailed until the real
-config-driven implementation exists, then the xfail marker should be removed.
+These tests cover the active config-driven policy modules and the deterministic
+policy boundary used by the MCP server.
 
-Expected future API:
+Covered API:
 
 - `gpu_mcp_config.load_policy(config_path) -> policy`
 - `gpu_mcp_config.ConfigError`
@@ -110,6 +109,16 @@ def test_config_requires_absolute_config_path(policy_modules, repo_fixture):
         gpu_mcp_config.load_policy(Path("gpu-mcp.toml"))
 
 
+def test_config_rejects_symlinked_policy_file(policy_modules, repo_fixture):
+    gpu_mcp_config, _ = policy_modules
+    real_config = _write_config(repo_fixture)
+    link = repo_fixture.parent / "gpu-mcp-link.toml"
+    link.symlink_to(real_config)
+
+    with pytest.raises(gpu_mcp_config.ConfigError, match="symlink"):
+        gpu_mcp_config.load_policy(link)
+
+
 def test_config_rejects_repo_root_that_does_not_match_config_location(
     policy_modules, repo_fixture
 ):
@@ -123,6 +132,54 @@ def test_config_rejects_repo_root_that_does_not_match_config_location(
     )
 
     with pytest.raises(gpu_mcp_config.ConfigError, match="repo_root"):
+        gpu_mcp_config.load_policy(config)
+
+
+def test_config_rejects_missing_repo_root(policy_modules, repo_fixture):
+    gpu_mcp_config, _ = policy_modules
+    config = _write_config(repo_fixture)
+    config.write_text(
+        "\n".join(
+            line
+            for line in config.read_text().splitlines()
+            if not line.startswith("repo_root =")
+        )
+        + "\n"
+    )
+
+    with pytest.raises(gpu_mcp_config.ConfigError, match="repo_root"):
+        gpu_mcp_config.load_policy(config)
+
+
+def test_config_rejects_non_list_nodes(policy_modules, repo_fixture):
+    gpu_mcp_config, _ = policy_modules
+    config = _write_config(repo_fixture)
+    config.write_text(config.read_text().replace("nodes = ['gpu-a']", "nodes = 'gpu-a'"))
+
+    with pytest.raises(gpu_mcp_config.ConfigError, match="nodes"):
+        gpu_mcp_config.load_policy(config)
+
+
+def test_config_rejects_non_string_root_entries(policy_modules, repo_fixture):
+    gpu_mcp_config, _ = policy_modules
+    config = _write_config(repo_fixture)
+    config.write_text(config.read_text().replace("script_roots = ['jobs']", "script_roots = [123]"))
+
+    with pytest.raises(gpu_mcp_config.ConfigError, match="script_roots"):
+        gpu_mcp_config.load_policy(config)
+
+
+def test_config_rejects_bool_and_negative_numeric_fields(policy_modules, repo_fixture):
+    gpu_mcp_config, _ = policy_modules
+    config = _write_config(repo_fixture)
+
+    config.write_text(config.read_text().replace("min_free_memory_mib = 0", "min_free_memory_mib = true"))
+    with pytest.raises(gpu_mcp_config.ConfigError, match="min_free_memory_mib"):
+        gpu_mcp_config.load_policy(config)
+
+    config = _write_config(repo_fixture)
+    config.write_text(config.read_text().replace("sync_timeout_sec = 5", "sync_timeout_sec = -1"))
+    with pytest.raises(gpu_mcp_config.ConfigError, match="sync_timeout_sec"):
         gpu_mcp_config.load_policy(config)
 
 
@@ -236,6 +293,24 @@ def test_async_output_file_must_be_under_output_roots(policy_modules, repo_fixtu
         gpu_mcp_policy.validate_output_path(policy, "jobs/ok_job.py")
 
 
+def test_async_output_default_uses_configured_output_root(policy_modules, repo_fixture):
+    gpu_mcp_config, gpu_mcp_policy = policy_modules
+    config = _write_config(repo_fixture, output_roots=["logs"])
+    (repo_fixture / "logs").mkdir()
+    _write_job(repo_fixture, "ok.py", "print('ok')\n")
+    policy = gpu_mcp_config.load_policy(config)
+
+    result = gpu_mcp_policy.run_python_on_gpu(
+        policy,
+        host="gpu-a",
+        script_path="jobs/ok.py",
+        async_mode=True,
+    )
+
+    _assert_mcp_result(result, status="ok", code="async_launched")
+    assert str(repo_fixture / "logs") in result["details"]["output_file"]
+
+
 def test_sync_timeout_returns_server_timeout(policy_modules, repo_fixture):
     gpu_mcp_config, gpu_mcp_policy = policy_modules
     config = _write_config(repo_fixture, sync_timeout_sec=1)
@@ -308,3 +383,16 @@ def test_socket_connect_is_rejected(policy_modules, repo_fixture):
 
     assert result["code"] in {"policy_violation", "runtime_policy_violation"}
     _assert_mcp_result(result, status="error", code=result["code"])
+
+
+def test_ctypes_import_is_rejected(policy_modules, repo_fixture):
+    _, gpu_mcp_policy = policy_modules
+    script = _write_job(
+        repo_fixture,
+        "ctypes_job.py",
+        "import ctypes\nprint('ctypes ran')\n",
+    )
+
+    issues = gpu_mcp_policy.scan_python_script_safety(script)
+
+    assert any("ctypes" in issue for issue in issues)

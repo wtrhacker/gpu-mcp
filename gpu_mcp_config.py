@@ -37,6 +37,32 @@ def _resolve_root(repo_root: Path, item: str) -> Path:
     return path.resolve()
 
 
+def _string_list(raw: object, *, name: str) -> tuple[str, ...]:
+    if not isinstance(raw, list):
+        raise ConfigError(f"{name} must be a list")
+    values: list[str] = []
+    for item in raw:
+        if not isinstance(item, str) or not item.strip():
+            raise ConfigError(f"{name} entries must be non-empty strings")
+        values.append(item)
+    return tuple(values)
+
+
+def _non_negative_int(raw: object, *, name: str) -> int:
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        raise ConfigError(f"{name} must be an integer")
+    if raw < 0:
+        raise ConfigError(f"{name} must be non-negative")
+    return raw
+
+
+def _positive_int(raw: object, *, name: str) -> int:
+    value = _non_negative_int(raw, name=name)
+    if value <= 0:
+        raise ConfigError(f"{name} must be positive")
+    return value
+
+
 def _validate_roots(
     raw: object,
     *,
@@ -46,7 +72,8 @@ def _validate_roots(
 ) -> tuple[Path, ...]:
     if not isinstance(raw, list):
         raise ConfigError(f"{name} must be a list")
-    roots = tuple(_resolve_root(repo_root, str(item)) for item in raw)
+    root_items = _string_list(raw, name=name)
+    roots = tuple(_resolve_root(repo_root, item) for item in root_items)
     for root in roots:
         if _inside(root, repo_root):
             continue
@@ -60,23 +87,29 @@ def load_policy(config_path: str | Path) -> GpuMcpPolicy:
     config = Path(config_path).expanduser()
     if not config.is_absolute():
         raise ConfigError("--config path must be absolute")
+    if config.is_symlink():
+        raise ConfigError("gpu-mcp.toml must not be a symlink")
     config = config.resolve()
     if not config.exists():
         raise ConfigError(f"config file does not exist: {config}")
 
     with config.open("rb") as fh:
-        raw = tomllib.load(fh)
+        try:
+            raw = tomllib.load(fh)
+        except tomllib.TOMLDecodeError as exc:
+            raise ConfigError(f"config file is invalid TOML: {exc}") from exc
 
     if raw.get("schema_version") != 1:
         raise ConfigError("schema_version must be 1")
 
-    repo_root = Path(str(raw.get("repo_root", ""))).expanduser().resolve()
-    if not repo_root:
+    repo_root_raw = raw.get("repo_root")
+    if not isinstance(repo_root_raw, str) or not repo_root_raw.strip():
         raise ConfigError("repo_root is required")
+    repo_root = Path(repo_root_raw).expanduser().resolve()
     if config.parent.resolve() != repo_root:
         raise ConfigError("repo_root must match the directory containing gpu-mcp.toml")
 
-    nodes = tuple(str(node) for node in raw.get("nodes", []))
+    nodes = _string_list(raw.get("nodes", []), name="nodes")
     if not nodes:
         raise ConfigError("nodes must contain at least one host")
 
@@ -112,7 +145,13 @@ def load_policy(config_path: str | Path) -> GpuMcpPolicy:
         script_roots=script_roots,
         write_roots=write_roots,
         output_roots=output_roots,
-        allowed_gpu_names=tuple(str(name) for name in raw.get("allowed_gpu_names", [])),
-        min_free_memory_mib=int(raw.get("min_free_memory_mib", 0)),
-        sync_timeout_sec=int(raw.get("sync_timeout_sec", 30)),
+        allowed_gpu_names=_string_list(raw.get("allowed_gpu_names", []), name="allowed_gpu_names"),
+        min_free_memory_mib=_non_negative_int(
+            raw.get("min_free_memory_mib", 0),
+            name="min_free_memory_mib",
+        ),
+        sync_timeout_sec=_positive_int(
+            raw.get("sync_timeout_sec", 30),
+            name="sync_timeout_sec",
+        ),
     )

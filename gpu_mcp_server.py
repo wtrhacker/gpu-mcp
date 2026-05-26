@@ -5,17 +5,26 @@ MCP server for GPU cluster inspection and constrained Python execution.
 Communicates via stdio and uses SSH/Fabric to inspect GPU availability or run
 approved Python entrypoints on remote GPU hosts.
 
-Usage (standalone test):
-    python gpu_mcp_server.py
+Usage:
+    python gpu_mcp_server.py --config /absolute/path/to/gpu-mcp.toml
 
 Register in Codex or another MCP-aware client as a stdio MCP server.
 """
 
-import sys, os, json, time, subprocess, re, shlex, ast, runpy, builtins, io, hashlib, signal as signal_lib
+import sys, os, json, time, subprocess, re, shlex, hashlib, signal as signal_lib, secrets
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+import gpu_mcp_guard
 from gpu_mcp_config import ConfigError, GpuMcpPolicy, load_policy
+from gpu_mcp_policy_approval import (
+    PolicyApprovalError,
+    approve_policy,
+    diff_policy_summary,
+    policy_file_hash,
+    verify_policy_approved,
+)
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
@@ -23,7 +32,8 @@ from gpu_mcp_config import ConfigError, GpuMcpPolicy, load_policy
 def _pop_config_arg(argv: list[str]) -> str:
     """Remove server-level --config before FastMCP sees argv."""
     if "--config" not in argv:
-        return os.environ.get("GPU_MCP_CONFIG", "").strip()
+        print("ERROR: --config requires an absolute gpu-mcp.toml path", file=sys.stderr)
+        raise SystemExit(2)
     index = argv.index("--config")
     try:
         value = argv[index + 1]
@@ -31,17 +41,29 @@ def _pop_config_arg(argv: list[str]) -> str:
         print("ERROR: --config requires an absolute gpu-mcp.toml path", file=sys.stderr)
         raise SystemExit(2)
     del argv[index : index + 2]
+    if not Path(value).expanduser().is_absolute():
+        print("ERROR: --config requires an absolute gpu-mcp.toml path", file=sys.stderr)
+        raise SystemExit(2)
     return value
 
 
 GPU_MCP_CONFIG_PATH = _pop_config_arg(sys.argv)
+GPU_MCP_TEST_DISABLE_POLICY_APPROVAL = (
+    os.environ.get("GPU_MCP_TEST_DISABLE_POLICY_APPROVAL", "").strip().lower()
+    in {"1", "true", "yes"}
+    and "PYTEST_CURRENT_TEST" in os.environ
+)
 CONFIG_POLICY: GpuMcpPolicy | None = None
-if GPU_MCP_CONFIG_PATH:
-    try:
-        CONFIG_POLICY = load_policy(Path(GPU_MCP_CONFIG_PATH).expanduser())
-    except ConfigError as exc:
-        print(f"ERROR: invalid GPU MCP config: {exc}", file=sys.stderr)
-        raise SystemExit(2)
+try:
+    CONFIG_POLICY = load_policy(Path(GPU_MCP_CONFIG_PATH).expanduser())
+    if not GPU_MCP_TEST_DISABLE_POLICY_APPROVAL:
+        verify_policy_approved(CONFIG_POLICY.config_path)
+except ConfigError as exc:
+    print(f"ERROR: invalid GPU MCP config: {exc}", file=sys.stderr)
+    raise SystemExit(2)
+except PolicyApprovalError as exc:
+    print(f"ERROR: unapproved GPU MCP policy: {exc}", file=sys.stderr)
+    raise SystemExit(2)
 
 REPO_ROOT = Path(__file__).resolve().parent
 PYTHON = os.environ.get("GPU_MCP_PYTHON", "").strip() or sys.executable
@@ -60,204 +82,85 @@ GPU_MCP_ALLOW_SSH_FALLBACK = os.environ.get("GPU_MCP_ALLOW_SSH_FALLBACK", "").st
 }
 DEFAULT_GPU_MCP_SSH_KEY = Path.home() / ".ssh" / "gpu_mcp_key"
 
+def _apply_policy(policy: GpuMcpPolicy) -> None:
+    global CONFIG_POLICY
+    global REPO_ROOT, NODES
+    global APPROVED_SCRIPT_ROOTS, APPROVED_WRITE_ROOTS, APPROVED_OUTPUT_ROOTS
+    global GPU_MCP_WRITE_ROOTS_RAW, SYNC_TIMEOUT_SEC
 
-def _env_path_list(name: str) -> list[Path]:
-    """Parse a path-list environment variable into Path objects."""
-    raw = os.environ.get(name, "").strip()
-    if not raw:
-        return []
-    return [Path(item).expanduser() for item in raw.split(os.pathsep) if item.strip()]
-
-
-GPU_MCP_WRITE_ROOTS_RAW = os.environ.get("GPU_MCP_WRITE_ROOTS", "").strip()
-
-APPROVED_SCRIPT_ROOTS = [REPO_ROOT]
-APPROVED_OUTPUT_ROOTS = [REPO_ROOT / ".gpu_mcp_logs", Path("/tmp/gpu_mcp_logs")]
-APPROVED_WRITE_ROOTS = (
-    [REPO_ROOT]
-    + APPROVED_OUTPUT_ROOTS
-    + [
-        Path("/tmp"),
-        Path("/tmp/gpu_mcp_outputs"),
-        Path("/tmp/gpu_mcp_matplotlib_cache"),
-    ]
-    + _env_path_list("GPU_MCP_WRITE_ROOTS")
-)
-
-FORBIDDEN_CALLS = {
-    "os.system",
-    "os.popen",
-    "os.fork",
-    "os.forkpty",
-    "os.execl",
-    "os.execle",
-    "os.execlp",
-    "os.execlpe",
-    "os.execv",
-    "os.execve",
-    "os.execvp",
-    "os.execvpe",
-    "os.spawnl",
-    "os.spawnle",
-    "os.spawnlp",
-    "os.spawnlpe",
-    "os.spawnv",
-    "os.spawnve",
-    "os.spawnvp",
-    "os.spawnvpe",
-    "os.posix_spawn",
-    "os.posix_spawnp",
-    "pty.spawn",
-    "subprocess.run",
-    "subprocess.call",
-    "subprocess.check_call",
-    "subprocess.check_output",
-    "subprocess.getoutput",
-    "subprocess.getstatusoutput",
-    "subprocess.Popen",
-    "shutil.rmtree",
-    "shutil.move",
-    "shutil.chown",
-    "os.remove",
-    "os.unlink",
-    "os.rmdir",
-    "os.removedirs",
-    "os.rename",
-    "os.renames",
-    "os.replace",
-    "os.truncate",
-    "os.chmod",
-    "os.chown",
-    "os.lchmod",
-    "os.lchown",
-    "os.symlink",
-    "os.link",
-    "Path.unlink",
-    "Path.rmdir",
-    "Path.rename",
-    "Path.replace",
-    "Path.chmod",
-    "Path.lchmod",
-    "Path.symlink_to",
-    "Path.hardlink_to",
-}
-
-FORBIDDEN_CALL_ROOTS = {
-    "subprocess",
-    "pty",
-}
-FORBIDDEN_IMPORT_ROOTS = {
-    "asyncssh",
-    "fabric",
-    "ftplib",
-    "invoke",
-    "paramiko",
-    "pty",
-    "subprocess",
-    "telnetlib",
-}
-RUNTIME_FORBIDDEN_IMPORT_ROOTS = FORBIDDEN_IMPORT_ROOTS - {"subprocess"}
-FORBIDDEN_DYNAMIC_CALLS = {
-    "__import__",
-    "builtins.__import__",
-    "builtins.compile",
-    "builtins.eval",
-    "builtins.exec",
-    "compile",
-    "eval",
-    "exec",
-    "getattr",
-    "setattr",
-    "delattr",
-    "importlib.import_module",
-}
-FORBIDDEN_DESTRUCTIVE_METHOD_NAMES = {
-    "chmod",
-    "hardlink_to",
-    "lchmod",
-    "rmdir",
-    "symlink_to",
-    "unlink",
-}
-FORBIDDEN_COMMAND_NAMES = {
-    "chown",
-    "dd",
-    "rm",
-    "chmod",
-    "chgrp",
-    "cp",
-    "curl",
-    "git",
-    "mkfs",
-    "mv",
-    "reboot",
-    "rmdir",
-    "rsync",
-    "scp",
-    "sftp",
-    "shred",
-    "shutdown",
-    "ssh",
-    "sudo",
-    "su",
-    "truncate",
-    "umount",
-    "unlink",
-    "wget",
-}
-
-FORBIDDEN_AUDIT_EVENTS = {
-    "os.chmod",
-    "os.chown",
-    "os.fork",
-    "os.forkpty",
-    "os.kill",
-    "os.link",
-    "os.remove",
-    "os.rename",
-    "os.rmdir",
-    "os.symlink",
-    "os.system",
-    "os.truncate",
-    "shutil.chown",
-    "shutil.move",
-    "shutil.rmtree",
-    "socket.bind",
-    "socket.connect",
-    "socket.connect_ex",
-    "subprocess.Popen",
-}
-
-NODES = [
-    "blob.mit.edu",
-    "proteome.mit.edu",
-    "zubr.mit.edu",
-    "wiz.mit.edu",
-    "quill.mit.edu",
-    "dau.mit.edu",
-    "leavitt.mit.edu",
-    "ledenberg.mit.edu",
-    "dna.mit.edu",
-    "something.mit.edu",
-    "emmy.mit.edu",
-    "sofia.mit.edu",
-    "pavlov.mit.edu",
-    "evolution.mit.edu",
-    "rubin.mit.edu",
-    "kulibin.mit.edu",
-    "stevens.mit.edu",
-]
-
-if CONFIG_POLICY is not None:
-    REPO_ROOT = CONFIG_POLICY.repo_root
-    NODES = list(CONFIG_POLICY.nodes)
-    APPROVED_SCRIPT_ROOTS = list(CONFIG_POLICY.script_roots)
-    APPROVED_WRITE_ROOTS = list(CONFIG_POLICY.write_roots)
-    APPROVED_OUTPUT_ROOTS = list(CONFIG_POLICY.output_roots)
+    CONFIG_POLICY = policy
+    REPO_ROOT = policy.repo_root
+    NODES = list(policy.nodes)
+    APPROVED_SCRIPT_ROOTS = list(policy.script_roots)
+    APPROVED_WRITE_ROOTS = list(policy.write_roots)
+    APPROVED_OUTPUT_ROOTS = list(policy.output_roots)
     GPU_MCP_WRITE_ROOTS_RAW = os.pathsep.join(str(path) for path in APPROVED_WRITE_ROOTS)
-SYNC_TIMEOUT_SEC = CONFIG_POLICY.sync_timeout_sec if CONFIG_POLICY is not None else 300
+    SYNC_TIMEOUT_SEC = policy.sync_timeout_sec
+
+
+_apply_policy(CONFIG_POLICY)
+ACTIVE_POLICY_HASH = policy_file_hash(CONFIG_POLICY.config_path)
+ACTIVE_POLICY_FILE_STAT = CONFIG_POLICY.config_path.stat()
+_STALE_POLICY_HASH_CACHE = {
+    "signature": (
+        ACTIVE_POLICY_FILE_STAT.st_mtime_ns,
+        ACTIVE_POLICY_FILE_STAT.st_size,
+    ),
+    "hash": ACTIVE_POLICY_HASH,
+}
+PENDING_POLICY_RELOADS: dict[str, dict[str, object]] = {}
+POLICY_RELOAD_TOKEN_TTL_SEC = 60 * 60
+POLICY_RELOAD_MAX_PENDING = 64
 
 SSH_CONNECT_TIMEOUT = 8
+HOST_RUN_ERRORS: dict[tuple[str, str], str] = {}
+
+POLICY_RELOAD_AGENT_INSTRUCTIONS = [
+    "Show this raw preview output, including diff_summary and hashes, to the human.",
+    "Do not summarize it as the only evidence.",
+    "Call reload_policy only after explicit human approval.",
+    "If you edited gpu-mcp.toml yourself, remind the human to inspect the file before approving reload.",
+]
+
+
+def _cleanup_policy_reload_tokens(now: float | None = None) -> None:
+    now = time.monotonic() if now is None else now
+    expired = [
+        token
+        for token, pending in PENDING_POLICY_RELOADS.items()
+        if now - float(pending.get("created_at", 0.0)) > POLICY_RELOAD_TOKEN_TTL_SEC
+    ]
+    for token in expired:
+        PENDING_POLICY_RELOADS.pop(token, None)
+
+    while len(PENDING_POLICY_RELOADS) > POLICY_RELOAD_MAX_PENDING:
+        oldest = min(
+            PENDING_POLICY_RELOADS,
+            key=lambda token: float(PENDING_POLICY_RELOADS[token].get("created_at", 0.0)),
+        )
+        PENDING_POLICY_RELOADS.pop(oldest, None)
+
+
+def _pop_pending_policy_reload(token: str) -> tuple[dict[str, object] | None, str | None]:
+    pending = PENDING_POLICY_RELOADS.get(token)
+    if pending is None:
+        return None, "invalid or already used reload token"
+    now = time.monotonic()
+    if now - float(pending.get("created_at", 0.0)) > POLICY_RELOAD_TOKEN_TTL_SEC:
+        PENDING_POLICY_RELOADS.pop(token, None)
+        return None, "expired reload token; preview again"
+    return PENDING_POLICY_RELOADS.pop(token), None
+
+STALE_POLICY_REFUSAL = (
+    "gpu-mcp.toml has changed but has not been reloaded.\n"
+    "Active policy is still the old approved policy.\n"
+    "Do not revert the file. Do not edit any policy or Codex config file.\n"
+    "Stop immediately and explain to the human what you were trying to do, "
+    "what changed, and why GPU MCP refused to continue.\n"
+    "If the human intentionally changed the policy, the next step is "
+    "preview_policy_reload. Show the safety diff and call reload_policy only "
+    "after explicit human approval."
+)
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -267,6 +170,8 @@ def _conn(host: str, user: str = GPU_MCP_USER):
 
     connect_kwargs = {}
     key_path = Path(GPU_MCP_SSH_KEY).expanduser() if GPU_MCP_SSH_KEY else DEFAULT_GPU_MCP_SSH_KEY
+    if key_path.is_symlink():
+        raise RuntimeError(f"Dedicated GPU MCP SSH key must not be a symlink: {key_path}")
     if key_path.exists():
         connect_kwargs = {
             "key_filename": str(key_path),
@@ -279,6 +184,23 @@ def _conn(host: str, user: str = GPU_MCP_USER):
             "set GPU_MCP_SSH_KEY, or set GPU_MCP_ALLOW_SSH_FALLBACK=1 explicitly."
         )
     return Connection(host, user=user, connect_kwargs=connect_kwargs, connect_timeout=SSH_CONNECT_TIMEOUT)
+
+
+def _stale_policy_refusal() -> str | None:
+    try:
+        stat = CONFIG_POLICY.config_path.stat()
+        signature = (stat.st_mtime_ns, stat.st_size)
+        if _STALE_POLICY_HASH_CACHE.get("signature") == signature:
+            current_hash = str(_STALE_POLICY_HASH_CACHE["hash"])
+        else:
+            current_hash = policy_file_hash(CONFIG_POLICY.config_path)
+            _STALE_POLICY_HASH_CACHE["signature"] = signature
+            _STALE_POLICY_HASH_CACHE["hash"] = current_hash
+    except Exception as exc:
+        return f"{STALE_POLICY_REFUSAL}\nCurrent policy file could not be hashed: {exc}"
+    if current_hash != ACTIVE_POLICY_HASH:
+        return STALE_POLICY_REFUSAL
+    return None
 
 
 def _short_host(host: str) -> str:
@@ -302,12 +224,12 @@ def _is_local_host(host: str) -> bool:
         return True
     local = os.uname().nodename.lower()
     local_short = local.split(".", 1)[0]
-    return requested in {local, local_short, f"{local_short}.mit.edu"} or _short_host(requested) == local_short
+    return requested in {local, local_short} or _short_host(requested) == local_short
 
 
 def _allowed_host_names() -> set[str]:
     """Return accepted host aliases for tool inputs."""
-    hosts: set[str] = {"localhost", "127.0.0.1", "::1"}
+    hosts: set[str] = set()
     for node in NODES:
         host = node.split("@")[-1].strip().lower()
         short = host.split(".", 1)[0]
@@ -317,38 +239,72 @@ def _allowed_host_names() -> set[str]:
 
 
 def _is_allowed_host(host: str) -> bool:
-    """Restrict remote tools to configured cluster hosts plus local aliases."""
+    """Restrict tools to configured repo policy hosts."""
     requested = host.split("@")[-1].strip().lower()
-    return requested in _allowed_host_names() or _is_local_host(requested)
+    return requested in _allowed_host_names()
+
+
+def _host_run_error(host: str, cmd: str) -> str:
+    return HOST_RUN_ERRORS.get((host, cmd), "")
+
+
+def _record_host_run_error(host: str, cmd: str, message: str) -> None:
+    HOST_RUN_ERRORS[(host, cmd)] = message
+
+
+def _classify_run_exception(exc: BaseException) -> str:
+    text = str(exc).strip()
+    lowered = text.lower()
+    if isinstance(exc, subprocess.TimeoutExpired) or "timed out" in lowered or "timeout" in lowered:
+        return f"timeout: {text}"
+    if "auth" in lowered or "permission denied" in lowered or "publickey" in lowered:
+        return f"authentication failed: {text}"
+    if "refused" in lowered or "could not resolve" in lowered or "name or service" in lowered:
+        return f"connection failed: {text}"
+    return text or exc.__class__.__name__
 
 
 def _local_shell_run(cmd: str, timeout: int = 15) -> Optional[str]:
-    """Run a bounded local shell command for GPU status probes."""
+    """Run a bounded local probe command without invoking a shell."""
+    HOST_RUN_ERRORS.pop(("local", cmd), None)
     try:
+        argv = shlex.split(cmd)
         result = subprocess.run(
-            cmd,
-            shell=True,
+            argv,
             check=False,
             capture_output=True,
             text=True,
             timeout=timeout,
             cwd=str(REPO_ROOT),
-            executable="/bin/bash",
         )
-    except Exception:
+    except Exception as exc:
+        _record_host_run_error("local", cmd, _classify_run_exception(exc))
         return None
     if result.returncode != 0:
+        _record_host_run_error(
+            "local",
+            cmd,
+            f"exit {result.returncode}: {(result.stderr or result.stdout).strip()}",
+        )
         return None
-    return result.stdout.strip()
+    return f"{result.stdout}{result.stderr}".strip()
 
 
-def _ssh_run(host: str, cmd: str, user: str = GPU_MCP_USER, hide: bool = True) -> Optional[str]:
+def _ssh_run(
+    host: str,
+    cmd: str,
+    user: str = GPU_MCP_USER,
+    hide: bool = True,
+    timeout: int = 15,
+) -> Optional[str]:
     """Run a command on a remote host. Returns stdout or None on failure."""
+    HOST_RUN_ERRORS.pop((host, cmd), None)
     try:
         c = _conn(host, user)
-        result = c.run(cmd, hide=hide, timeout=15)
+        result = c.run(cmd, hide=hide, timeout=timeout)
         return result.stdout.strip()
     except Exception as e:
+        _record_host_run_error(host, cmd, _classify_run_exception(e))
         return None
 
 
@@ -356,7 +312,15 @@ def _host_run(host: str, cmd: str, user: str = GPU_MCP_USER, timeout: int = 15) 
     """Run a status command locally for this host, otherwise through SSH."""
     if _is_local_host(host):
         return _local_shell_run(cmd, timeout=timeout)
-    return _ssh_run(host, cmd, user=user)
+    return _ssh_run(host, cmd, user=user, timeout=timeout)
+
+
+def _parse_optional_int(value: str) -> Optional[int]:
+    text = value.replace("%", "").replace("MiB", "").strip()
+    try:
+        return int(text)
+    except (TypeError, ValueError):
+        return None
 
 
 def _parse_nvsmi_csv(raw: str) -> list[dict]:
@@ -365,45 +329,77 @@ def _parse_nvsmi_csv(raw: str) -> list[dict]:
     for line in raw.strip().splitlines():
         parts = [p.strip() for p in line.split(",")]
         if len(parts) >= 4:
+            gpu_index = _parse_optional_int(parts[0])
+            if gpu_index is None:
+                continue
             gpus.append({
-                "index": int(parts[0]),
+                "index": gpu_index,
                 "name": parts[1],
-                "utilization_pct": int(parts[2].replace("%", "").strip()),
-                "memory_used_MiB": int(parts[3].replace("MiB", "").strip()),
-                "memory_total_MiB": int(parts[4].replace("MiB", "").strip()) if len(parts) > 4 else None,
+                "utilization_pct": _parse_optional_int(parts[2]),
+                "memory_used_MiB": _parse_optional_int(parts[3]),
+                "memory_total_MiB": _parse_optional_int(parts[4]) if len(parts) > 4 else None,
             })
     return gpus
 
 
 def _resolve_under(path: str, roots: list[Path], label: str, must_exist: bool) -> Path:
     """Resolve a path and require it to live under one approved root."""
-    p = Path(path).expanduser()
-    if must_exist and not p.exists():
-        raise ValueError(f"{label} does not exist: {path}")
-    resolved = p.resolve(strict=must_exist)
-    root_paths = [root.expanduser().resolve() for root in roots]
-    if not any(resolved == root or root in resolved.parents for root in root_paths):
-        allowed = ", ".join(str(root) for root in root_paths)
-        raise ValueError(f"{label} must be under approved roots: {allowed}")
-    return resolved
+    return gpu_mcp_guard.resolve_under(
+        path,
+        repo_root=REPO_ROOT,
+        roots=roots,
+        label=label,
+        must_exist=must_exist,
+    )
 
 
 def _validate_python_script_path(script_path: str) -> Path:
     """Validate that a remote GPU job targets an approved existing Python file."""
-    script = _resolve_under(
-        script_path, APPROVED_SCRIPT_ROOTS, "script_path", must_exist=True
+    return gpu_mcp_guard.validate_python_script_path(
+        script_path,
+        repo_root=REPO_ROOT,
+        script_roots=APPROVED_SCRIPT_ROOTS,
     )
-    if script.suffix != ".py":
-        raise ValueError("script_path must point to a .py file")
-    if not script.is_file():
-        raise ValueError("script_path must point to a regular file")
-    return script
+
+
+def _open_output_no_follow(path: Path):
+    """Open an output file without following a final-component symlink."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags, 0o600)
+    try:
+        fd_path = Path(f"/proc/self/fd/{fd}")
+        if fd_path.exists() and not _path_under_roots(fd_path.resolve(), APPROVED_OUTPUT_ROOTS):
+            raise PermissionError(f"GPU MCP blocked output outside approved roots: {path}")
+        return os.fdopen(fd, "w")
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _prepare_output_parent(path: Path) -> None:
+    """Require an already-created, non-symlink output parent under output roots."""
+    parent = path.parent
+    if parent.is_symlink():
+        raise ValueError(f"output_file parent must not be a symlink: {parent}")
+    if not parent.exists():
+        raise ValueError(f"output_file parent directory must already exist: {parent}")
+    if not parent.is_dir():
+        raise ValueError(f"output_file parent must be a directory: {parent}")
+    if not _path_under_roots(parent, APPROVED_OUTPUT_ROOTS):
+        raise ValueError(f"output_file parent must be under approved roots: {parent}")
 
 
 def _validate_output_path(output_file: Optional[str]) -> Path:
     """Validate output path for remote stdout/stderr redirection."""
     if output_file is None:
-        return REPO_ROOT / ".gpu_mcp_logs" / f"gpu_python_job_{int(time.time())}.log"
+        return _resolve_under(
+            str(APPROVED_OUTPUT_ROOTS[0] / f"gpu_python_job_{int(time.time())}.log"),
+            APPROVED_OUTPUT_ROOTS,
+            "output_file",
+            must_exist=False,
+        )
     output = _resolve_under(
         output_file, APPROVED_OUTPUT_ROOTS, "output_file", must_exist=False
     )
@@ -412,206 +408,99 @@ def _validate_output_path(output_file: Optional[str]) -> Path:
     return output
 
 
-def _full_call_name(node: ast.AST, aliases: dict[str, str]) -> Optional[str]:
-    """Return a dotted call name, resolving simple import aliases."""
-    if isinstance(node, ast.Name):
-        return aliases.get(node.id, node.id)
-    if isinstance(node, ast.Attribute):
-        parent = _full_call_name(node.value, aliases)
-        if parent:
-            return f"{parent}.{node.attr}"
-    return None
+def _file_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _import_aliases(tree: ast.AST) -> dict[str, str]:
-    """Collect simple import aliases so aliased unsafe calls are still caught."""
-    aliases: dict[str, str] = {}
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for item in node.names:
-                aliases[item.asname or item.name.split(".")[0]] = item.name
-        elif isinstance(node, ast.ImportFrom) and node.module:
-            for item in node.names:
-                aliases[item.asname or item.name] = f"{node.module}.{item.name}"
-    return aliases
+def _runner_bundle_sources() -> dict[str, bytes]:
+    base = Path(__file__).resolve().parent
+    return {
+        "gpu_mcp_safe_runner.py": (base / "gpu_mcp_safe_runner.py").read_bytes(),
+        "gpu_mcp_guard.py": (base / "gpu_mcp_guard.py").read_bytes(),
+    }
 
 
-def _module_root(module_name: str) -> str:
-    """Return the top-level module name for import and call checks."""
-    return module_name.split(".", 1)[0]
+def _safe_runner_source_hash() -> str:
+    return hashlib.sha256(_runner_bundle_sources()["gpu_mcp_safe_runner.py"]).hexdigest()
 
 
-def _import_rejection_issue(module_name: str) -> Optional[str]:
-    """Return an issue if an import grants shell or remote-control ability."""
-    root = _module_root(module_name)
-    if root in FORBIDDEN_IMPORT_ROOTS:
-        return f"forbidden import: {module_name}"
-    return None
+def _ensure_staged_safe_runner() -> Path:
+    """Stage the standalone runner into the repo without following symlinks."""
+    runner_dir = REPO_ROOT / ".gpu_mcp_runner"
+    if runner_dir.exists() and runner_dir.is_symlink():
+        raise ValueError(f"safe runner directory must not be a symlink: {runner_dir}")
+    runner_dir.mkdir(mode=0o700, exist_ok=True)
+    bundle = _runner_bundle_sources()
+    file_hashes: dict[str, str] = {}
+    for filename, source in bundle.items():
+        target = runner_dir / filename
+        expected_hash = hashlib.sha256(source).hexdigest()
+        file_hashes[filename] = expected_hash
+        needs_write = True
+        if target.exists() and not target.is_symlink():
+            try:
+                needs_write = _file_sha256(target) != expected_hash
+            except OSError:
+                needs_write = True
 
+        if needs_write:
+            tmp_path = runner_dir / f".{filename}.{os.getpid()}.tmp"
+            tmp_path.write_bytes(source)
+            tmp_path.chmod(0o700)
+            os.replace(tmp_path, target)
+            print(
+                f"GPU MCP staged runner bundle file at {target} sha256={expected_hash}",
+                file=sys.stderr,
+            )
 
-def _runtime_import_rejection_issue(module_name: str) -> Optional[str]:
-    """Runtime import guard; process execution itself is blocked by audit events."""
-    root = _module_root(module_name)
-    if root in RUNTIME_FORBIDDEN_IMPORT_ROOTS:
-        return f"forbidden runtime import: {module_name}"
-    return None
-
-
-def _call_rejection_issue(call_name: Optional[str]) -> Optional[str]:
-    """Return an issue if a call is unsafe or too dynamic to vet."""
-    if not call_name:
-        return None
-    root = _module_root(call_name)
-    leaf = call_name.rsplit(".", 1)[-1]
-    if call_name in FORBIDDEN_CALLS:
-        return f"forbidden call: {call_name}"
-    if root in FORBIDDEN_CALL_ROOTS:
-        return f"forbidden call family: {root}"
-    if call_name in FORBIDDEN_DYNAMIC_CALLS or leaf in FORBIDDEN_DYNAMIC_CALLS:
-        return f"forbidden dynamic execution: {call_name}"
-    return None
-
-
-def _literal_string_list(node: ast.AST) -> Optional[list[str]]:
-    """Extract a list of literal string tokens from a Python literal node."""
-    if isinstance(node, ast.Constant) and isinstance(node.value, str):
-        try:
-            return shlex.split(node.value)
-        except ValueError:
-            return [node.value]
-    if isinstance(node, (ast.List, ast.Tuple)):
-        values = []
-        for elt in node.elts:
-            if not (isinstance(elt, ast.Constant) and isinstance(elt.value, str)):
-                return None
-            values.append(elt.value)
-        return values
-    return None
-
-
-def _is_recursive_remove(tokens: list[str]) -> bool:
-    """Detect tokenized recursive removal without relying on a shell string."""
-    if not tokens or tokens[0] != "rm":
-        return False
-    for token in tokens[1:]:
-        if token == "--recursive":
-            return True
-        if token.startswith("-") and "r" in token.lower()[1:]:
-            return True
-    return False
-
-
-def _dangerous_command_issue(tokens: list[str]) -> Optional[str]:
-    """Return a human-readable issue for forbidden shell command tokens."""
-    if not tokens:
-        return None
-    command = Path(tokens[0]).name
-    normalized = [command] + tokens[1:]
-    if _is_recursive_remove(normalized):
-        return "recursive remove command"
-    for token in tokens:
-        cleaned = token.strip(" \t\r\n;|&(){}[]<>")
-        if not cleaned:
-            continue
-        candidate = Path(cleaned).name
-        if candidate in FORBIDDEN_COMMAND_NAMES:
-            return f"forbidden command token: {candidate}"
-    return None
+    manifest_path = runner_dir / "runner_manifest.json"
+    manifest = {
+        "schema_version": 1,
+        "runner_path": str(runner_dir / "gpu_mcp_safe_runner.py"),
+        "files": {
+            filename: {"sha256": file_hash}
+            for filename, file_hash in sorted(file_hashes.items())
+        },
+        "updated_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+    }
+    tmp_manifest = runner_dir / f".runner_manifest.{os.getpid()}.tmp"
+    tmp_manifest.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    os.replace(tmp_manifest, manifest_path)
+    return runner_dir / "gpu_mcp_safe_runner.py"
 
 
 def _script_rejection_message(script: Path, issues: list[str]) -> str:
     """Build a strong rejection message for unsafe remote GPU scripts."""
-    details = "\n".join(f"- {issue}" for issue in issues)
-    return (
-        f"REJECTED: unsafe Python GPU script: {script}\n"
-        f"{details}\n"
-        "This file contains destructive, shell, dynamic-execution, or remote-control "
-        "behavior. Running it through GPU MCP is blocked because "
-        "repo files are shared across hosts. Remove the offending code and rerun "
-        "local review before requesting GPU execution. If you think you cannot do your job "
-        "without the blocked behavior, please TERMINATE AND STOP WORKING."
-    )
+    return gpu_mcp_guard._script_rejection_message(script, issues)
+
+
+def _read_script_no_follow(script: Path) -> str:
+    """Read an already validated script without following a swapped symlink."""
+    return gpu_mcp_guard.read_script_no_follow(script, script_roots=APPROVED_SCRIPT_ROOTS)
+
+
+def _scan_python_source_safety(script: Path, source: str) -> list[str]:
+    """Inspect Python source and return safety issues without executing it."""
+    return gpu_mcp_guard.scan_python_source_safety(script, source)
 
 
 def scan_python_gpu_script_safety(script_path: str) -> list[str]:
     """Inspect a Python GPU script and return safety issues without executing it."""
-    script = _validate_python_script_path(script_path)
-    try:
-        source = script.read_text()
-        tree = ast.parse(source, filename=str(script))
-    except SyntaxError as e:
-        return [f"line {e.lineno}: invalid Python syntax: {e.msg}"]
-    except UnicodeDecodeError as e:
-        return [f"could not decode script as text: {e}"]
-
-    aliases = _import_aliases(tree)
-    issues: list[str] = []
-
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            lineno = getattr(node, "lineno", "?")
-            for item in node.names:
-                issue = _import_rejection_issue(item.name)
-                if issue:
-                    issues.append(f"line {lineno}: {issue}")
-
-        elif isinstance(node, ast.ImportFrom) and node.module:
-            lineno = getattr(node, "lineno", "?")
-            issue = _import_rejection_issue(node.module)
-            if issue:
-                issues.append(f"line {lineno}: {issue}")
-
-        elif isinstance(node, ast.Call):
-            name = _full_call_name(node.func, aliases)
-            lineno = getattr(node, "lineno", "?")
-            issue = _call_rejection_issue(name)
-            if issue is None and isinstance(node.func, ast.Attribute):
-                method_name = node.func.attr
-                if method_name in FORBIDDEN_DESTRUCTIVE_METHOD_NAMES:
-                    issue = f"forbidden destructive method: {method_name}"
-            if issue:
-                issues.append(f"line {lineno}: {issue}")
-
-            for arg in node.args:
-                tokens = _literal_string_list(arg)
-                if tokens:
-                    issue = _dangerous_command_issue(tokens)
-                    if issue:
-                        issues.append(f"line {lineno}: {issue}")
-
-        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
-            try:
-                tokens = shlex.split(node.value)
-            except ValueError:
-                tokens = [node.value]
-            issue = _dangerous_command_issue(tokens)
-            if issue:
-                lineno = getattr(node, "lineno", "?")
-                issues.append(f"line {lineno}: {issue}")
-
-    return sorted(set(issues))
+    return gpu_mcp_guard.scan_python_script_safety(
+        script_path,
+        repo_root=REPO_ROOT,
+        script_roots=APPROVED_SCRIPT_ROOTS,
+    )
 
 
 def _path_under_roots(path: object, roots: list[Path]) -> bool:
     """Return True when a path resolves under at least one approved root."""
-    if not isinstance(path, (str, bytes, os.PathLike)):
-        return True
-    try:
-        resolved = Path(path).expanduser().resolve(strict=False)
-    except Exception:
-        return False
-    root_paths = [root.expanduser().resolve(strict=False) for root in roots]
-    return any(resolved == root or root in resolved.parents for root in root_paths)
+    return gpu_mcp_guard.path_under_roots(path, roots)
 
 
 def _open_is_write(mode: object, flags: object) -> bool:
     """Detect write-capable open calls from audit-hook arguments."""
-    mode_text = "" if mode is None else str(mode)
-    if any(marker in mode_text for marker in ("w", "a", "x", "+")):
-        return True
-    if isinstance(flags, int):
-        return bool(flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_TRUNC))
-    return False
+    return gpu_mcp_guard._open_is_write(mode, flags)
 
 
 def _safe_run_audit_hook(event: str, args: tuple) -> None:
@@ -622,55 +511,12 @@ def _safe_run_audit_hook(event: str, args: tuple) -> None:
     destructive filesystem operations, socket connections, and writes outside
     approved write roots.
     """
-    if event in FORBIDDEN_AUDIT_EVENTS or event.startswith("subprocess."):
-        raise PermissionError(f"GPU MCP blocked runtime event: {event}")
-    if event == "import" and args:
-        module_name = str(args[0])
-        issue = _runtime_import_rejection_issue(module_name)
-        if issue:
-            raise PermissionError(f"GPU MCP blocked runtime import: {module_name}")
-    if event == "open" and len(args) >= 3:
-        path, mode, flags = args[0], args[1], args[2]
-        if _open_is_write(mode, flags) and not _path_under_roots(path, APPROVED_WRITE_ROOTS):
-            raise PermissionError(f"GPU MCP blocked write outside approved roots: {path}")
-    if event == "sqlite3.connect" and args:
-        path = args[0]
-        if path != ":memory:" and not _path_under_roots(path, APPROVED_WRITE_ROOTS):
-            raise PermissionError(f"GPU MCP blocked sqlite database outside approved roots: {path}")
-    if event == "os.mkdir" and args:
-        path = args[0]
-        if not _path_under_roots(path, APPROVED_WRITE_ROOTS):
-            raise PermissionError(
-                f"GPU MCP blocked directory creation outside approved roots: {path}"
-            )
+    return gpu_mcp_guard.make_safe_run_audit_hook(APPROVED_WRITE_ROOTS)(event, args)
 
 
 def _install_preopen_write_guards() -> None:
     """Patch Python open entrypoints so write checks happen before OS open."""
-    original_builtin_open = builtins.open
-    original_io_open = io.open
-    original_os_open = os.open
-
-    def guarded_builtin_open(file, mode="r", buffering=-1, encoding=None, errors=None, newline=None, closefd=True, opener=None):
-        if _open_is_write(mode, None) and not _path_under_roots(file, APPROVED_WRITE_ROOTS):
-            raise PermissionError(f"GPU MCP blocked write outside approved roots: {file}")
-        return original_builtin_open(file, mode, buffering, encoding, errors, newline, closefd, opener)
-
-    def guarded_io_open(file, mode="r", buffering=-1, encoding=None, errors=None, newline=None, closefd=True, opener=None):
-        if _open_is_write(mode, None) and not _path_under_roots(file, APPROVED_WRITE_ROOTS):
-            raise PermissionError(f"GPU MCP blocked write outside approved roots: {file}")
-        return original_io_open(file, mode, buffering, encoding, errors, newline, closefd, opener)
-
-    def guarded_os_open(path, flags, mode=0o777, *, dir_fd=None):
-        if _open_is_write(None, flags) and not _path_under_roots(path, APPROVED_WRITE_ROOTS):
-            raise PermissionError(f"GPU MCP blocked write outside approved roots: {path}")
-        if dir_fd is None:
-            return original_os_open(path, flags, mode)
-        return original_os_open(path, flags, mode, dir_fd=dir_fd)
-
-    builtins.open = guarded_builtin_open
-    io.open = guarded_io_open
-    os.open = guarded_os_open
+    gpu_mcp_guard.install_preopen_write_guards(APPROVED_WRITE_ROOTS)
 
 
 def _run_script_under_guard(argv: list[str]) -> int:
@@ -685,36 +531,78 @@ def _run_script_under_guard(argv: list[str]) -> int:
     else:
         script_arg = argv[0]
         script_args = argv[1:]
-    script = _validate_python_script_path(script_arg)
-    issues = scan_python_gpu_script_safety(str(script))
-    if issues:
-        print(_script_rejection_message(script, issues), file=sys.stderr)
-        return 126
-    sys.addaudithook(_safe_run_audit_hook)
-    _install_preopen_write_guards()
-    sys.argv = [str(script)] + [str(arg) for arg in script_args]
-    runpy.run_path(str(script), run_name="__main__")
-    return 0
+    return gpu_mcp_guard.run_job(
+        script_arg,
+        [str(arg) for arg in script_args],
+        repo_root=REPO_ROOT,
+        script_roots=APPROVED_SCRIPT_ROOTS,
+        write_roots=APPROVED_WRITE_ROOTS,
+    )
 
 
-def _build_python_gpu_argv(script_path: str, args: Optional[list[str]] = None) -> list[str]:
+def _build_python_gpu_argv(
+    script_path: str,
+    args: Optional[list[str]] = None,
+    execution_host: Optional[str] = None,
+) -> list[str]:
     """Build argv for an approved script launched through the guarded runner."""
     script = _validate_python_script_path(script_path)
     issues = scan_python_gpu_script_safety(str(script))
     if issues:
         raise ValueError(_script_rejection_message(script, issues))
+    if execution_host is not None and not _is_local_host(execution_host):
+        runner = _ensure_staged_safe_runner()
+        return [
+            PYTHON,
+            str(runner),
+            "--job",
+            str(script),
+            "--repo-root",
+            str(REPO_ROOT),
+            "--script-roots",
+            json.dumps([str(path) for path in APPROVED_SCRIPT_ROOTS]),
+            "--write-roots",
+            json.dumps([str(path) for path in APPROVED_WRITE_ROOTS]),
+            "--",
+        ] + [str(arg) for arg in (args or [])]
     return [
         PYTHON,
         str(Path(__file__).resolve()),
+        "--config",
+        str(Path(GPU_MCP_CONFIG_PATH).expanduser().resolve()),
         "--safe-run",
         str(script),
         "--",
     ] + [str(arg) for arg in (args or [])]
 
 
-def _build_python_gpu_command(script_path: str, args: Optional[list[str]] = None) -> str:
-    """Build a shell-quoted Python command for an approved script."""
-    return shlex.join(_build_python_gpu_argv(script_path, args=args))
+def _remote_async_launch_command(argv: list[str], out_path: Path, env_values: dict[str, str]) -> str:
+    """Build a remote launcher that opens async output with O_NOFOLLOW."""
+    wrapper = (
+        "import json, os, subprocess, sys\n"
+        "out_path, cwd, argv_json, env_json = sys.argv[1:5]\n"
+        "flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC\n"
+        "if hasattr(os, 'O_NOFOLLOW'):\n"
+        "    flags |= os.O_NOFOLLOW\n"
+        "fd = os.open(out_path, flags, 0o600)\n"
+        "env = os.environ.copy()\n"
+        "env.update(json.loads(env_json))\n"
+        "proc = subprocess.Popen(json.loads(argv_json), stdout=fd, stderr=subprocess.STDOUT, "
+        "stdin=subprocess.DEVNULL, env=env, cwd=cwd, start_new_session=True)\n"
+        "os.close(fd)\n"
+        "print(proc.pid)\n"
+    )
+    return shlex.join(
+        [
+            PYTHON,
+            "-c",
+            wrapper,
+            str(out_path),
+            str(REPO_ROOT),
+            json.dumps(argv),
+            json.dumps(env_values),
+        ]
+    )
 
 
 def _gpu_job_env(gpu_index: int) -> dict[str, str]:
@@ -727,8 +615,6 @@ def _gpu_job_env(gpu_index: int) -> dict[str, str]:
     }
     if GPU_MCP_WRITE_ROOTS_RAW:
         env["GPU_MCP_WRITE_ROOTS"] = GPU_MCP_WRITE_ROOTS_RAW
-    if GPU_MCP_CONFIG_PATH:
-        env["GPU_MCP_CONFIG"] = str(Path(GPU_MCP_CONFIG_PATH).expanduser().resolve())
     return env
 
 
@@ -899,8 +785,8 @@ from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP("gpu-cluster", instructions=(
     "GPU cluster management server. Provides tools to check GPU availability "
-    "across the MIT compute cluster, run approved Python files on specific "
-    "GPUs, identify which processes own which GPUs, and signal only GPU_MCP_USER "
+    "across configured hosts, run approved Python files on specific GPUs, "
+    "identify which processes own which GPUs, and signal only GPU_MCP_USER "
     "processes after fingerprint confirmation. kill_gpu_process is not a "
     "general cleanup or scheduling tool: use it only for a specific PID that "
     "the caller intends to stop. First inspect the target, read the owner, GPU, "
@@ -909,22 +795,114 @@ mcp = FastMCP("gpu-cluster", instructions=(
 ))
 
 
-# Report known inference-capable GPU nodes.
-# Most are RTX 4090 hosts; sofia has 4x RTX 3080 and is useful for lighter jobs.
-RTX4090_HOSTS = {
-    "blob",
-    "wiz",
-    "leavitt",
-    "ledenberg",
-    "dna",
-    "something",
-    "emmy",
-    "pavlov",
-    "evolution",
-    "stevens",
-    "kulibin",
-    "sofia",
-}
+@mcp.tool()
+def preview_policy_reload():
+    """Validate changed gpu-mcp.toml and preview an explicit policy reload.
+
+    This does not activate the candidate policy. It returns a one-time reload
+    token only after the file validates and the safety-relevant diff is shown
+    to the human.
+    """
+    _cleanup_policy_reload_tokens()
+    try:
+        candidate = load_policy(CONFIG_POLICY.config_path)
+    except ConfigError as exc:
+        return json.dumps({
+            "status": "error",
+            "validation": "fail",
+            "reason": str(exc),
+        }, sort_keys=True)
+
+    candidate_hash = policy_file_hash(candidate.config_path)
+    diff_summary = diff_policy_summary(CONFIG_POLICY, candidate)
+    token = "gpu-mcp-reload-v1:" + secrets.token_urlsafe(24)
+    PENDING_POLICY_RELOADS[token] = {
+        "candidate_hash": candidate_hash,
+        "diff_summary": diff_summary,
+        "created_at": time.monotonic(),
+    }
+    _cleanup_policy_reload_tokens()
+    return json.dumps({
+        "status": "preview",
+        "validation": "pass",
+        "config_path": str(candidate.config_path),
+        "active_hash": ACTIVE_POLICY_HASH,
+        "candidate_hash": candidate_hash,
+        "diff_summary": diff_summary,
+        "reload_token": token,
+        "agent_instructions": POLICY_RELOAD_AGENT_INSTRUCTIONS,
+    }, sort_keys=True)
+
+
+@mcp.tool()
+def reload_policy(token: str):
+    """Activate a previously previewed and human-approved policy reload."""
+    global ACTIVE_POLICY_HASH
+    global _STALE_POLICY_HASH_CACHE
+
+    if not isinstance(token, str) or not token:
+        return json.dumps({
+            "status": "refused",
+            "reason": "reload token is required",
+        }, sort_keys=True)
+    pending, token_error = _pop_pending_policy_reload(token)
+    if pending is None:
+        return json.dumps({
+            "status": "refused",
+            "reason": token_error,
+        }, sort_keys=True)
+
+    try:
+        candidate = load_policy(CONFIG_POLICY.config_path)
+    except ConfigError as exc:
+        return json.dumps({
+            "status": "error",
+            "validation": "fail",
+            "reason": str(exc),
+        }, sort_keys=True)
+
+    candidate_hash = policy_file_hash(candidate.config_path)
+    if candidate_hash != pending["candidate_hash"]:
+        return json.dumps({
+            "status": "refused",
+            "reason": "policy changed after preview; preview again",
+        }, sort_keys=True)
+
+    approve_policy(candidate, diff_summary=list(pending["diff_summary"]))
+    _apply_policy(candidate)
+    ACTIVE_POLICY_HASH = candidate_hash
+    stat = CONFIG_POLICY.config_path.stat()
+    _STALE_POLICY_HASH_CACHE = {
+        "signature": (stat.st_mtime_ns, stat.st_size),
+        "hash": ACTIVE_POLICY_HASH,
+    }
+    return json.dumps({
+        "status": "reloaded",
+        "config_path": str(candidate.config_path),
+        "active_hash": ACTIVE_POLICY_HASH,
+        "diff_summary": pending["diff_summary"],
+    }, sort_keys=True)
+
+
+@mcp.tool()
+def reject_policy_reload(token: str):
+    """Discard a previously previewed policy reload token without changing policy."""
+    if not isinstance(token, str) or not token:
+        return json.dumps({
+            "status": "refused",
+            "reason": "reload token is required",
+        }, sort_keys=True)
+    pending, token_error = _pop_pending_policy_reload(token)
+    if pending is None:
+        return json.dumps({
+            "status": "refused",
+            "reason": token_error,
+        }, sort_keys=True)
+    return json.dumps({
+        "status": "rejected",
+        "active_hash": ACTIVE_POLICY_HASH,
+        "reason": "reload token discarded; active policy unchanged",
+    }, sort_keys=True)
 
 
 @mcp.tool()
@@ -934,9 +912,9 @@ def check_gpus(
 ):
     """Check GPU availability across the cluster.
 
-    Uses check_gpus.bash which SSHes to all nodes, takes multiple
-    nvidia-smi samples, averages utilization, and reports AVAILABLE/BUSY.
-    Only shows RTX 4090 nodes (others lack memory for inference).
+    SSHes to configured nodes, takes multiple nvidia-smi samples, averages
+    utilization, applies repo policy GPU-name/free-memory filters, and reports
+    AVAILABLE/BUSY.
 
     Args:
         samples: Number of utilization samples to average (default 2).
@@ -945,8 +923,12 @@ def check_gpus(
     Returns:
         Formatted report of GPU status across the cluster.
     """
-    samples = max(1, int(samples))
-    threshold = int(threshold)
+    if stale := _stale_policy_refusal():
+        return stale
+    if not isinstance(samples, int) or isinstance(samples, bool) or samples < 1:
+        return "ERROR: samples must be a positive integer"
+    if not isinstance(threshold, int) or isinstance(threshold, bool) or threshold < 0:
+        return "ERROR: threshold must be a non-negative integer"
     query = (
         "nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total "
         "--format=csv,noheader,nounits"
@@ -959,8 +941,6 @@ def check_gpus(
     for node in NODES:
         user, host = _node_user_host(node)
         short_host = host.split(".", 1)[0]
-        if short_host not in RTX4090_HOSTS:
-            continue
         local_host = _is_local_host(host)
         route = "local" if local_host else "ssh"
 
@@ -977,7 +957,9 @@ def check_gpus(
 
         lines.append(f"[{short_host} {route}]")
         if failed or not sample_sets:
-            lines.append("  ssh/nvidia-smi failed")
+            reason = _host_run_error("local" if local_host else host, query)
+            suffix = f": {reason}" if reason else ""
+            lines.append(f"  ssh/nvidia-smi failed{suffix}")
             continue
         if not local_host:
             remote_successes += 1
@@ -987,21 +969,33 @@ def check_gpus(
             seen = [sample[gpu_index] for sample in sample_sets if gpu_index < len(sample)]
             if not seen:
                 continue
-            avg_util = sum(g["utilization_pct"] for g in seen) / len(seen)
+            util_values = [g["utilization_pct"] for g in seen if g["utilization_pct"] is not None]
+            avg_util = sum(util_values) / len(util_values) if util_values else None
             last = seen[-1]
+            if CONFIG_POLICY.allowed_gpu_names and not any(
+                name in last["name"] for name in CONFIG_POLICY.allowed_gpu_names
+            ):
+                continue
             mem_free = (
-                int(last["memory_total_MiB"] or 0) - int(last["memory_used_MiB"])
-                if last["memory_total_MiB"] is not None
+                int(last["memory_total_MiB"]) - int(last["memory_used_MiB"])
+                if last["memory_total_MiB"] is not None and last["memory_used_MiB"] is not None
                 else None
             )
-            status = "AVAILABLE" if avg_util <= threshold and (mem_free is None or mem_free >= 16000) else "BUSY"
+            status = (
+                "AVAILABLE"
+                if avg_util is not None
+                and avg_util <= threshold
+                and (mem_free is None or mem_free >= CONFIG_POLICY.min_free_memory_mib)
+                else "BUSY"
+            )
             mem_text = (
                 f"{last['memory_used_MiB']}/{last['memory_total_MiB']} MiB"
                 if last["memory_total_MiB"] is not None
                 else f"{last['memory_used_MiB']} MiB"
             )
+            util_text = f"{avg_util:.1f}%" if avg_util is not None else "N/A"
             lines.append(
-                f"  GPU {last['index']} | {last['name']} | util_avg={avg_util:.1f}% | "
+                f"  GPU {last['index']} | {last['name']} | util_avg={util_text} | "
                 f"mem={mem_text} | {status}"
             )
 
@@ -1011,7 +1005,7 @@ def check_gpus(
             "routing is not installed from this control host."
         )
 
-    return "\n".join(lines) if len(lines) > 1 else "(no RTX 4090 nodes available)"
+    return "\n".join(lines) if len(lines) > 1 else "(no configured GPU nodes available)"
 
 
 @mcp.tool()
@@ -1032,6 +1026,14 @@ def check_gpu_processes(
     Returns:
         Per-host report of GPU-owning processes with PID, user, command, and memory usage.
     """
+    if stale := _stale_policy_refusal():
+        return stale
+    if hosts is not None and (
+        not isinstance(hosts, list) or any(not isinstance(host, str) for host in hosts)
+    ):
+        return "ERROR: hosts must be a list of host strings"
+    if user_filter is not None and not isinstance(user_filter, str):
+        return "ERROR: user_filter must be a string or null"
     if hosts is None:
         hosts = [n.split("@")[-1] for n in NODES]
     if user_filter is None:
@@ -1054,7 +1056,9 @@ def check_gpu_processes(
         uuid_raw = _host_run(host, uuid_query)
 
         if proc_raw is None or uuid_raw is None:
-            lines.append(f"[{host}] SSH/nvidia-smi failed")
+            reason = _host_run_error(host, proc_query) or _host_run_error(host, uuid_query)
+            suffix = f": {reason}" if reason else ""
+            lines.append(f"[{host}] SSH/nvidia-smi failed{suffix}")
             continue
 
         # Build UUID → index map
@@ -1062,7 +1066,9 @@ def check_gpu_processes(
         for row in uuid_raw.strip().splitlines():
             parts = [p.strip() for p in row.split(",")]
             if len(parts) >= 2:
-                uuid_to_idx[parts[1]] = int(parts[0])
+                parsed_index = _parse_optional_int(parts[0])
+                if parsed_index is not None:
+                    uuid_to_idx[parts[1]] = parsed_index
 
         if not proc_raw.strip():
             lines.append(f"[{host}] no GPU compute processes running")
@@ -1077,7 +1083,7 @@ def check_gpu_processes(
             gpu_idx = uuid_to_idx.get(gpu_uuid, "?")
 
             # Get the owning user and full command via ps
-            ps_raw = _host_run(host, f"ps -p {pid} -o user=,args= 2>/dev/null")
+            ps_raw = _host_run(host, f"ps -p {pid} -o user=,args=")
             if ps_raw:
                 ps_parts = ps_raw.split(None, 1)
                 owner = ps_parts[0] if ps_parts else "?"
@@ -1128,6 +1134,17 @@ def kill_gpu_process(
     Returns:
         Compact JSON describing the inspected target and whether a signal was sent.
     """
+    if stale := _stale_policy_refusal():
+        return stale
+    if isinstance(pid, bool):
+        return json.dumps({
+            "status": "refused",
+            "host": host,
+            "pid": str(pid),
+            "killable": False,
+            "reason": "pid must be an integer",
+            "signal_sent": None,
+        }, sort_keys=True)
     try:
         pid_int = int(pid)
     except Exception:
@@ -1239,7 +1256,7 @@ def run_python_on_gpu(
     """Run an approved Python file on a specific GPU on a specific host.
 
     Args:
-        host: Hostname (e.g. "blob.mit.edu").
+        host: Configured hostname.
         gpu_index: GPU device index to use (sets CUDA_VISIBLE_DEVICES).
         script_path: Existing .py file under an approved script root.
         args: Positional CLI args passed to the Python script.
@@ -1249,13 +1266,24 @@ def run_python_on_gpu(
     Returns:
         Command output (sync) or PID info (async).
     """
-    if not isinstance(gpu_index, int) or gpu_index < 0:
+    if stale := _stale_policy_refusal():
+        return stale
+    if not isinstance(gpu_index, int) or isinstance(gpu_index, bool) or gpu_index < 0:
         return "ERROR: gpu_index must be a non-negative integer"
+    if args is not None and (
+        not isinstance(args, list)
+        or any(not isinstance(arg, (str, int, float, bool)) or arg is None for arg in args)
+    ):
+        return "ERROR: args must be a list of string/number/boolean values"
+    if not isinstance(async_mode, bool):
+        return "ERROR: async_mode must be a boolean"
+    if output_file is not None and not isinstance(output_file, str):
+        return "ERROR: output_file must be a string path"
     if not _is_allowed_host(host):
         return "ERROR: host must be one of the configured GPU MCP NODES"
 
     try:
-        argv = _build_python_gpu_argv(script_path, args=args)
+        argv = _build_python_gpu_argv(script_path, args=args, execution_host=host)
         command = shlex.join(argv)
         out_path = _validate_output_path(output_file)
     except ValueError as e:
@@ -1269,14 +1297,14 @@ def run_python_on_gpu(
 
     if async_mode:
         try:
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-        except Exception as e:
-            return f"ERROR: Failed to create output directory {out_path.parent}: {e}"
+            _prepare_output_parent(out_path)
+        except ValueError as e:
+            return f"ERROR: {e}"
         if _is_local_host(host):
             try:
                 env = os.environ.copy()
                 env.update(job_env)
-                out_handle = open(out_path, "w")
+                out_handle = _open_output_no_follow(out_path)
                 proc = subprocess.Popen(
                     argv,
                     stdout=out_handle,
@@ -1296,22 +1324,19 @@ def run_python_on_gpu(
                 "output_file": str(out_path),
                 "launch": "local",
             })
-        launch_cmd = (
-            f"(nohup env {env_prefix} {command} > {shlex.quote(str(out_path))} "
-            "2>&1 < /dev/null & echo $!)"
-        )
-        bg_cmd = (
-            f"mkdir -p {shlex.quote(str(out_path.parent))} && "
-            f"{_remote_repo_command(launch_cmd)}"
-        )
+        launch_cmd = _remote_async_launch_command(argv, out_path, job_env)
+        bg_cmd = _remote_repo_command(launch_cmd)
         pid_str = _ssh_run(host, bg_cmd)
         if pid_str is None:
             return f"ERROR: Failed to SSH to {host}"
+        pid_value = pid_str.strip()
+        if not pid_value.isdigit() or int(pid_value) <= 0:
+            return f"ERROR: invalid async pid returned from {host}: {pid_value!r}"
         return json.dumps({
             "status": "launched",
             "host": host,
             "gpu_index": gpu_index,
-            "pid": pid_str.strip(),
+            "pid": pid_value,
             "output_file": str(out_path),
             "launch": "ssh",
         })
@@ -1346,7 +1371,11 @@ def run_python_on_gpu(
             )
             return result.stdout
         except Exception as e:
-            return f"ERROR: {e}"
+            result = getattr(e, "result", None)
+            stdout = getattr(result, "stdout", "") or ""
+            stderr = getattr(result, "stderr", "") or ""
+            details = f"{stdout}{stderr}"
+            return f"ERROR: {e}" + (f"\n{details}" if details else "")
 
 
 @mcp.tool()
@@ -1356,33 +1385,37 @@ def cluster_info():
     Returns:
         Summary table of all cluster nodes.
     """
-    query = (
+    if stale := _stale_policy_refusal():
+        return stale
+    gpu_query = (
         "nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total "
-        "--format=csv,noheader,nounits 2>/dev/null; echo '|LOAD|'; uptime"
+        "--format=csv,noheader,nounits"
     )
+    load_query = "uptime"
     lines = ["HOST                | STATUS    | GPUs | GPU_UTIL_AVG | LOAD_AVG"]
     lines.append("-" * 72)
 
     for node in NODES:
         user, host = _node_user_host(node)
-        raw = _host_run(host, query, user=user)
-        if raw is None:
-            lines.append(f"{host:20s} | OFFLINE   |    - |            - | -")
+        gpu_raw = _host_run(host, gpu_query, user=user)
+        if gpu_raw is None:
+            reason = _host_run_error("local" if _is_local_host(host) else host, gpu_query)
+            suffix = f" ({reason})" if reason else ""
+            lines.append(f"{host:20s} | OFFLINE   |    - |            - | -{suffix}")
             continue
-
-        parts = raw.split("|LOAD|")
-        gpu_raw = parts[0].strip() if parts else ""
-        load_raw = parts[1].strip() if len(parts) > 1 else ""
+        load_raw = _host_run(host, load_query, user=user) or ""
 
         gpus = _parse_nvsmi_csv(gpu_raw) if gpu_raw else []
-        avg_util = sum(g["utilization_pct"] for g in gpus) // max(len(gpus), 1) if gpus else 0
+        util_values = [g["utilization_pct"] for g in gpus if g["utilization_pct"] is not None]
+        avg_util = sum(util_values) // len(util_values) if util_values else None
 
         # Parse load average from uptime
         load_match = re.search(r"load average:\s*([\d.]+)", load_raw)
         load_avg = load_match.group(1) if load_match else "?"
 
         lines.append(
-            f"{host:20s} | ONLINE    | {len(gpus):4d} | {avg_util:10d}% | {load_avg}"
+            f"{host:20s} | ONLINE    | {len(gpus):4d} | "
+            f"{str(avg_util) + '%' if avg_util is not None else 'N/A':>10s} | {load_avg}"
         )
 
     return "\n".join(lines)

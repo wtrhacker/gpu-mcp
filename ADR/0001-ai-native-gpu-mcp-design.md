@@ -1,11 +1,17 @@
-# GPU MCP Public-Ready Plan
+# ADR 0001: AI-Native GPU MCP Design
 
-This is the working plan for turning the current site-specific GPU MCP server
-into a small, publishable project that other labs can install with help from an
-AI agent. The previous design note was copied to
-`DESIGN_MODIFICATIONS.original.md` before this file was edited.
+This is the design record for turning the original site-specific GPU MCP server
+into a small, publishable project that other labs can install with help from a
+Codex agent. The previous design note was copied to
+`STALE/DESIGN_MODIFICATIONS.original.md` before this plan was edited.
 
-The plan is intentionally narrow. The goal is deterministic setup for trusted
+This ADR is historical as well as prescriptive: some sections explain why the
+current implementation exists, and some describe the remaining public-readiness
+work. The authoritative user-facing install flow lives in
+`AI_native_installer/INSTALL_FOR_AI.md`; the current test-suite map lives in
+`test/README.md`, with real battlefield details in `test/BATTLEFIELD.md`.
+
+The scope is intentionally narrow. The goal is deterministic setup for trusted
 lab GPU fleets, not a general HPC scheduler or a broad remote execution system.
 
 Guiding rule: keep the current design, remove site-specific and repo-specific
@@ -15,16 +21,19 @@ the install path that matters for normal lab use.
 ## Current Plan Status
 
 - [x] Preserve the original design note.
-- [ ] Add repo-local `gpu-mcp.toml` policy loading.
-- [ ] Add a publishable example config.
-- [ ] Make SSH bootstrap a human-first prerequisite.
-- [ ] Make bootstrap write a user-level reachable-host inventory.
-- [ ] Add an AI-facing doctor harness.
-- [ ] Add an AI-facing install checklist template.
-- [ ] Update README into public setup documentation.
-- [ ] Keep the current Python-only guarded execution model.
-- [ ] Keep tests passing after each phase.
+- [x] Add repo-local `gpu-mcp.toml` policy loading.
+- [x] Add a publishable template config in `contracts/gpu-mcp.template.toml`.
+- [x] Make SSH bootstrap a human-first prerequisite.
+- [x] Make bootstrap write a user-level reachable-host inventory.
+- [x] Add an AI-facing doctor/check harness.
+- [x] Add an AI-facing install checklist template.
+- [x] Keep the current Python-only guarded execution model.
+- [x] Prove the repo-local config model through real `codex exec` battlefield
+  tests.
 - [x] Prove repo-local Codex MCP config with two `codex exec` fixture repos.
+- [ ] Polish the public README and AI-native install docs for a fresh external
+  user.
+- [ ] Run a fresh install from scratch using only the AI-native docs.
 
 ## Implementation Phases
 
@@ -33,7 +42,7 @@ the install path that matters for normal lab use.
 Deliverables:
 
 - `gpu_mcp_config.py` or equivalent config-loading helpers.
-- `examples/gpu-mcp.example.toml`.
+- `contracts/gpu-mcp.template.toml`.
 - tests for config discovery, validation, path resolution, and failure modes.
 
 Acceptance criteria:
@@ -41,7 +50,7 @@ Acceptance criteria:
 - Server requires `--config /absolute/path/to/gpu-mcp.toml`.
 - Missing, relative, or invalid `--config` paths fail with a clear startup
   error.
-- No MIT node list, server-source repo root, or fixed GPU model list is used as
+- No site-specific node list, server-source repo root, or fixed GPU model list is used as
   silent fallback policy. This only needs a small startup/doctor check, not a
   `codex exec` policy test.
 - Existing safety tests still pass after being adapted to the config model.
@@ -50,7 +59,7 @@ Acceptance criteria:
 
 Deliverables:
 
-- `gpu_mcp_bootstrap_ssh.py` no longer imports the server's hard-coded `NODES`
+- `gpu_mcp_bootstrap.py` no longer imports the server's hard-coded `NODES`
   as the normal path.
 - Bootstrap requires explicit hosts or `--hosts-file`.
 - Bootstrap writes a machine-readable user-level report/inventory.
@@ -103,7 +112,7 @@ Deliverables:
 
 - `AI_native_installer/INSTALL_FOR_AI.md`.
 - `AI_native_installer/progress.template.md`.
-- `AI_native_installer/gpu_mcp_doctor.py`.
+- `gpu_mcp_doctor.py`.
 - Active Codex raw remote command block check.
 
 The doctor script is primarily for the installer AI, with human-readable output
@@ -161,7 +170,11 @@ Acceptance criteria:
 
 ### Phase 5: Final Verification
 
-Human user will launch codex on a new machine and try install from scratch AI-natively.
+A human user should launch Codex in a fresh repo and try the install from
+scratch using only the AI-native docs. The repo-local config model and real
+battlefield suite have been proven in this development checkout; the remaining
+question is whether the docs are sufficient for a new install without hidden
+context.
 
 ## Target Scope
 
@@ -176,7 +189,9 @@ Expected environment:
 
 This fits many small academic lab GPU pools. It does not target scheduler-mandated clusters where users must submit through SLURM/PBS/LSF.
 
-Keep `localhost` support for install checks and debugging, but do not present the project as a single-workstation tool.
+`localhost` can be used only when explicitly listed in a repo policy for local
+debugging; it is not implicitly allowed and should not be presented as the main
+workflow.
 
 ## Non-Goals For First Public Version
 
@@ -190,19 +205,23 @@ Do not add these now:
 
 These can be revisited later, but the first public version should stay close to the current working system. Multi-user Unix safety is still in scope: the current cancellation flow refuses to signal processes whose owner does not match the configured MCP user.
 
-## Current Problem
+## Original Problem
 
-The current server works, but core site-specific and repo-specific policy is hard-coded in `gpu_mcp_server.py`.
+The original server worked, but core site-specific and repo-specific policy was
+hard-coded in `gpu_mcp_server.py`.
 
 Examples:
 
 - GPU host list is in `NODES`.
-- GPU model filtering is in `RTX4090_HOSTS`.
+- GPU model filtering is hard-coded.
 - approved script roots are based on `REPO_ROOT`.
 - approved write/output roots are hard-coded plus environment variables.
 - `REPO_ROOT` currently means the directory containing `gpu_mcp_server.py`.
 
-That means another lab must edit Python source before using the repo. It also means the MCP server code is coupled to the research repo whose scripts it is allowed to run. For a public project, both need to be fixed.
+That meant another lab had to edit Python source before using the repo. It also
+meant the MCP server code was coupled to the research repo whose scripts it was
+allowed to run. The implemented config model below is the fix for that
+coupling.
 
 ## Repo-Specific Policy Model
 
@@ -214,10 +233,10 @@ The server code can live somewhere stable, for example a cloned `gpu-mcp` repo o
 gpu-mcp.toml
 ```
 
-This file should not be committed by default. Publish only an example:
+This file should not be committed by default. Publish only a template:
 
 ```text
-examples/gpu-mcp.example.toml
+contracts/gpu-mcp.template.toml
 ```
 
 The server should refuse to start unless it can find an approved repo-specific `gpu-mcp.toml`. This is intentional: GPU access should be enabled per repo, not globally inherited by every project an AI agent opens.
@@ -272,7 +291,7 @@ Do not move every current environment override into `gpu-mcp.toml`. For the firs
 
 - `REPO_ROOT` as "server source directory"
 - `NODES`
-- `RTX4090_HOSTS` / fixed GPU-name assumptions
+- fixed GPU-name assumptions
 - `APPROVED_SCRIPT_ROOTS`
 - `APPROVED_OUTPUT_ROOTS`
 - parts of `APPROVED_WRITE_ROOTS`
@@ -409,7 +428,7 @@ The server should validate on startup:
 - at least one configured GPU host is reachable during verification, not necessarily during startup.
 
 Do not read config from `cwd`. Do not read `GPU_MCP_CONFIG`. Do not silently
-fall back to a built-in MIT node list or to the server source directory as the
+fall back to a built-in site-specific node list or to the server source directory as the
 repo root.
 
 ## AI-Native Setup
@@ -422,13 +441,13 @@ declares anything installed.
 Human prerequisite:
 
 ```bash
-python gpu_mcp_bootstrap_ssh.py gpu01.example.edu gpu02.example.edu gpu03.example.edu
+python gpu_mcp_bootstrap.py --install gpu01.example.edu gpu02.example.edu gpu03.example.edu
 ```
 
 or:
 
 ```bash
-python gpu_mcp_bootstrap_ssh.py --hosts-file gpu-hosts.txt
+python gpu_mcp_bootstrap.py --install --hosts-file ~/gpu-mcp/hosts.txt
 ```
 
 The bootstrap result should become the installer AI's source of candidate
@@ -440,7 +459,8 @@ explicitly asks to retry or include them.
 The README should tell an AI agent to:
 
 1. Read `INSTALL_FOR_AI.md`.
-2. Create or update `progress.md` from `examples/progress.md`.
+2. Create or update `progress.md` from
+   `AI_native_installer/progress.template.md`.
 3. Confirm the human has already run SSH bootstrap with explicit hostnames or a
    hosts file.
 4. Read `~/.cache/gpu-mcp/bootstrap_hosts.json`.
@@ -463,11 +483,13 @@ The README should tell an AI agent to:
 14. Configure repo-local MCP client config so this repo starts the server with
     `--config /absolute/path/to/gpu-mcp.toml`.
 15. Optionally run a local MCP smoke probe to catch configuration mistakes.
-16. Run required remote acceptance through `codex exec` and the real installed
-    MCP on a non-local host verified by bootstrap.
-17. Run a required policy-rejection probe, such as a job that attempts to write
-    outside approved write roots.
-18. Update `progress.md` after every completed step or blocker.
+16. Run the full real battlefield suite through `codex exec` and the real
+    installed MCP on non-local hosts verified by bootstrap.
+17. Treat acceptance as incomplete if any designed battlefield policy family
+    lacks a passing wet test or a documented reason it cannot be safely run.
+18. For repeatable validation, run
+    `GPU_MCP_RUN_REAL_BATTLEFIELD_TESTS=1 pytest -q test/test_real_gpu_mcp_battlefield.py`.
+19. Update `progress.md` after every completed step or blocker.
 
 Safety-relevant values should be approved by the human. Non-critical defaults should be automatic.
 
@@ -565,7 +587,8 @@ The public docs should say this clearly. Do not rename the tool to generic `run_
 Also say what this is not: AST scanning and Python audit hooks are guardrails
 for trusted lab scripts and common AI-generated mistakes. They are not a
 hostile-code sandbox for arbitrary Python packages, native extensions, or a
-determined malicious author.
+determined malicious author. They constrain execution and writes; they do not
+try to hide every file the Unix user can already read.
 
 Possible public name:
 
@@ -646,7 +669,7 @@ Replace the current single setup README with:
 - `docs/CONFIG.md`
 - `docs/SECURITY.md`
 - `docs/OPERATIONS.md`
-- `examples/gpu-mcp.example.toml`
+- `contracts/gpu-mcp.template.toml`
 
 Keep language direct. The docs should answer:
 

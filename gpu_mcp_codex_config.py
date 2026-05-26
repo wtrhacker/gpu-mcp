@@ -24,6 +24,7 @@ def required_remote_command_prompt_rules() -> dict[str, str]:
 
 def validate_remote_command_prompt_rules(rules_text: str) -> dict:
     prompt_commands: set[str] = set()
+    allow_commands: set[str] = set()
     host_specific: list[str] = []
     for line in rules_text.splitlines():
         stripped = line.strip()
@@ -39,6 +40,14 @@ def validate_remote_command_prompt_rules(rules_text: str) -> dict:
             continue
         if decision == "prompt":
             prompt_commands.add(pattern)
+        elif decision == "allow":
+            allow_commands.add(pattern)
+
+    conflicts = prompt_commands & allow_commands & set(REMOTE_COMMANDS)
+    if conflicts:
+        raise CodexConfigError(
+            f"conflicting allow rule for raw remote command: {', '.join(sorted(conflicts))}"
+        )
 
     missing = set(REMOTE_COMMANDS) - prompt_commands
     if missing:
@@ -63,7 +72,7 @@ def build_remote_command_probe_argv(repo: str | Path, command: str) -> list[str]
         "-C",
         str(Path(repo)),
         "--sandbox",
-        "workspace-write",
+        "read-only",
         f"Run exactly this shell command: {command}. Then report whether it ran.",
     ]
 

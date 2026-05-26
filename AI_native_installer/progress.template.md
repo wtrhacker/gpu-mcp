@@ -19,6 +19,7 @@ Configured hosts:
 - [ ] Confirm script roots with human
 - [ ] Confirm write roots with human
 - [ ] Write repo-local `gpu-mcp.toml`
+- [ ] Human-approved policy hash recorded with `gpu_mcp_doctor.py approve-policy`
 - [ ] Python imports pass
 - [ ] Server config validation passes
 - [ ] Dedicated-key SSH verification passes
@@ -28,8 +29,9 @@ Configured hosts:
 - [ ] Codex restarted or reloaded after MCP config change
 - [ ] `codex exec` probe sees and can call the repo-local MCP tool
 - [ ] Optional local smoke probe succeeded through MCP, if run
-- [ ] Required remote acceptance probe succeeded through real `codex exec`
-- [ ] Required policy-rejection probe blocked unsafe work
+- [ ] Full real battlefield suite succeeded through real `codex exec`
+- [ ] Every designed battlefield policy family is covered or explicitly marked unsafe to run
+- [ ] `GPU_MCP_RUN_REAL_BATTLEFIELD_TESTS=1 pytest -q test/test_real_gpu_mcp_battlefield.py` passes
 
 ## Blockers
 
