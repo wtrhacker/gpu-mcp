@@ -136,13 +136,47 @@ For v1, the fixed-cadence defaults are:
 | maximum heartbeat interval | `3600` seconds | Prevents stale detection from being delayed indefinitely, even after dynamic cadence exists. |
 | stale multiplier | `3` | A reservation is stale when `now - last_heartbeat_at > heartbeat_interval_sec * 3`. |
 
-These are design constants, not user-facing scheduler policy. They can become configuration later if real deployments need it, but v1 should keep them fixed so behavior is predictable and tests are stable. Dynamic cadence may later choose any per-task interval inside the min/max range; cleanup still requires stale heartbeat plus process proof.
+These are design constants, not user-facing scheduler policy. They can become
+configuration later if real deployments need it, but v1 should keep them fixed
+so behavior is predictable and tests are stable. Phase 7 dynamic cadence chooses
+a per-task interval inside the min/max range; cleanup still requires stale
+heartbeat plus process proof.
+
+Phase 7 uses a deterministic `select_cadence` contract. Cadence inputs are
+positive finite numeric seconds; booleans, non-numeric values, non-positive
+values, and non-finite values are invalid. Fractional inputs are rounded up to
+integer seconds before selection.
+
+Selection precedence is:
+
+1. `cadence_hint_sec`: treat as a direct heartbeat interval request and clamp to
+   `60..3600`.
+2. `expected_duration_sec`: map the expected runtime through the coarse duration
+   bands below.
+3. Successful `smoke_job_id` plus `smoke_cadence_representative=true`: map the
+   observed smoke runtime through the same coarse duration bands.
+4. No cadence evidence: use the minimum heartbeat interval, `60` seconds.
+
+The coarse duration bands are:
+
+| Runtime signal | Heartbeat interval |
+|----------------|--------------------|
+| `<= 300` seconds | `60` seconds |
+| `> 300` and `<= 1800` seconds | `180` seconds |
+| `> 1800` and `<= 7200` seconds | `600` seconds |
+| `> 7200` seconds | `1800` seconds |
+
+The same selector applies to launch-time cadence and
+`manage_gpu_job(action="update_cadence")`. `next_poll_after` is computed as
+`now + heartbeat_interval_sec` using the same owner-side timestamp as the
+heartbeat write and is returned as a UTC RFC 3339 timestamp ending in `Z`. A
+terminal job should omit `next_poll_after` or return it as null.
 
 ## 5. Tool Behavior
 
 Launch responses should return promptly with a managed job handle and a suggested first status check. They should not wait for the GPU job to finish.
 
-Status responses should report:
+Full status responses should report:
 
 - current computed reservation state;
 - job lifecycle, when known, distinct from reservation diagnostics;
@@ -152,9 +186,67 @@ Status responses should report:
 - agent guidance derived from job lifecycle and reservation diagnostics;
 - suggested next poll time or poll interval.
 
-If the job lifecycle is running or retrying, or if reservation diagnostics are unclear because inspection failed, tool output should tell the agent not to invent dependent work. It may continue independent work before the next suggested check. If no independent work is available, waiting idly and polling is acceptable behavior. If the job is terminal, status should distinguish success, failure, and process-gone-with-unknown-outcome, then tell the agent what outputs are ready and what lifecycle actions are valid.
+If the job lifecycle is running or retrying, or if reservation diagnostics are
+unclear because inspection failed, tool output should tell the agent not to
+invent dependent work. It may continue independent work before the next
+suggested check. If no independent work is available, waiting until the next
+suggested check and then polling is acceptable behavior. If the job is terminal,
+status should distinguish success, failure, and
+process-gone-with-unknown-outcome, then tell the agent what outputs are ready
+and what lifecycle actions are valid.
 
-In the fixed-cadence v1 path, `next_poll_after` is `now + heartbeat_interval_sec` after launch or status unless the job is terminal. Dynamic cadence can later revise this based on expected duration or progress evidence, but it must stay within the min/max interval bounds above.
+In the fixed-cadence v1 path, `next_poll_after` is
+`now + heartbeat_interval_sec` after launch or status unless the job is
+terminal. Phase 7 dynamic cadence revises this with `select_cadence` based on
+explicit cadence evidence or progress evidence, but it must stay within the
+min/max interval bounds above.
+
+Phase 7 also makes poll discipline an explicit user-experience contract. The
+goal is to keep agents from burning context by repeatedly checking a long GPU
+job before the MCP-provided cadence says the job is due. Tool output and hook
+context should tell the agent not to call
+`manage_gpu_job(action="status", job_id=...)` before `next_poll_after` unless
+the user asks, the job output is now blocking the next step, or the agent has
+another concrete reason.
+
+`manage_gpu_job(action="status")` should accept an optional
+`early_poll_reason`. Blank or whitespace-only values behave as absent. A status
+call is due when the job has a parseable `next_poll_after` and
+`now >= next_poll_after`.
+
+When a targeted status call is before `next_poll_after`, has no
+`early_poll_reason`, and the current repo-local job record is known nonterminal,
+the server should return a compact local-only response instead of a full status
+check. This response is a cadence-preserving advisory response, not a lifecycle
+assertion. It must not imply the remote process is alive. It should include:
+
+- `status: "ok"`;
+- `polling_state: "not_due_yet"`;
+- `job_id`;
+- `reservation_key`, when known;
+- `heartbeat_interval_sec`;
+- `next_poll_after`;
+- `seconds_until_due`;
+- `full_status_performed: false`;
+- `remote_inspection_performed: false`;
+- `log_tail_included: false`;
+- concise guidance to continue independent work or retry with
+  `early_poll_reason` if an immediate full check is justified.
+
+The compact `not_due_yet` path must not SSH, inspect the remote process, tail
+logs, update `last_status_checked_at`, advance `next_poll_after`, renew the
+heartbeat, change cadence, update process-inspection state, or acknowledge a
+hook reminder. In ADR 0004q terms, it is not a real status check.
+
+The server must take the normal full status path instead when the status call is
+due or overdue, `early_poll_reason` is non-empty, a local terminal outcome is
+already known, `next_poll_after` is missing or malformed, the target is
+ambiguous, or ownership/policy/recovery diagnostics require full status. A
+non-empty `early_poll_reason` records an intentional early override in
+repo-local state and/or tool output, then performs full status. If recording the
+override fails, the server may still return full status, but the response should
+include `early_poll_override_recorded: false` and a bounded warning because the
+override record is observability, not a safety boundary.
 
 Phase 7 adds public cadence evidence to `run_python_on_gpu`. The launch input
 should accept:
@@ -240,7 +332,9 @@ the agent or tests to scrape prose. Launch output should include:
 - `smoke_cadence_representative`;
 - `expected_duration_sec`;
 - `cadence_hint_sec`;
-- `skip_reason_recorded`.
+- `skip_reason_recorded`;
+- `selected_interval_sec`;
+- `duration_band`.
 
 Human-readable guidance may accompany these fields, but tests and agent behavior
 should rely on the structured fields.
@@ -256,10 +350,11 @@ cross-repo metadata.
 During polling, the agent may discover the initial cadence is wrong. Phase 7
 therefore adds an owner-side lifecycle action:
 `manage_gpu_job(action="update_cadence", job_id=..., expected_duration_sec=...,
-cadence_hint_sec=..., reason=...)`. The server clamps the selected interval to
-`60..3600` seconds and updates `heartbeat_interval_sec` and `last_heartbeat_at`
-in the same metadata write. This action records the agent's revised cadence
-judgment; it does not infer progress from arbitrary output.
+cadence_hint_sec=..., reason=...)`. The server chooses the new interval with the
+same `select_cadence` precedence and bands used at launch, then updates
+`heartbeat_interval_sec` and `last_heartbeat_at` in the same metadata write.
+This action records the agent's revised cadence judgment; it does not infer
+progress from arbitrary output.
 
 `update_cadence` is an owner-side lease mutation. It requires the current
 `server_instance_id` to own the reservation, a fresh approved policy, a healthy
@@ -348,10 +443,23 @@ should inject a structured precondition: the agent should launch a representativ
 `job_role="smoke"` job first, or retry the main launch with a concrete
 `smoke_skip_reason`. When a running job is due, the hook may remind the agent to
 status-check the job and update cadence if observed progress contradicts the old
-cadence. The Phase 7 cadence/preflight hook branch runs only after stale-policy
-handling, fails quiet, and is advisory. It must not veto tool calls, mutate or
-synthesize tool input, act as a scheduler, or write heartbeats or cadence state.
-The launch tool's soft refusal is the server-side workflow guard.
+cadence.
+
+The hook may also inject an early-poll warning, but only for an unambiguous
+current-repo `manage_gpu_job(action="status", job_id=...)` call before that
+job's `next_poll_after` and without `early_poll_reason`. The warning must be
+advisory and non-blocking: it tells the agent the job is not due, suggests
+independent work, and explains that an immediate full check requires
+`early_poll_reason`. It must not warn for `check_gpus`,
+`list_gpu_reservations`, unrelated tools, cross-repo jobs, malformed or
+ambiguous targets, due jobs, terminal jobs, lifecycle actions, status calls that
+already include `early_poll_reason`, or `PostToolUse`.
+
+The Phase 7 cadence/preflight hook branch runs only after stale-policy handling,
+fails quiet, and is advisory. It must not veto tool calls, mutate or synthesize
+tool input, act as a scheduler, or write heartbeats or cadence state. The launch
+tool's soft refusal and the status tool's compact `not_due_yet` response are the
+server-side workflow guards.
 
 The Phase 7 hook context should be compact and shaped like:
 
@@ -363,6 +471,14 @@ or a short smoke script; provide expected_duration_sec or cadence_hint_sec when
 feasible. Otherwise retry the main launch with smoke_skip_reason explaining why
 smoke is skipped.
 Cadence hints affect polling only; they do not replace smoke or a skip reason.
+```
+
+The early-poll hook context should be compact and shaped like:
+
+```text
+GPU MCP: job job-20260530T123456Z-a is not due for status until 2026-05-30T12:45:00Z.
+Do independent work until then unless this job's output is blocking or the user asked for an immediate check.
+If a full check is justified now, call manage_gpu_job(action="status", job_id="job-20260530T123456Z-a", early_poll_reason="...").
 ```
 
 ## 8. Failure Boundaries
@@ -377,13 +493,9 @@ If the task heartbeat is stale, observers may inspect the remote process. They s
 
 ## 9. What This ADR Will Specify Later
 
-This draft intentionally keeps formula-level policy simple. The final version should specify:
+The Phase 7 `select_cadence` contract is fixed above. This draft still leaves
+the following non-cadence details for later implementation notes:
 
-- the exact `select_cadence` contract before Phase 7 implementation: accepted
-  value types and ranges, precedence when multiple cadence inputs are supplied,
-  how dynamic `next_poll_after` is computed beyond direct `cadence_hint_sec`
-  clamping, and the exact formula for deriving cadence from
-  `expected_duration_sec` or cadence-representative smoke runtime;
 - heartbeat lifecycle and health states beyond the initial `healthy`/`unhealthy` boundary;
 - the exact `PreToolUse` hook output shape and fallback behavior for Codex versions without `additionalContext`;
 - the exact atomic file-write mechanics for hook-owned advisory reminder state;

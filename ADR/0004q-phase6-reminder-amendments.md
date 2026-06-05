@@ -15,10 +15,18 @@ the hook already emitted once for the current `next_poll_after`.
 
 A reminder for a due managed job is acknowledged only when one of these happens:
 
-- `manage_gpu_job(action="status", job_id=...)` checks that job;
+- `manage_gpu_job(action="status", job_id=...)` performs a full status check
+  for that job;
 - the job reaches terminal status;
 - the local job record no longer matches an active shared reservation and the
   hook retires its advisory state.
+
+ADR 0004p Phase 7 adds a compact early-poll status mode,
+`polling_state="not_due_yet"`, for status calls before `next_poll_after` without
+an explicit `early_poll_reason`. That compact response is not a full status
+check and must not acknowledge or silence a due reminder. A due status check or
+an intentional early override with `early_poll_reason` uses the full status path
+and may acknowledge the reminder normally.
 
 Until acknowledged, the hook may re-remind for the same `next_poll_after`, but
 only after a time throttle. The v1 throttle is:
@@ -127,7 +135,10 @@ Phase 6 tests should amend the existing reminder cases as follows:
 - add a same-due-timestamp re-reminder test after one clamped
   `heartbeat_interval_sec` when no status acknowledgement occurred;
 - add a status-acknowledgement test: `manage_gpu_job(status)` for job A updates
-  `last_status_checked_at` and silences job A's old due timestamp;
+  `last_status_checked_at` and silences job A's old due timestamp only when it
+  performs the full status path;
+- add a compact early-status test: `polling_state="not_due_yet"` does not update
+  `last_status_checked_at` and does not silence the later reminder;
 - add a per-job acknowledgement test: status for job A must not acknowledge or
   silence job B;
 - add a multi-job context test: one `PreToolUse` context can list multiple due

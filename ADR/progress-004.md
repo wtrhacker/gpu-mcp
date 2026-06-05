@@ -199,13 +199,16 @@ coordination behavior:
   `heartbeat_interval_sec`, and structured `cadence_basis`. A refusal must say
   why the launch did not happen, include a structured refusal code when
   available, and must not create a job that the caller then has to manage.
-- [ ] `manage_gpu_job(action, job_id=None, reservation_key=None)` is the
+- [ ] `manage_gpu_job(action, job_id=None, reservation_key=None,
+  early_poll_reason=None)` is the
   status/lifecycle surface for `action="status"`, `"stop"`, `"retry"`, and
   `"finish"`, and in Phase 7 also `action="update_cadence"`. A status result
-  must include `job_id`, `reservation_key`, computed reservation state, job
+  normally includes `job_id`, `reservation_key`, computed reservation state, job
   lifecycle when known, whether this server owns the job, heartbeat
   age/staleness, process inspection summary when performed, allowed actions,
   current-repo output/log pointers when available, and next poll guidance.
+  Phase 7 may return compact `polling_state="not_due_yet"` for early
+  no-reason status calls; that compact response is not a full status check.
   Stop/retry/finish/update-cadence must return the same kind of handle or
   refusal context so the agent knows what remains safe to do.
 - [ ] `list_gpu_reservations(scope="mine"|"all", fresh=False)` is the
@@ -845,7 +848,9 @@ accepted.
 
 User-visible requirement: long jobs should not force frequent polling, and short
 smoke probes should be checked soon, without making runtime estimates cleanup
-authority.
+authority. Phase 7 also provides poll discipline: accidental early status checks
+should be compact and cheap, while intentional early checks remain possible with
+an explicit reason.
 
 Agentic battlefield first:
 
@@ -868,7 +873,8 @@ Agentic battlefield first:
   agent launches `job_role="smoke"` with an explicit short
   `expected_duration_sec` or `cadence_hint_sec`; launch output exposes
   `heartbeat_interval_sec`, `next_poll_after`, and a smoke cadence basis, with
-  the interval clamped no lower than the minimum.
+  the interval selected by the pinned coarse-band contract and clamped no lower
+  than the minimum.
 - [ ] Repo A launches `job_role="smoke"` without explicit cadence input. The
   smoke job still creates a normal reservation and heartbeat, and its first
   `heartbeat_interval_sec`/`next_poll_after` use the minimum interval.
@@ -901,8 +907,10 @@ Agentic battlefield first:
   evidence.
 - [ ] Repo A launches a main/long job with an explicit long
   `expected_duration_sec` or `cadence_hint_sec`, successful smoke or
-  `smoke_skip_reason`, and no stronger cadence input. The tool gives a later
-  next-check time, clamped no higher than the maximum interval.
+  `smoke_skip_reason`, and no stronger cadence input. A direct
+  `cadence_hint_sec` wins and clamps to `60..3600`; otherwise
+  `expected_duration_sec` maps through the pinned coarse duration bands. The
+  tool gives a later next-check time no higher than the maximum interval.
 - [ ] Repo A launches `job_role="main"` with `smoke_skip_reason` but no
   `expected_duration_sec` or `cadence_hint_sec`. Launch output records the skip
   reason in `cadence_basis` and uses the conservative minimum first poll cadence.
@@ -914,6 +922,28 @@ Agentic battlefield first:
 - [ ] When a running job is due, the hook reminder tells the agent to
   status-check and optionally update cadence if observed progress contradicts
   the old cadence. It must not perform the status check or write cadence itself.
+- [ ] Repo A launches a long managed job and receives a future
+  `next_poll_after`. Before that time, the agent calls
+  `manage_gpu_job(action="status", job_id=...)` without an
+  `early_poll_reason`. The server returns compact
+  `polling_state="not_due_yet"` guidance and does not inspect the remote
+  process, tail logs, acknowledge a reminder, or move `next_poll_after`.
+- [ ] Repo A has a concrete reason to check early, such as a user request or an
+  output dependency, and calls `manage_gpu_job(action="status", job_id=...,
+  early_poll_reason=...)` before `next_poll_after`. The server performs full
+  status and records or reports the intentional override.
+- [ ] Repo A calls `manage_gpu_job(status)` after `next_poll_after` is due. The
+  server performs full status without requiring `early_poll_reason`.
+- [ ] Repo A has a local terminal outcome before `next_poll_after`, including a
+  smoke job that finished quickly. A status call reports terminal full status
+  instead of hiding the result behind `polling_state="not_due_yet"`.
+- [ ] Before a premature targeted
+  `manage_gpu_job(action="status", job_id=...)` call, the PreToolUse hook may
+  warn that the job is not due and explain `early_poll_reason`. The warning is
+  advisory only and must not fire for `check_gpus`, `list_gpu_reservations`,
+  unrelated tools, cross-repo jobs, ambiguous/malformed targets, due jobs,
+  terminal jobs, lifecycle actions, status calls with `early_poll_reason`, or
+  `PostToolUse`.
 
 Invariants and implementation pressure:
 
@@ -931,6 +961,48 @@ Invariants and implementation pressure:
   cadence evidence only; they do not explain why smoke was skipped.
 - [ ] Launch and status output expose the chosen `heartbeat_interval_sec`,
   `next_poll_after`, and `cadence_basis`.
+- [ ] `manage_gpu_job(action="status")` accepts optional `early_poll_reason`.
+  Blank or whitespace-only values behave as absent. The reason is repo-local
+  observability data, not a safety proof.
+- [ ] A status call is due when its current repo-local `next_poll_after` is
+  parseable and `now >= next_poll_after`. If `next_poll_after` is missing or
+  malformed, status must take the full status path rather than hiding behind
+  `not_due_yet`.
+- [ ] Before `next_poll_after`, a targeted status call for a known nonterminal
+  current-repo job with no `early_poll_reason` returns compact
+  `polling_state="not_due_yet"`. This response is local-only and is not a
+  lifecycle assertion; it must not imply the remote process is alive.
+- [ ] `polling_state="not_due_yet"` includes `job_id`, `reservation_key` when
+  known, `heartbeat_interval_sec`, `next_poll_after`, `seconds_until_due`,
+  `full_status_performed=false`, `remote_inspection_performed=false`,
+  `log_tail_included=false`, and concise guidance to do independent work or
+  retry with `early_poll_reason` for an immediate full check.
+- [ ] `polling_state="not_due_yet"` must not SSH, inspect the remote process,
+  tail logs, update `last_status_checked_at`, advance `next_poll_after`, renew
+  heartbeat, change cadence, update process-inspection state, or acknowledge a
+  hook reminder.
+- [ ] Full status is required when the status call is due or overdue, has
+  non-empty `early_poll_reason`, has a local terminal outcome, has missing or
+  malformed cadence state, has ambiguous target resolution, or needs
+  ownership/policy/recovery diagnostics. A local terminal outcome before
+  `next_poll_after` wins over `not_due_yet`.
+- [ ] An early status call with non-empty `early_poll_reason` performs full
+  status and records an intentional override in repo-local state and/or output.
+  If override recording fails, full status may still return with
+  `early_poll_override_recorded=false` and a bounded warning.
+- [ ] `select_cadence` is deterministic. Inputs are positive finite numeric
+  seconds; booleans, non-numeric values, non-positive values, and non-finite
+  values are invalid, and fractional values are rounded up before selection.
+  Precedence is direct `cadence_hint_sec`, then `expected_duration_sec`, then a
+  successful `smoke_job_id` with `smoke_cadence_representative=true`, then
+  conservative no-evidence cadence.
+- [ ] Expected duration and cadence-representative successful smoke runtime use
+  the same coarse bands: `<=300` seconds selects `60`, `>300` and `<=1800`
+  selects `180`, `>1800` and `<=7200` selects `600`, and `>7200` selects
+  `1800`. Direct `cadence_hint_sec` is not banded; it is clamped to `60..3600`.
+- [ ] `next_poll_after` is computed as `now + heartbeat_interval_sec` using the
+  same owner-side timestamp as the heartbeat write and is returned as a UTC RFC
+  3339 timestamp ending in `Z`. Terminal jobs omit it or return null.
 - [ ] The cadence basis records whether launch had smoke viability evidence,
   smoke cadence evidence, explicit expected duration, direct cadence hint,
   conservative no-evidence cadence, or default cadence. Sensitive script paths
@@ -939,7 +1011,8 @@ Invariants and implementation pressure:
   as `source`, `conservative_reason`, `smoke_job_id`, `smoke_lifecycle`,
   `smoke_runtime_sec`, `positive_viability_evidence`,
   `cadence_evidence_used`, `expected_duration_sec`, `cadence_hint_sec`,
-  `smoke_cadence_representative`, and `skip_reason_recorded` when applicable.
+  `smoke_cadence_representative`, `skip_reason_recorded`,
+  `selected_interval_sec`, and `duration_band` when applicable.
 - [ ] Phase 7 state storage is repo-local except for lease cadence. Shared
   metadata may contain `last_heartbeat_at` and `heartbeat_interval_sec`, plus
   existing sanitized reservation identity fields. `job_role`, `smoke_*`,
@@ -994,20 +1067,53 @@ Invariants and implementation pressure:
 - [ ] Do not infer duration from comments, arbitrary stdout, `ps`, or
   `nvidia-smi` utilization patterns in v1.
 - [ ] Intervals remain clamped to `60..3600` seconds.
+- [ ] The same `select_cadence` contract applies to launch-time cadence and
+  `manage_gpu_job(action="update_cadence")`.
 - [ ] Runtime estimates remain non-authoritative for cleanup.
 - [ ] The hook never acts as a scheduler and never writes heartbeat or cadence
   state. The Phase 7 hook branch runs after stale-policy handling, fails quiet,
   and must not veto or mutate tool input; server-side soft refusal is the
   workflow guard.
-- [ ] Do not implement Phase 7 dynamic cadence until a deterministic
-  `select_cadence` contract is pinned: input types/ranges, precedence when
-  multiple signals are supplied, exact mapping from `expected_duration_sec` and
-  cadence-representative smoke runtime, direct `cadence_hint_sec` behavior,
-  timestamp format, and clamp semantics.
+- [ ] The Phase 7 early-poll hook warning is narrow and advisory. It may only
+  target unambiguous premature `manage_gpu_job(action="status", job_id=...)`
+  calls for current-repo jobs without `early_poll_reason`; it must be silent for
+  broad GPU tools, unrelated tools, cross-repo jobs, malformed or ambiguous
+  targets, due jobs, terminal jobs, lifecycle actions, calls with
+  `early_poll_reason`, and `PostToolUse`.
 
 Supporting tests:
 
-- [ ] Cadence clamps.
+- [ ] Direct `cadence_hint_sec` clamps to `60..3600` and wins over
+  `expected_duration_sec` and cadence-representative smoke runtime.
+- [ ] Invalid cadence inputs are refused: booleans, non-numeric values,
+  non-positive values, and non-finite values.
+- [ ] Expected duration coarse-band boundaries:
+  `300 -> 60`, `301 -> 180`, `1800 -> 180`, `1801 -> 600`, `7200 -> 600`,
+  and `7201 -> 1800`.
+- [ ] Cadence-representative successful smoke runtime uses the same coarse-band
+  boundaries when no direct hint or expected duration is present.
+- [ ] `next_poll_after` is derived from the same timestamp as the heartbeat
+  write and equals `now + heartbeat_interval_sec` for nonterminal jobs.
+- [ ] Early status before `next_poll_after` with no `early_poll_reason` returns
+  compact `polling_state="not_due_yet"`, performs no remote inspection, includes
+  no log tail, and does not mutate `last_status_checked_at`, `next_poll_after`,
+  heartbeat, cadence, or process-inspection state.
+- [ ] Compact `polling_state="not_due_yet"` does not acknowledge or silence a
+  Phase 6 due reminder.
+- [ ] Early status with non-empty `early_poll_reason` performs full status and
+  records or reports the override.
+- [ ] Due status without `early_poll_reason` performs full status.
+- [ ] Local terminal outcome before `next_poll_after` returns terminal full
+  status, not compact `not_due_yet`.
+- [ ] Missing or malformed `next_poll_after`, ambiguous target resolution, and
+  policy/ownership/recovery diagnostics do not collapse into `not_due_yet`.
+- [ ] Hook warns only for premature targeted
+  `manage_gpu_job(action="status", job_id=...)` without `early_poll_reason`.
+- [ ] Hook is silent for `check_gpus`, `list_gpu_reservations`, unrelated tools,
+  cross-repo jobs, due jobs, terminal jobs, lifecycle actions, malformed or
+  ambiguous targets, status calls with `early_poll_reason`, and `PostToolUse`.
+- [ ] Battlefield: an agent that tries to poll early receives compact guidance
+  and no log/inspection output unless it supplies `early_poll_reason`.
 - [ ] `job_role` defaulting from `async_mode`.
 - [ ] Soft refusal for main launch without positive smoke viability evidence or
   skip reason, even when cadence evidence is present.
