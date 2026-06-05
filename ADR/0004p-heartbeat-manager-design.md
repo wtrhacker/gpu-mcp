@@ -96,6 +96,13 @@ script-to-args recipe maps, or a second smoke-only launch path. The agent is
 responsible for choosing representative smoke arguments and for interpreting
 whether the smoke result is representative of the main job.
 
+The smoke `job_id` is the Phase 7 linkage key. A main launch that supplies
+`smoke_job_id` gives the server all indexing information needed for the normal
+workflow: look up that repo-local smoke job record, validate its role and
+terminal outcome, read its runtime and output pointers, and record it in
+`cadence_basis`. Listing or searching older smoke jobs is a separate recovery
+convenience and is not part of the core Phase 7 contract.
+
 Runtime estimates are guidance, not authority. They may affect heartbeat interval and suggested next poll time. They must not be used as proof that a reservation is free. Cleanup still follows ADR 0004: stale task heartbeat plus process proof.
 
 Heartbeat interval revisions must be written with a fresh heartbeat. The server must not shorten or lengthen `heartbeat_interval_sec` without also updating `last_heartbeat_at` in the same metadata write. Stale computation therefore uses the interval stored with the last successful heartbeat write; a shortened interval must not retroactively make an older heartbeat stale.

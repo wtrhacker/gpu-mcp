@@ -906,6 +906,9 @@ Invariants and implementation pressure:
   script paths and arguments stay repo-local under the existing metadata rules.
 - [ ] `smoke_job_id` is valid cadence evidence only when it names a same-repo
   managed job with `job_role="smoke"` and a successful terminal outcome.
+- [ ] `smoke_job_id` is the normal smoke-result index. The server uses it to
+  retrieve the repo-local smoke job record, outcome, runtime, and output
+  pointers. Listing/searching recent smoke jobs is not required for Phase 7.
 - [ ] A successful smoke status response gives explicit smoke-to-main guidance:
   preserve the smoke `job_id`, report observed runtime when available, and show
   that the main launch should pass `job_role="main"` and `smoke_job_id`.
