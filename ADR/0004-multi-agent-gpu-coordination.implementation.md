@@ -222,7 +222,7 @@ The heartbeat manager is defined in ADR 0004p. From the reservation protocol's p
 
 1. **Periodic heartbeat writes.** For each reservation owned by the current server, write `last_heartbeat_at` at a cadence derived from the reservation's `heartbeat_interval_sec`.
 2. **Stale threshold computation.** Given a reservation's `heartbeat_interval_sec`, return the threshold at which it becomes stale.
-3. **Health status.** Expose a lightweight `is_healthy()` check that the server can poll. If the heartbeat manager is unhealthy (thread died, filesystem writes failing), the server must refuse owner-side mutations like launch, retry, stop, and finish. Read-only tools and the fingerprint-gated rescue kill path remain available.
+3. **Health status.** Expose a lightweight `is_healthy()` check that the server can poll. If the heartbeat manager is unhealthy (thread died, filesystem writes failing), the server must refuse owner-side mutations like launch, retry, stop, finish, and cadence revision. Read-only tools and the fingerprint-gated rescue kill path remain available.
 4. **Owner identity.** Tag heartbeats with the current `server_instance_id` so other servers know which instance wrote them.
 
 The reservation protocol does not care how the heartbeat manager is threaded, whether it batches writes, or how it recovers from errors. Those are 0004p's concerns.
@@ -280,7 +280,7 @@ Candidate entries should be useful but sanitized. Include `job_id`, `reservation
 - `status`: Read-only and allowed for a resolved target after the policy freshness check. Reports state, heartbeat age, process identity, last inspection. Works even if the local heartbeat manager is unhealthy.
 - `stop`: Only if the current server owns the reservation. Sends SIGTERM but does not remove the reservation. While the process is still exiting, broad availability checks still report the GPU as reserved; owner status may report that stop was requested and whether the process is still alive or already gone. Status may report `RESERVED_IDLE` only after inspection proves the process is gone. Refused if the heartbeat manager is unhealthy.
 - `retry`: Only if owned. Before relaunching under the same reservation, inspect the current recorded process. If the matching process is still alive, refuse retry for this reservation because retry must not create a second process on the same GPU. The agent may keep polling this job, explicitly stop it if it wants to replace this attempt, or launch a separate new job on another available GPU through normal reservation acquisition. If the process is gone or was already stopped, relaunch under the same reservation and update process identity. Refused if the heartbeat manager is unhealthy.
-- `finish`: Only if owned. The owner is done. Stop heartbeating and inspect the process immediately. If already gone, clean up the reservation now. If still alive, the reservation remains occupied; after the heartbeat ages past the stale threshold, observers may report `STALE_RESERVED` while the process lives. Cleanup will happen later when the process exits and the next inspection finds it gone. Refused if the heartbeat manager is unhealthy.
+- `finish`: Only if owned. The owner is done only after process-gone proof. Inspect the process immediately. If already gone, clean up the reservation now. If still alive, refuse, keep heartbeating, and tell the agent to call `stop` first if it intends to terminate the job or continue polling `status` if it intends to wait. Refused if the heartbeat manager is unhealthy.
 
 ### list_gpu_reservations
 
