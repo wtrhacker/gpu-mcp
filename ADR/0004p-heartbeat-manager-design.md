@@ -109,6 +109,13 @@ should not confine this choice. The only mandatory part is that the smoke run
 goes through the same GPU MCP launch path and produces a durable managed
 `job_id`.
 
+Smoke jobs still use the normal reservation and heartbeat protocol. A smoke job
+can hang, wedge during CUDA initialization, or run longer than intended, so it
+must not be heartbeat-free while it holds a GPU reservation. Instead, smoke jobs
+should be bounded and checked early: absent an explicit cadence hint or expected
+duration, a smoke launch should use the minimum heartbeat interval for its first
+poll guidance.
+
 The smoke `job_id` is the Phase 7 linkage key. A main launch that supplies
 `smoke_job_id` gives the server all indexing information needed for the normal
 workflow: look up that repo-local smoke job record, validate its role, read its
@@ -350,8 +357,11 @@ The Phase 7 hook context should be compact and shaped like:
 
 ```text
 GPU MCP: this main GPU launch has no successful smoke evidence.
-Before launching, run a representative run_python_on_gpu(job_role="smoke", ...)
-or retry the main launch with smoke_skip_reason explaining why smoke is skipped.
+Before launching, run a bounded representative
+run_python_on_gpu(job_role="smoke", ...) with small inputs, max steps, dry run,
+or a short smoke script; provide expected_duration_sec or cadence_hint_sec when
+feasible. Otherwise retry the main launch with smoke_skip_reason explaining why
+smoke is skipped.
 Cadence hints affect polling only; they do not replace smoke or a skip reason.
 ```
 

@@ -853,7 +853,8 @@ Agentic battlefield first:
   without `job_role`, positive smoke viability evidence, or
   `smoke_skip_reason`. Because `async_mode=True` defaults the role to `main`,
   the PreToolUse hook injects a structured precondition: run a representative
-  `job_role="smoke"` job first, or retry the main launch with a concrete
+  bounded `job_role="smoke"` job first with small inputs, max steps, dry run, or
+  a short smoke script, or retry the main launch with a concrete
   `smoke_skip_reason`.
 - [ ] Repo A calls `run_python_on_gpu` with `async_mode=True` and no
   `job_role`. The launch contract resolves `job_role="main"`, reports that the
@@ -868,6 +869,9 @@ Agentic battlefield first:
   `expected_duration_sec` or `cadence_hint_sec`; launch output exposes
   `heartbeat_interval_sec`, `next_poll_after`, and a smoke cadence basis, with
   the interval clamped no lower than the minimum.
+- [ ] Repo A launches `job_role="smoke"` without explicit cadence input. The
+  smoke job still creates a normal reservation and heartbeat, and its first
+  `heartbeat_interval_sec`/`next_poll_after` use the minimum interval.
 - [ ] Live Codex prompt: Repo A's main script has no built-in small-run flag.
   The agent creates or adapts a smoke path, such as a small input fixture, an
   added smoke mode, or a separate managed smoke script that exercises the same
@@ -970,6 +974,10 @@ Invariants and implementation pressure:
   mode, a tiny input fixture, a dry-run/max-steps path, or a separate managed
   smoke script that exercises the same relevant GPU code path. The harness must
   not confine this choice beyond requiring MCP launch and `job_role="smoke"`.
+- [ ] Smoke jobs are not heartbeat-free. They use the normal reservation and
+  heartbeat protocol because a smoke run can hang or overrun while holding a GPU.
+  Without explicit smoke cadence input, first poll guidance uses the minimum
+  heartbeat interval.
 - [ ] Do not add smoke templates, smoke recipe files, or a separate smoke-only
   launch path. A smoke test is an ordinary managed GPU job submitted through the
   MCP launch tool.
@@ -1006,6 +1014,8 @@ Supporting tests:
 - [ ] Representative smoke/preflight mapping and explicit smoke-skip reason.
 - [ ] Flexible smoke path: separate smoke script or added smoke mode is accepted
   as ordinary `job_role="smoke"` evidence.
+- [ ] Smoke launch without explicit cadence input still heartbeats and uses
+  minimum first poll cadence.
 - [ ] Successful smoke status emits smoke-to-main guidance.
 - [ ] Invalid `smoke_job_id` (missing, cross-repo, wrong-role, unreadable
   lifecycle/outcome) is refused as smoke evidence.
