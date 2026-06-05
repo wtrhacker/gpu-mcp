@@ -69,10 +69,32 @@ A smoke probe that should finish in 30 seconds should be checked soon. A simulat
 - explicit user expectation, when available;
 - smoke-test or preflight timing, when the probe is explicitly representative or paired with an expected main-job duration;
 - early progress observations;
-- explicit progress or phase signals from the user, agent, job output, or status response;
+- explicit progress or phase signals from the user, agent, status response, or
+  job output only when the job has an agreed progress signal format;
 - conservative min/max clamps.
 
 These inputs are explicit signals, not hidden semantic inference from `ps` or `nvidia-smi`. The MCP server should not guess that a process is "warming up" or "checkpointing" from utilization patterns in v1.
+
+Smoke and preflight jobs are explicit evidence, not magic inference. Before a
+real long-running job, the agent should run a short smoke/preflight job when
+feasible. That smoke run has two purposes:
+
+- run viability: script path, environment, imports, arguments, output path, and
+  GPU access work on the selected host;
+- runtime estimate: the agent gets evidence for the first heartbeat cadence of
+  the main job.
+
+The MCP server cannot invent smoke arguments for arbitrary scripts. The agent or
+human must supply representative smoke arguments, or the agent must explicitly
+record why smoke was skipped.
+
+Smoke is not a separate template/config subsystem. A smoke test is a normal
+managed GPU job launched through `run_python_on_gpu` with `job_role="smoke"`.
+Its evidence is the ordinary managed job record, outcome record, output pointer,
+runtime, and `job_id`. Phase 7 must not add repo-local smoke template files,
+script-to-args recipe maps, or a second smoke-only launch path. The agent is
+responsible for choosing representative smoke arguments and for interpreting
+whether the smoke result is representative of the main job.
 
 Runtime estimates are guidance, not authority. They may affect heartbeat interval and suggested next poll time. They must not be used as proof that a reservation is free. Cleanup still follows ADR 0004: stale task heartbeat plus process proof.
 
@@ -106,6 +128,63 @@ Status responses should report:
 If the job lifecycle is running or retrying, or if reservation diagnostics are unclear because inspection failed, tool output should tell the agent not to invent dependent work. It may continue independent work before the next suggested check. If no independent work is available, waiting idly and polling is acceptable behavior. If the job is terminal, status should distinguish success, failure, and process-gone-with-unknown-outcome, then tell the agent what outputs are ready and what lifecycle actions are valid.
 
 In the fixed-cadence v1 path, `next_poll_after` is `now + heartbeat_interval_sec` after launch or status unless the job is terminal. Dynamic cadence can later revise this based on expected duration or progress evidence, but it must stay within the min/max interval bounds above.
+
+Phase 7 adds public cadence evidence to `run_python_on_gpu`. The launch input
+should accept:
+
+- `job_role`: one of `smoke`, `main`, or `one_off`;
+- `expected_duration_sec`: an optional explicit expected runtime for the
+  launched job;
+- `cadence_hint_sec`: an optional direct heartbeat cadence request;
+- `smoke_job_id`: an optional managed smoke job whose viability/timing is being
+  used as evidence for a main job;
+- `smoke_skip_reason`: an optional reason a likely main/long job is being
+  launched without smoke evidence.
+
+If `job_role` is omitted, explicit launch semantics provide only a default role,
+not proof of runtime. The default should be:
+
+- `main` when `async_mode=True`;
+- `one_off` when `async_mode=False`, because `async_mode=False` is retained as
+  compatibility input even though it still returns a managed job handle.
+
+Launch output must include the resolved `job_role` and whether it was defaulted.
+An explicit `job_role` always wins over the default.
+
+For `job_role="main"`, launch should soft-refuse when there is no smoke evidence
+or explicit opt-out evidence: no `smoke_job_id`, no `expected_duration_sec`, no
+`cadence_hint_sec`, and no `smoke_skip_reason`. The refusal is a workflow guard,
+not a GPU safety boundary. It should tell the agent to either run a smoke job
+first or retry with a concrete `smoke_skip_reason`.
+
+If `smoke_job_id` is supplied, the server must validate it before using it as
+cadence evidence. It must identify a same-repo managed job with
+`job_role="smoke"` and a successful terminal outcome. The server still does not
+prove representativeness; it records that the agent or human chose to use that
+smoke result as evidence.
+
+Launch output must expose the selected `heartbeat_interval_sec`,
+`next_poll_after`, and `cadence_basis`. The cadence basis should be structured
+enough to say whether the cadence came from a smoke job, explicit expected
+duration, direct cadence hint, or the default cadence, and should include
+human-readable guidance such as "based on smoke job X" or "default cadence used;
+no smoke evidence".
+
+During polling, the agent may discover the initial cadence is wrong. Phase 7
+therefore adds an owner-side lifecycle action:
+`manage_gpu_job(action="update_cadence", job_id=..., expected_duration_sec=...,
+cadence_hint_sec=..., reason=...)`. The server clamps the selected interval to
+`60..3600` seconds and updates `heartbeat_interval_sec` and `last_heartbeat_at`
+in the same metadata write. This action records the agent's revised cadence
+judgment; it does not infer progress from arbitrary output.
+
+When `manage_gpu_job(status)` observes that a smoke job has succeeded, status
+output should make the smoke-to-main transition explicit. It should preserve the
+smoke `job_id`, report the observed runtime when available, and guide the agent
+to launch the main job with `job_role="main"` and
+`smoke_job_id="<smoke job id>"` if the agent judges the smoke result
+representative. This keeps smoke evidence discoverable through durable job state
+instead of relying on transient chat memory.
 
 ## 6. Implementation Posture
 
@@ -158,6 +237,16 @@ The hook must be cheap and local. It must not SSH to GPU hosts, inspect remote p
 
 Missing a reminder is acceptable. If the agent is between tool calls, stuck thinking, waiting for user input, or otherwise not invoking tools, the hook does not fire. That does not break the design: the MCP-owned heartbeat and ADR 0004 cleanup invariant remain the safety boundary. The next tool use can surface the reminder if it is still relevant.
 
+For Phase 7, the hook's cadence role is behavioral only. Before a
+`run_python_on_gpu` call that is explicitly or defaultedly `job_role="main"` and
+has no `smoke_job_id`, `expected_duration_sec`, `cadence_hint_sec`, or
+`smoke_skip_reason`, the hook should inject a structured precondition: the agent
+must either launch a representative `job_role="smoke"` job first or retry the
+main launch with a concrete `smoke_skip_reason`. When a running job is due, the
+hook may remind the agent to status-check the job and update cadence if observed
+progress contradicts the old cadence. The hook must not act as a scheduler and
+must not write heartbeats or cadence state itself.
+
 ## 8. Failure Boundaries
 
 Heartbeat failure and late polling have different meanings.
@@ -170,11 +259,14 @@ If the task heartbeat is stale, observers may inspect the remote process. They s
 
 ## 9. What This ADR Will Specify Later
 
-This first draft intentionally keeps the big picture simple. The final version should specify:
+This draft intentionally keeps formula-level policy simple. The final version should specify:
 
-- how representative preflight or smoke-test evidence maps to cadence;
-- how dynamic `next_poll_after` is computed and clamped beyond the fixed v1 rule;
-- how future dynamic cadence inputs are stored in repo-local job state versus shared reservation metadata;
+- edge-case validation and precedence rules not fixed above when multiple
+  public cadence inputs are supplied;
+- how dynamic `next_poll_after` is computed beyond direct `cadence_hint_sec`
+  clamping;
+- how the cadence basis is stored in repo-local job state while shared
+  reservation metadata remains limited to lease fields;
 - heartbeat lifecycle and health states beyond the initial `healthy`/`unhealthy` boundary;
 - the exact `PreToolUse` hook output shape and fallback behavior for Codex versions without `additionalContext`;
 - the exact atomic file-write mechanics for hook-owned advisory reminder state;
@@ -195,6 +287,14 @@ Rejected. One agent may manage multiple GPU tasks with different expected runtim
 ### Fixed Polling Interval
 
 Rejected. A single polling interval either wastes tokens on long jobs or reacts too slowly to short probes.
+
+### Smoke Template Files
+
+Rejected. Smoke arguments are workload judgment, not MCP policy. A repo-local
+template or recipe file would add a second configuration surface, create path
+and argument-substitution rules, and still not prove representativeness. Phase 7
+uses normal managed GPU jobs for smoke tests and durable job records for smoke
+evidence.
 
 ### Runtime Estimate as Cleanup Authority
 

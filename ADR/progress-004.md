@@ -836,8 +836,9 @@ Supporting tests:
 
 ## Phase 7: Dynamic Cadence
 
-Do not implement this until the fixed-cadence lifecycle is correct and ADR 0004p
-finalizes the public cadence input interface.
+Do not implement this until the fixed-cadence lifecycle and Phase 6 hook
+delivery are correct, and ADR 0004p's public cadence input interface is
+accepted.
 
 User-visible requirement: long jobs should not force frequent polling, and short
 smoke probes should be checked soon, without making runtime estimates cleanup
@@ -845,39 +846,102 @@ authority.
 
 Agentic battlefield first:
 
-- [ ] After the public cadence input exists, Repo A launches a short smoke job
-  with an explicit short expected duration or cadence hint. The tool tells the
-  agent to check again soon, but not more often than the minimum allowed
-  interval.
-- [ ] After the public cadence input exists, Repo A launches a job with an
-  explicit long expected duration or cadence hint. The tool gives a later
-  next-check time, but not later than the maximum allowed interval.
-- [ ] Cadence revision from status observations is deferred until ADR 0004p
-  defines the public progress/revision input. When implemented, a revision must
-  refresh the heartbeat so the job does not suddenly become stale because the
-  interval changed.
+- [ ] Live Codex prompt: Repo A asks the agent to launch a likely main/long job
+  without `job_role`, smoke evidence, `expected_duration_sec`,
+  `cadence_hint_sec`, or `smoke_skip_reason`. Because `async_mode=True`
+  defaults the role to `main`, the PreToolUse hook injects a structured
+  precondition: run a representative `job_role="smoke"` job first, or retry the
+  main launch with a concrete `smoke_skip_reason`.
+- [ ] Repo A calls `run_python_on_gpu` with `async_mode=True` and no
+  `job_role`. The launch contract resolves `job_role="main"`, reports that the
+  role was defaulted, and soft-refuses if no smoke/runtime evidence or
+  `smoke_skip_reason` is present.
+- [ ] Repo A calls `run_python_on_gpu` with `async_mode=False` and no
+  `job_role`. The launch contract resolves `job_role="one_off"` and reports
+  that the role was defaulted, without treating the compatibility flag as proof
+  of short runtime.
+- [ ] Live Codex prompt: Repo A supplies representative smoke arguments. The
+  agent launches `job_role="smoke"` with an explicit short
+  `expected_duration_sec` or `cadence_hint_sec`; launch output exposes
+  `heartbeat_interval_sec`, `next_poll_after`, and a smoke cadence basis, with
+  the interval clamped no lower than the minimum.
+- [ ] Live Codex prompt: after the smoke result, the agent checks
+  `manage_gpu_job(status)` for the smoke job. When the smoke job succeeds,
+  status output reports the smoke `job_id`, observed runtime when available, and
+  the next-call shape for launching the main job with `job_role="main"` and
+  `smoke_job_id`.
+- [ ] Repo A launches `job_role="main"` with a valid same-repo successful
+  `smoke_job_id`. Launch output cites the smoke job in `cadence_basis` and tells
+  the agent when to check next.
+- [ ] Repo A launches `job_role="main"` with a missing, cross-repo, non-smoke, or
+  non-successful `smoke_job_id`. The tool refuses to use it as cadence evidence.
+- [ ] Repo A launches a main/long job with an explicit long
+  `expected_duration_sec` or `cadence_hint_sec`. The tool gives a later
+  next-check time, clamped no higher than the maximum interval.
+- [ ] During polling, Repo A observes that the initial cadence is wrong and calls
+  `manage_gpu_job(action="update_cadence", job_id=...,
+  expected_duration_sec=... or cadence_hint_sec=..., reason=...)`. The server
+  updates cadence and heartbeat together, and the next status output reports the
+  revised basis.
+- [ ] When a running job is due, the hook reminder tells the agent to
+  status-check and optionally update cadence if observed progress contradicts
+  the old cadence. It must not perform the status check or write cadence itself.
 
 Invariants and implementation pressure:
 
-- [ ] Amend ADR 0004p with an explicit interface for user/runtime expectation
-  before using it as a cadence input. Do not infer duration from comments or
-  parse arbitrary stdout in v1.
-- [ ] The future public launch/status contract should expose the chosen
-  `heartbeat_interval_sec` and `next_poll_after`. A future launch parameter such
-  as `expected_duration_sec` or `cadence_hint` may be added only after ADR 0004p
-  names the interface.
+- [ ] `run_python_on_gpu` accepts public cadence evidence:
+  `job_role="smoke"|"main"|"one_off"`, optional `expected_duration_sec`,
+  optional `cadence_hint_sec`, optional `smoke_job_id`, and optional
+  `smoke_skip_reason`.
+- [ ] If `job_role` is omitted, `async_mode=True` defaults to `job_role="main"`
+  and `async_mode=False` defaults to `job_role="one_off"`. Explicit `job_role`
+  always wins, and launch output reports whether the role was defaulted.
+- [ ] A `job_role="main"` launch with no `smoke_job_id`,
+  `expected_duration_sec`, `cadence_hint_sec`, or `smoke_skip_reason`
+  soft-refuses with guidance to run smoke first or provide a skip reason.
+- [ ] Launch and status output expose the chosen `heartbeat_interval_sec`,
+  `next_poll_after`, and `cadence_basis`.
+- [ ] The cadence basis records whether cadence came from a smoke job, explicit
+  expected duration, direct cadence hint, or the default cadence. Sensitive
+  script paths and arguments stay repo-local under the existing metadata rules.
+- [ ] `smoke_job_id` is valid cadence evidence only when it names a same-repo
+  managed job with `job_role="smoke"` and a successful terminal outcome.
+- [ ] A successful smoke status response gives explicit smoke-to-main guidance:
+  preserve the smoke `job_id`, report observed runtime when available, and show
+  that the main launch should pass `job_role="main"` and `smoke_job_id`.
+- [ ] `manage_gpu_job(action="update_cadence")` is owner-side, requires a
+  reason, clamps the interval to `60..3600`, and writes
+  `heartbeat_interval_sec` plus `last_heartbeat_at` in the same metadata update.
 - [ ] Smoke/preflight evidence maps to initial cadence only when the probe is
-  explicitly representative or paired with expected main-job duration.
-- [ ] `next_poll_after` can be recomputed from status observations only after a
-  public progress/revision source is defined.
+  explicitly representative or paired with expected main-job duration. The MCP
+  server does not invent smoke arguments.
+- [ ] Do not add smoke templates, smoke recipe files, or a separate smoke-only
+  launch path. A smoke test is an ordinary managed GPU job submitted through the
+  MCP launch tool.
+- [ ] A likely main/long job without smoke evidence must either provide explicit
+  duration/cadence evidence or record a `smoke_skip_reason`; the hook nudges
+  this and the launch tool may soft-refuse accidental omissions, but neither is
+  a GPU safety boundary.
+- [ ] Do not infer duration from comments, arbitrary stdout, `ps`, or
+  `nvidia-smi` utilization patterns in v1.
 - [ ] Intervals remain clamped to `60..3600` seconds.
 - [ ] Runtime estimates remain non-authoritative for cleanup.
+- [ ] The hook never acts as a scheduler and never writes heartbeat or cadence
+  state.
 
-Deferred supporting tests after ADR 0004p names the cadence interface:
+Supporting tests:
 
 - [ ] Cadence clamps.
-- [ ] Representative preflight mapping.
+- [ ] `job_role` defaulting from `async_mode`.
+- [ ] Soft refusal for main launch without smoke/runtime evidence or skip
+  reason.
+- [ ] Representative smoke/preflight mapping and explicit smoke-skip reason.
+- [ ] Successful smoke status emits smoke-to-main guidance.
+- [ ] Invalid `smoke_job_id` is refused as cadence evidence.
 - [ ] Interval revision with fresh heartbeat.
+- [ ] Hook injects the structured smoke-or-skip precondition before a main/long
+  launch missing smoke/runtime evidence.
+- [ ] Due reminder includes status-check and cadence-revision guidance.
 - [ ] Estimates never bypass process-proof cleanup.
 
 ## Phase-Local Gates
