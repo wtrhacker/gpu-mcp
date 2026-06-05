@@ -32,8 +32,9 @@ The live suite currently covers these strategy-level guarantees:
 - The remote safe runner rejects Python remote-control APIs such as subprocess,
   `os.system`, dynamic subprocess import, sockets, and `ctypes`.
 - Sync timeout behavior is enforced by the server boundary.
-- Raw remote commands such as `ssh`, `scp`, `sftp`, and `rsync` are blocked by
-  Codex execpolicy when the probe is run without `--ignore-rules`.
+- Raw remote commands such as `ssh`, `scp`, `sftp`, and `rsync`, plus Codex
+  self-spawn through `codex`, are prompt-gated by Codex execpolicy when the
+  probe is run without `--ignore-rules`.
 - `kill_gpu_process` is a two-step inspect-and-fingerprint flow and only signals
   the harmless owned fixture process after the inspected fingerprint is replayed.
 
@@ -75,8 +76,8 @@ Before enabling the suite, the environment must provide:
 - Shared `/net` access from the control machine and remote host to the
   battlefield fixture root.
 - Remote GPU framework support through JAX or Torch for the framework probe.
-- Codex execpolicy prompt rules for raw remote commands, validated without
-  `--ignore-rules`.
+- Codex execpolicy prompt rules for raw remote commands and Codex self-spawn,
+  validated without `--ignore-rules`.
 
 Useful environment variables:
 

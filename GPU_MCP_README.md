@@ -89,7 +89,9 @@ written to the repo or Codex config.
 
 Root is not required if the user can log in normally and write their own destination-side `~/.ssh/authorized_keys`. Some historical nodes may be offline or not provisioned for this account; the MCP install requires at least one non-local GPU target that verifies with the dedicated key.
 
-## 3. Repo-Local Codex Config
+## 3. Codex Config
+
+### Repo-Local MCP Server Config
 
 Do not put repo-specific MCP policy paths in global `~/.codex/config.toml`.
 Each research repo should contain its own Codex config:
@@ -125,24 +127,6 @@ approval_mode = "approve"
 # Codex shows this prompt only in the human UI. After approval, the agent sees
 # the normal MCP result and cannot tell from the result that approval happened.
 approval_mode = "prompt"
-
-[[hooks.PreToolUse]]
-matcher = ".*"
-
-[[hooks.PreToolUse.hooks]]
-type = "command"
-command = "/absolute/path/to/python /home/USER/gpu-mcp/gpu_mcp_policy_hook.py"
-timeout = 5
-statusMessage = "Checking GPU MCP policy drift"
-
-[[hooks.PostToolUse]]
-matcher = ".*"
-
-[[hooks.PostToolUse.hooks]]
-type = "command"
-command = "/absolute/path/to/python /home/USER/gpu-mcp/gpu_mcp_policy_hook.py"
-timeout = 5
-statusMessage = "Checking GPU MCP policy drift"
 ```
 
 The server does not rely on `cwd` and does not read `GPU_MCP_CONFIG`. The
@@ -151,11 +135,41 @@ The server does not rely on `cwd` and does not read `GPU_MCP_CONFIG`. The
 The legacy global `[mcp_servers.gpu-cluster]` entry may exist for older live
 sessions, but new installs should use repo-local `gpu-cluster-mcp`.
 
-Restart Codex after editing this file. Use `/hooks` in Codex to review and
-trust the repo-local hook definition. The hook is workflow feedback: it warns
-the agent if `gpu-mcp.toml` has changed but has not been reloaded. The server's
-startup, preview/reload, and stale-policy checks remain the actual safety
-boundary if a client does not support hooks.
+### User-Global Companion Hook
+
+Install the GPU MCP companion hook once in the user's global Codex config:
+
+```text
+~/.codex/config.toml
+```
+
+```toml
+[[hooks.PreToolUse]]
+matcher = "*"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "/absolute/path/to/python /home/USER/gpu-mcp/gpu_mcp_policy_hook.py"
+timeout = 5
+statusMessage = "Checking GPU MCP policy drift"
+
+[[hooks.PostToolUse]]
+matcher = "*"
+
+[[hooks.PostToolUse.hooks]]
+type = "command"
+command = "/absolute/path/to/python /home/USER/gpu-mcp/gpu_mcp_policy_hook.py"
+timeout = 5
+statusMessage = "Checking GPU MCP policy drift"
+```
+
+Restart Codex after editing Codex config. Use `/hooks` in Codex to review and
+trust the user-global GPU MCP companion hook. The hook discovers the current
+repo from the nearest `gpu-mcp.toml` and exits quietly outside GPU MCP repos. It
+is workflow feedback: it warns the agent if `gpu-mcp.toml` has changed but has
+not been reloaded, and it may surface due managed-job reminders. The server's
+startup, preview/reload, stale-policy, reservation, and heartbeat checks remain
+the actual safety boundary if a client does not support hooks.
 
 ## 4. Repo Policy
 
@@ -396,8 +410,10 @@ The installation is complete only when these are true:
 1. repo-local .codex/config.toml registers gpu-cluster-mcp with --config.
 2. gpu-mcp.toml contains the human-approved repo policy.
 3. doctor check passes for the repo-local policy/config.
-4. raw remote command prompt rules are verified without --ignore-rules.
+4. raw remote command and Codex self-spawn prompt rules are verified without
+   --ignore-rules.
 5. a non-local run_python_on_gpu probe succeeds through MCP.
-6. the full real battlefield suite passes, or any omitted family is explicitly
+6. the user-global GPU MCP companion hook is installed and trusted in Codex.
+7. the full real battlefield suite passes, or any omitted family is explicitly
    documented as unsafe to run in the current environment.
 ```

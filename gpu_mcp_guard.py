@@ -115,6 +115,7 @@ FORBIDDEN_DESTRUCTIVE_METHOD_NAMES = {
 }
 FORBIDDEN_COMMAND_NAMES = {
     "chown",
+    "codex",
     "dd",
     "rm",
     "chmod",
@@ -138,6 +139,9 @@ FORBIDDEN_COMMAND_NAMES = {
     "umount",
     "unlink",
     "wget",
+    "--dangerously-bypass-approvals-and-sandbox",
+    "--ignore-rules",
+    "--yolo",
 }
 FORBIDDEN_AUDIT_EVENTS = {
     "os.chmod",

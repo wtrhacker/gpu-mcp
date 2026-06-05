@@ -1,322 +1,231 @@
 # ADR 0004: Multi-Agent GPU Coordination
 
-GPU MCP currently assumes one AI agent per research repo, and one active MCP server
-process per agent. In a shared lab filesystem, multiple agents (each in their own
-repo) may simultaneously submit jobs to the same GPU cluster. Without coordination,
-two agents can call `check_gpus`, see the same GPU as available, and both submit
-to it.
-
-This ADR defines a lightweight coordination mechanism that prevents GPU collisions
-without introducing a persistent daemon, a database, or a general scheduler.
-
 ## Status
 
 Proposed.
 
-## Context
+## 1. Why This Exists
 
-The existing design (ADR 0001) explicitly rejects adding a database or daemon for
-same-user multi-agent coordination. That rejection was correct for the initial
-single-agent scope. The user has since clarified the operational reality:
+GPU MCP was built for one agent working in one research repo. That assumption breaks down in a shared lab where multiple researchers (or multiple sessions from the same researcher) run Codex agents simultaneously, all submitting jobs to the same GPU cluster.
 
-- One agent per repo. Repos are isolated by path and workflow.
-- Multiple repos may be active simultaneously under the same Unix account.
-- All repos share the same GPU cluster hosts via SSH.
-- The filesystem is shared (NFS/Lustre or equivalent), typical of academic labs.
-- Target scale is small: 1–10 simultaneous agents, not high-throughput HPC.
+The specific problem: two agents can call `check_gpus` within seconds of each other, both see GPU 0 as free, and both launch jobs to it. The result is a collision — out-of-memory errors, corrupted training runs, wasted hours.
 
-The only resource contention across agents is **GPU device selection**. File-level
-contention within a repo is the agent's own responsibility; cross-repo file
-contention is negligible because repos are isolated.
+This ADR adds a lightweight coordination layer that prevents such collisions without turning GPU MCP into a scheduler, a database, or a daemon.
 
-The user already built `saunasub`, a lightweight Python job scheduler with a
-persistent TCP daemon (`SaunaMaster`) that solves this exact problem. Saunasub
-uses a central daemon to serialize job searches, maintain `Taken_targets`, and
-prevent collisions. However, saunasub's daemon model carries operational baggage
-that conflicts with MCP's design philosophy:
+## 2. What This Is and Is Not
 
-- Open TCP port (6000) exposed to port scanning and authentication probes.
-- Hardcoded shared authkey (`b"secret password"`) as the only security boundary.
-- Single point of failure: daemon crash loses all job tracking.
-- Host key verification disabled (`AutoAddPolicy`) during SSH key deployment.
-- Hardcoded site-specific configuration baked into library source.
+This is a **cooperative reservation registry** — a shared filesystem directory where each reserved GPU is represented by a small metadata file. It is:
 
-MCP should not adopt saunasub's daemon architecture. MCP should borrow the
-**coordination concept** (exclude lists, job tracking, reservation state) but
-implement it through the **shared filesystem** that the lab already has, keeping
-MCP stateless and lightweight.
+- **Cooperative**, not secure. It prevents well-behaved agents from stepping on each other. It does not stop the same Unix user from bypassing it entirely.
+- **A reservation list**, not a scheduler. It does not queue jobs, assign GPUs, or manage priorities.
+- **Filesystem-based**, not daemon-based. It uses atomic directory creation for locking, avoiding TCP ports, process monitoring, and single points of failure.
 
-## Decision
+It is explicitly **not** a replacement for Slurm, Kubernetes, or a real HPC scheduler. If a lab outgrows the 1–10 agent scale, the correct migration is to a real scheduler, not a more complex MCP-native coordinator.
 
-Add a filesystem-based GPU reservation registry.
+## 3. The Four Cases That Drive the Design
 
-The registry is a small JSON file on the shared filesystem that records which
-`(host, gpu_index)` pairs are reserved by which active MCP jobs. It provides
-collision avoidance without a daemon, without a database, and without requiring
-MCP server processes to communicate directly.
+1. **Multiple repo agents must not double-book one GPU.** Two agents in different repos should never independently select the same GPU.
+2. **An agent that lost context must find its own repo's active reservation.** A Codex session may crash or restart. The next session in the same repo should be able to discover what the previous session left running.
+3. **A dead agent must not strand a GPU forever if its process is gone.** If an agent dies and its remote GPU job also exits, the GPU should eventually become available again.
+4. **MCP must stay lightweight.** No daemon, no database, no queue, no scheduler, no cross-agent service.
 
-The coordination rule is:
+## 4. The Decision
 
-> Before choosing a GPU, an agent must observe the reservation registry. Before
-> launching a job, the MCP server must atomically reserve the chosen GPU. A
-> reservation without a corresponding running process expires automatically.
+Add a shared per-user filesystem registry at `~/gpu-mcp/state/reservations/`.
 
-This is not a scheduler. It does not queue jobs, auto-assign GPUs, or manage
-priorities. It only prevents two agents from independently selecting the same GPU
-based on a stale `check_gpus` snapshot.
+Each reserved GPU gets one directory named after its canonical host and GPU index (for example, `gpu-a.gpu0/`). Inside the directory is a small `metadata.json` file describing who reserved it, when, and whether the reservation is still alive.
 
-### Registry Location
+The coordination rule is simple:
 
-The registry lives beside the staged runner directory:
+> Before choosing a GPU, an agent must look at the registry. Before launching a job, the MCP server must atomically reserve the chosen GPU by creating that GPU's reservation directory. Observer-initiated cleanup may remove a reservation only when the owner's heartbeat is stale and remote inspection proves the original job process is gone. Owner-initiated `finish` is a voluntary surrender path and may remove the reservation immediately after inspection proves the process is already gone.
+
+### 4.1 Registry Location
+
+The registry must be shared across repos. If each repo kept its own registry, agents in different repos could not see each other's reservations, and double-booking would still be possible.
+
+The shared location is:
+
+```
+~/gpu-mcp/state/reservations/
+```
+
+All MCP server processes for the same Unix user read and write this directory. Different Unix users have separate namespaces naturally.
+
+The server should resolve the registry path, verify that the resolved directory is owned by the current user, and require user-only permissions. Lab home directories and scratch roots are often symlinked, so a symlinked parent path is acceptable after resolution. Symlinks inside the registry itself, including reservation entries and metadata files, must still be rejected. This is not a security boundary — the same Unix user could edit it directly — but it prevents accidental writes through unsafe paths.
+
+### 4.2 Reservation Keys
+
+The directory name is the reservation key, derived from the canonical host identity and GPU index. The canonical host identity is the active policy node name after host validation, not arbitrary user input. For example:
+
+- Policy node `gpu-a` → canonical host `gpu-a`
+- GPU index `0` → reservation key `gpu-a.gpu0`
+
+This canonicalization is critical. If one agent uses `gpu-a` and another uses `gpu-a.example.edu`, they could create separate reservation directories for the same physical GPU and collide. Every tool — `check_gpus`, `run_python_on_gpu`, reservation creation, cleanup — must use the same canonical key.
+
+The v1 reservation key format is:
 
 ```text
-$REPO/.gpu_mcp_reservations/active.json
+<canonical-host>.gpu<gpu-index>
 ```
 
-Wait — this is wrong. The registry must be **shared across repos**, not per-repo.
-If each repo has its own registry, agents in different repos cannot see each
-other's reservations.
+The v1 implementation should reject canonical host names that are not safe as a single directory component.
 
-The correct location is a user-level shared path:
+### 4.3 Atomic Reservation
+
+The reservation is granted by a single atomic operation: creating a directory.
+
+1. Build the reservation key (`gpu-a.gpu0`).
+2. Attempt to create `~/gpu-mcp/state/reservations/gpu-a.gpu0/`.
+3. If creation succeeds, the caller owns the reservation.
+4. If creation fails because the directory already exists, the GPU is reserved by someone else.
+
+Why a directory, not a file? Because two processes can both read a file, both see it is empty, both write their own version, and both proceed to launch. A directory can only be created once; the filesystem itself serializes the race.
+
+If the existing reservation is stale and has been cleaned up, the caller must retry the atomic creation. Cleanup does not transfer ownership; only a fresh successful creation does.
+
+### 4.4 Stable State Roots and IDs
+
+The v1 shared registry root is fixed:
 
 ```text
-~/.gpu-mcp/state/reservations.json
+~/gpu-mcp/state/reservations/
 ```
 
-This path is already the trusted control-state directory (see ADR 0002). All MCP
-server processes for the same Unix user read and write this file. Different Unix
-users have separate namespaces naturally; we do not try to coordinate across users.
+This matches ADR 0002's trusted user-level state directory. Production behavior should not require a repo-local config knob for this path. Tests may inject an alternate root so they do not touch real user state.
 
-### Registry Shape
-
-```json
-{
-  "schema_version": 1,
-  "reservations": [
-    {
-      "host": "gpu-a",
-      "gpu_index": 0,
-      "repo": "/net/levsha/scratch2/tingran/repo-a",
-      "pid": 12345,
-      "reserved_at": "2026-05-26T12:00:00Z",
-      "expires_at": "2026-05-26T13:00:00Z"
-    }
-  ]
-}
-```
-
-Fields:
-
-- `host`: Short hostname (same namespace as `gpu-mcp.toml` nodes).
-- `gpu_index`: Integer GPU device index.
-- `repo`: Absolute path to the reserving agent's repo. For debugging and
-  accountability, not for enforcement.
-- `pid`: OS process ID of the launched job on the remote host. Populated after
-  async launch succeeds; null for sync jobs that have not yet returned.
-- `reserved_at`: ISO timestamp of reservation creation.
-- `expires_at`: ISO timestamp after which the reservation is stale.
-
-The `repo` field is diagnostic. The registry does not enforce that a reservation
-was created by the same repo whose server is reading it. All reservations for
-the same Unix user are visible to all MCP servers for that user. The agent is
-expected to tolerate reservations from other repos gracefully.
-
-### Atomic Reservation
-
-Reservations must be written atomically to prevent two MCP server processes from
-simultaneously reading an empty slot and both claiming it.
-
-The implementation should:
-
-1. Read the current registry.
-2. Check if `(host, gpu_index)` is already reserved by an unexpired entry.
-3. If free, append a new reservation with `expires_at = now + TTL`.
-4. Write the updated registry to a temporary file in `~/.gpu-mcp/state/`.
-5. Atomically replace `reservations.json` with `os.replace`.
-6. If the replace succeeds, the reservation is held. If another process won the
-   race, read again and retry or fail.
-
-This is not a distributed lock protocol. It is a best-effort atomic file update
-sufficient for 1–10 agents on a shared filesystem. The race window is the
-read-modify-write cycle; on a local or NFS filesystem with reasonable coherence,
-this window is small enough for the target scale.
-
-### TTL and Cleanup
-
-Reservations expire automatically. The default TTL should be long enough to cover
-most GPU jobs but short enough that a crashed agent does not block a GPU forever.
-
-Suggested default: **30 minutes**.
-
-The MCP server should clean expired entries on every registry read. No separate
-garbage-collection process is needed.
-
-For sync jobs, the reservation is released when the job returns (success or
-failure). For async jobs, the reservation is released when:
-- the agent explicitly calls `release_gpu_reservation(host, gpu_index)`;
-- the reservation TTL expires; or
-- a new `check_gpus` call observes the reservation is expired and removes it.
-
-### Enhanced `check_gpus`
-
-`check_gpus` should read the reservation registry before reporting availability.
-
-For each GPU, the tool should:
-
-1. Query `nvidia-smi` for utilization and memory (existing behavior).
-2. Check the registry for an unexpired reservation on that `(host, gpu_index)`.
-3. If reserved, mark the GPU as `RESERVED` instead of `AVAILABLE` or `BUSY`.
-4. Include the reservation age (minutes since `reserved_at`) in the output.
-
-The agent sees something like:
+Repo-local managed job records live under:
 
 ```text
-GPU 0 | NVIDIA A100 | util_avg=5.0% | mem=1024/40960 MiB | RESERVED (12 min)
-GPU 1 | NVIDIA A100 | util_avg=45.0% | mem=20480/40960 MiB | BUSY
-GPU 2 | NVIDIA A100 | util_avg=2.0% | mem=512/40960 MiB | AVAILABLE
+<repo>/.gpu_mcp_state/jobs/
 ```
 
-An agent should prefer `AVAILABLE` over `RESERVED`. If all suitable GPUs are
-reserved, the agent should wait and `check_gpus` again rather than overriding a
-reservation.
+This directory stores current-repo details that do not belong in shared metadata: full script path, arguments, output/log paths, outcome records, and hook reminder state. It should be treated like `.gpu_mcp_runner/` and `.gpu_mcp_logs/`: local operational state, not source code.
 
-### Reservation in `run_python_on_gpu`
+`job_id` is an opaque handle generated at launch:
 
-When an agent calls `run_python_on_gpu(host, gpu_index, ...)`, the server should:
-
-1. Validate host and GPU index against policy (existing behavior).
-2. Read the registry and check for an unexpired reservation on `(host, gpu_index)`.
-3. If reserved by another repo, refuse with a clear message:
-   ```text
-   GPU 0 on gpu-a is reserved by /net/levsha/scratch2/tingran/repo-b
-   (reserved 5 minutes ago, expires in 25 minutes).
-   Call check_gpus to find an available GPU.
-   ```
-4. If not reserved, atomically write a reservation entry.
-5. Launch the job (sync or async).
-6. For async jobs, update the reservation with the remote PID after launch.
-7. For sync jobs, remove the reservation when the job completes.
-
-If the launch fails (SSH error, invalid script, etc.), the server must still
-remove the reservation so the GPU is not orphaned.
-
-### Explicit Release Tool
-
-A new MCP tool:
-
-```python
-@mcp.tool()
-def release_gpu_reservation(host: str, gpu_index: int):
-    """Release a previously reserved GPU."""
+```text
+job-<UTC timestamp>-<random suffix>
 ```
 
-This allows an agent to free a GPU before the TTL expires, e.g., after killing
-an async job with `kill_gpu_process`.
+Example: `job-20260528T153012Z-a1b2c3d4`. It is for tool targeting and recovery, not for authorization.
 
-Calling `release_gpu_reservation` on a reservation held by another repo should
-succeed silently or warn. The design does not treat reservations as strong
-ownership locks; they are advisory coordination hints.
+`server_instance_id` identifies one live MCP server process:
 
-### Reservation Listing Tool (Optional)
-
-A diagnostic tool:
-
-```python
-@mcp.tool()
-def list_gpu_reservations():
-    """List all active GPU reservations across repos."""
+```text
+server-<local-hostname>-<pid>-<random suffix>
 ```
 
-This helps an agent understand cluster contention without parsing `check_gpus`
-output. It returns the registry contents as structured JSON.
+Example: `server-login01-42817-a1b2c3d4e5f6`. It is not a secret. Its only purpose is to ensure that a new server process does not accidentally heartbeat or mutate reservations owned by an old process.
 
-## Rejected Alternatives
+## 5. What Gets Stored (and Why)
 
-### Persistent TCP Daemon (Saunasub Model)
+The metadata file inside each reservation directory contains only what other agents need to avoid collisions and help recovery. The guiding question is: if Repo B looks at Repo A's reservation, what should Repo B legitimately know?
 
-Rejected. A daemon like `SaunaMaster` provides true serialization and avoids
-filesystem races, but it introduces a single point of failure, requires
-monitoring/restart logic, needs a network port, and creates a security boundary
-that MCP's stateless model deliberately avoids. The filesystem registry achieves
-sufficient coordination for the target scale with none of the operational burden.
+**Repo B must know:** which GPU is taken, by which repo, since when, and whether the reservation is still alive. This prevents collisions.
+
+**Repo B should know:** a rough description of the job. This helps humans understand cluster contention.
+
+**Repo B must not know:** script arguments, full file paths, or output locations. These can contain sensitive data — API tokens, dataset paths, personal information. Same Unix user is not a justification for sharing sensitive command-line content.
+
+Therefore, the shared metadata includes:
+
+| Field | Purpose |
+|-------|---------|
+| `job_id` | Opaque handle for lifecycle operations |
+| `repo` | Which repo reserved this GPU (for recovery) |
+| `script_name` | Just the filename, e.g. `train.py` (human-readable, no sensitive data) |
+| `host`, `gpu_index` | Self-describing location |
+| `owner_user` | Unix account |
+| `server_instance_id` | Which MCP server process owns the heartbeat for this reservation |
+| `remote_pid`, `remote_start_time`, `remote_boot_id`, `process_fingerprint` | Remote process identity (for inspection). The fingerprint may be a launcher nonce or other opaque non-sensitive value; it must not encode command-line arguments. |
+| `reserved_at`, `last_heartbeat_at`, `heartbeat_interval_sec` | Lease timestamps |
+
+Notably absent: `args_preview`, `script_path`, and `output_file`. These belong in repo-local job records, not shared cross-repo state.
+
+If metadata is malformed or manually edited, tools must fail closed for that reservation rather than guessing. A corrupted reservation is treated as occupied until an administrator intervenes.
+
+## 6. The Cleanup Rule
+
+The most important decision in this ADR is when an observer may remove a reservation it does not own. The rule has two parts:
+
+> **Observer-initiated cleanup may remove a reservation only when two independent conditions are met:**
+> 1. The owner's heartbeat has gone stale (the owner has not checked in for longer than expected).
+> 2. Remote process inspection proves the original GPU job is gone or has a different identity.
+
+For observer-initiated cleanup, both conditions must be true. Neither alone is sufficient. Owner-initiated `finish` is a separate voluntary surrender path described below.
+
+### Why both conditions?
+
+- **Heartbeat alone is not enough.** The agent might have crashed while the remote GPU job keeps running. Freeing the reservation based only on a missing heartbeat would allow another agent to schedule onto a GPU still occupied by the first agent's job.
+- **Process proof alone is not enough.** The agent might have deliberately killed its job and is about to retry under the same reservation. The heartbeat is still fresh, so the owner still holds the lease.
+
+### What counts as "process proof"?
+
+Remote inspection compares the stored process identity against the current state of the remote host:
+
+- Does a process still exist at the stored `remote_pid`?
+- Does the process owner match `owner_user`?
+- Does its start time match?
+- Does its opaque process fingerprint or launcher nonce match?
+- Does the host's boot ID match?
+- Is the process a real live process rather than a zombie?
+
+If any of these differ, the stored PID is either dead, reused by a different process, or from a rebooted host. The original job is gone.
+
+A matching live process keeps the reservation even if it is temporarily off the GPU (for example, doing CPU-side cleanup between training epochs). Absence from `nvidia-smi` alone does not prove a process is gone. A zombie process counts as gone for cleanup purposes; it has exited even if the PID remains in the process table.
+
+### Sub-rules
+
+- Observer-initiated cleanup (e.g., `check_gpus`, `run_python_on_gpu` finding a stale reservation) requires both stale heartbeat and process proof. A fresh heartbeat means the owner is still managing the lease; observers must not override it.
+- Owner-initiated `finish` is different: the owner voluntarily surrenders the lease. The server inspects the process immediately. If already gone, it cleans up without waiting for staleness. If still alive, it stops heartbeating and lets the normal stale + process proof path handle cleanup when the process eventually exits.
+- Never free a stale reservation merely because the heartbeat is missing.
+- Killing a process and freeing a reservation are separate operations. After a rescue kill, the reservation stays until the next inspection proves the process is gone.
+- Cleanup must be atomic and race-safe. Two agents might both discover the same stale reservation at the same time. The protocol must ensure only one cleans it, and neither acts on stale data if the owner refreshes its heartbeat mid-cleanup. The final cleanup step must be guarded so a heartbeat cannot refresh the reservation between the final metadata check and the quarantine rename; this guard must be short-lived and automatically released on process death, not a persistent lock directory.
+
+## 7. Recovery
+
+When an agent loses its `job_id` (for example, after a Codex crash and restart), it needs to find its reservation again. The registry stores the repo path, so the agent can ask: "show me reservations for my repo."
+
+If exactly one reservation matches the current repo, it is the implicit recovery target. If there are zero or multiple, the agent must disambiguate explicitly. The server never guesses.
+
+A new MCP server instance never adopts reservations created by a prior instance. It can inspect and report them, and it can clean them up if they are stale and the process is gone. But it does not take over heartbeat ownership for a still-running old job. If the old process needs to be stopped, the caller uses the managed owner path (if the original session is still alive) or explicitly chooses the fingerprinted rescue-kill path (if the reservation is stale or orphaned).
+
+## 8. What Changes for Tools
+
+- Ordinary GPU runs and smoke probes use managed background jobs. A launch call reserves the GPU, starts the remote process, and returns promptly with a `job_id`; `manage_gpu_job(status)` is how the agent follows progress and retrieves results. Tool timeouts apply to launch/status RPCs, not to total GPU job runtime.
+- The managed launcher writes a repo-local outcome record with exit code, signal if known, and end time. If `status` later finds the process gone but no outcome record exists, it reports process-gone-with-unknown-outcome rather than guessing success or failure.
+- The launch result must at minimum include `status`, `job_id`, `reservation_key`, `host`, `gpu_index`, `server_instance_id`, process identity summary when known, a current-repo output/log pointer when available, and `next_poll_after`.
+- A status result must at minimum include `job_id`, `reservation_key`, computed reservation state, job lifecycle when known, ownership (`owned_by_current_server`), heartbeat age/staleness details, process inspection summary when performed, allowed actions, current-repo output/log pointers when available, and the next suggested poll time.
+- **`check_gpus`** now reads the registry before reporting. For reserved GPUs, it reports the reservation state instead of `AVAILABLE`. It may inspect stale reservations and perform observer cleanup when stale heartbeat plus process proof shows the original job is gone, but it does not perform deep inspection when the heartbeat is fresh. `check_gpus` is not an owner-side lifecycle mutation and remains available even if the local heartbeat manager is unhealthy; only owner-side mutations are refused when the heartbeat manager is unhealthy.
+- **`run_python_on_gpu`** now atomically reserves the GPU before launching. If the GPU is already reserved, it refuses with a clear message. If launch fails before a remote process exists, it removes the reservation so the GPU is not orphaned.
+- **No explicit `release_gpu_reservation` tool.** Releasing a live reservation is dangerous — another agent could schedule onto a GPU still occupied by the old job. Reservations are removed only through owner `finish` after process-gone proof, or through observer cleanup after stale heartbeat plus process-gone proof.
+- **`kill_gpu_process`** remains a separate rescue concept. It inspects a specific host/PID, requires fingerprint confirmation, and does not directly remove reservations. Because it does not depend on local lease ownership, it remains available even if the local heartbeat manager is unhealthy. Cleanup follows the normal two-condition rule on the next inspection.
+- All operational cluster tools still obey ADR 0002's active-policy rule. If `gpu-mcp.toml` has changed but not been approved and reloaded, normal tools refuse rather than running under ambiguous policy. Policy preview/reload tools are the recovery path.
+
+## 9. Rejected Alternatives
+
+### Persistent TCP Daemon
+A central daemon would avoid filesystem races but introduces a single point of failure, requires a network port, and needs monitoring. The filesystem registry achieves the same coordination for our scale without any of this.
 
 ### SQLite or Embedded Database
-
-Rejected. SQLite would provide atomic transactions, but it adds a schema, a file
-lock protocol, and a dependency. For fewer than 100 reservation entries, JSON
-with atomic file replacement is simpler and sufficient.
+SQLite would provide atomic transactions but adds a schema, a file lock protocol, and a dependency. Per-GPU directory creation is simpler.
 
 ### Per-Repo Reservation Files
-
-Rejected. If each repo maintains its own registry (e.g., under
-`$REPO/.gpu_mcp_reservations/`), agents in different repos cannot see each
-other's reservations. Cross-repo coordination is the entire purpose of this
-feature.
+If each repo had its own registry, agents in different repos could not see each other's reservations. Cross-repo coordination would fail.
 
 ### SSH-Based Lock Files on GPU Hosts
-
-Rejected. Creating lock files on each GPU host via SSH would work without a
-shared filesystem, but it adds N SSH round-trips per reservation check and
-complicates cleanup when an agent crashes. The shared filesystem is already a
-prerequisite for the MCP runner model (ADR 0003); using it for coordination is
-consistent.
+Creating lock files on each GPU host via SSH would work without a shared filesystem but adds N round-trips per check and complicates cleanup when an agent crashes.
 
 ### Agent-Side Coordination Only
+Telling agents to "just check `nvidia-smi` and tolerate collisions" does not solve the problem. At small scale collisions are rare but expensive — OOMs, corrupted runs, wasted hours.
 
-Rejected. Telling agents to "just check `nvidia-smi` and tolerate collisions"
-does not solve the stated problem. At small scale, collisions are rare but
-wasteful: two jobs land on the same GPU, memory contention causes OOM or severe
-slowdown, and the agent must retry. The reservation registry eliminates this
-class of failure cheaply.
+### Full Scheduler with Queuing
+Out of scope. ADR 0001 explicitly excludes general HPC scheduler features.
 
-### Full Scheduler with Queuing and Priorities
+## 10. Consequences
 
-Rejected. Out of scope. ADR 0001 explicitly excludes general HPC scheduler
-features. The registry is a reservation list, not a job queue.
+This adds reservation state alongside the approved-policy state under `~/gpu-mcp/state/`. The trust model does not change — this directory was already treated as trusted control state.
 
-## Testing Implications
+The design stays lightweight: no daemon, no database, no new dependencies. The implementation must share process identity logic across launch, cleanup, lifecycle management, and rescue kill paths, which is nontrivial but bounded.
 
-Deterministic tests should cover:
-
-- registry is created on first reservation if absent;
-- `check_gpus` marks reserved GPUs as `RESERVED` with age;
-- `run_python_on_gpu` refuses a GPU reserved by another repo;
-- `run_python_on_gpu` succeeds and writes a reservation for an unreserved GPU;
-- reservation includes correct `host`, `gpu_index`, `repo`, `expires_at`;
-- async launch updates reservation with remote PID;
-- sync job completion removes reservation;
-- `release_gpu_reservation` removes the matching entry;
-- expired reservations are cleaned on `check_gpus` read;
-- registry write uses atomic `os.replace` (no partial writes visible);
-- concurrent reservation attempts from two MCP processes: one succeeds, one fails
-  or retries;
-- launch failure removes reservation (no orphaned GPU blocks).
-
-Battlefield tests should cover:
-
-1. Agent A in repo-a calls `check_gpus`, sees GPU 0 as `AVAILABLE`.
-2. Agent A calls `run_python_on_gpu` on GPU 0; reservation is written.
-3. Agent B in repo-b calls `check_gpus`, sees GPU 0 as `RESERVED`.
-4. Agent B picks GPU 1 instead.
-5. Agent A's job finishes; reservation is removed.
-6. Agent B (or a new Agent C) later sees GPU 0 as `AVAILABLE` again.
-
-## Consequences
-
-This is a localized addition to the MCP tool surface, not a redesign. The
-existing policy model, approval lifecycle, staged runner, and SSH fabric remain
-unchanged.
-
-The registry adds a small trusted state file under `~/.gpu-mcp/state/`, alongside
-the approved-policy record. This directory is already treated as trusted control
-state; adding one JSON file does not change the trust model.
-
-The design stays lightweight: no daemon, no database, no new dependencies. The
-implementation is roughly 50–100 lines of JSON file I/O with atomic replacement,
-plus reservation checks in `check_gpus` and `run_python_on_gpu`.
-
-The trade-off is explicit: the filesystem registry is not a distributed lock. On
-a poorly coherent shared filesystem, the read-modify-write race window could
-allow occasional collisions. For 1–10 agents in a single lab, this is acceptable.
-If the lab grows beyond that scale, the correct migration is to a real scheduler
-(e.g., Slurm, Kubernetes), not a more complex MCP-native coordinator.
+For 1–10 agents in a single lab, this is sufficient. If the lab grows beyond that, migrate to Slurm or Kubernetes, not a more complex MCP-native coordinator.

@@ -9,6 +9,8 @@ import json
 import shlex
 import subprocess
 import sys
+import textwrap
+import time
 import uuid
 from pathlib import Path
 
@@ -56,8 +58,34 @@ def _write_config(repo: Path) -> Path:
 
 def _import_server_with_config(monkeypatch, config: Path):
     monkeypatch.setattr(sys, "argv", [str(SERVER), "--config", str(config)])
+    old_server = sys.modules.get("gpu_mcp_server")
+    if old_server is not None and hasattr(old_server, "HEARTBEAT_MANAGER"):
+        old_server.HEARTBEAT_MANAGER.stop()
     sys.modules.pop("gpu_mcp_server", None)
     return importlib.import_module("gpu_mcp_server")
+
+
+def _server_subprocess_env(registry: Path) -> dict[str, str]:
+    env = os.environ.copy()
+    existing_pythonpath = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = (
+        str(REPO_ROOT)
+        if not existing_pythonpath
+        else str(REPO_ROOT) + os.pathsep + existing_pythonpath
+    )
+    env["GPU_MCP_TEST_RESERVATION_ROOT"] = str(registry)
+    env["GPU_MCP_TEST_DISABLE_POLICY_APPROVAL"] = "1"
+    env.setdefault("PYTEST_CURRENT_TEST", "gpu-mcp subprocess contract")
+    return env
+
+
+def _wait_for_path(path: Path, *, timeout: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if path.exists():
+            return
+        time.sleep(0.01)
+    raise AssertionError(f"timed out waiting for {path}")
 
 
 def test_server_refuses_to_start_without_explicit_config():
@@ -157,8 +185,10 @@ def test_run_python_rejects_bool_gpu_index(repo_fixture, monkeypatch):
         script_path="jobs/does_not_matter.py",
     )
 
-    assert "gpu_index" in result
-    assert "integer" in result
+    parsed = json.loads(result)
+    assert parsed["status"] == "refused"
+    assert "gpu_index" in parsed["reason"]
+    assert "integer" in parsed["reason"]
 
 
 def test_run_python_rejects_non_list_args_and_non_bool_async(repo_fixture, monkeypatch):
@@ -179,8 +209,1992 @@ def test_run_python_rejects_non_list_args_and_non_bool_async(repo_fixture, monke
         async_mode="false",
     )
 
-    assert "args" in args_result
-    assert "async_mode" in async_result
+    assert json.loads(args_result)["status"] == "refused"
+    assert "args" in json.loads(args_result)["reason"]
+    assert json.loads(async_result)["status"] == "refused"
+    assert "async_mode" in json.loads(async_result)["reason"]
+
+
+def test_phase0_managed_job_status_shape_has_no_target(repo_fixture, monkeypatch):
+    config = _write_config(repo_fixture)
+    server = _import_server_with_config(monkeypatch, config)
+
+    result = json.loads(server.manage_gpu_job(action="status"))
+
+    assert result["status"] == "no_target"
+    assert result["action"] == "status"
+    assert result["job_id"] is None
+    assert result["reservation_key"] is None
+    assert result["owned_by_current_server"] is False
+    assert result["allowed_actions"] == ["status"]
+    assert result["server_instance_id"].startswith("server-")
+
+
+def test_phase0_list_reservations_shape_and_fresh_semantics(repo_fixture, tmp_path, monkeypatch):
+    config = _write_config(repo_fixture)
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    server = _import_server_with_config(monkeypatch, config)
+
+    result = json.loads(server.list_gpu_reservations(scope="mine", fresh=True))
+
+    assert result["status"] == "ok"
+    assert result["scope"] == "mine"
+    assert result["fresh"] is True
+    assert result["fresh_semantics"] == "bounded_refresh_not_filter"
+    assert result["registry_root"] == str(registry.resolve())
+    assert result["registry_status"] == "ok"
+    assert result["reservations"] == []
+
+
+def test_phase0_list_reservations_reports_sanitized_rows(repo_fixture, tmp_path, monkeypatch):
+    config = _write_config(repo_fixture)
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    server = _import_server_with_config(monkeypatch, config)
+    key = "gpu-a.gpu0"
+    reservation_dir = registry / key
+    reservation_dir.mkdir(parents=True)
+    metadata = {
+        "schema_version": 1,
+        "job_id": "job-20260530T123456Z-abc123",
+        "attempt_id": "attempt-20260530T123456Z-def456",
+        "reservation_key": key,
+        "host": "gpu-a",
+        "gpu_index": 0,
+        "repo": str(repo_fixture.resolve()),
+        "script_name": "train.py",
+        "owner_user": server.GPU_MCP_USER,
+        "server_instance_id": "server-login-1234-srv",
+        "remote_pid": 12345,
+        "remote_start_time": None,
+        "remote_boot_id": None,
+        "process_fingerprint": "gpu-mcp-process:fingerprint",
+        "reserved_at": "2026-05-30T12:00:00Z",
+        "last_heartbeat_at": "2026-05-30T12:00:00Z",
+        "heartbeat_interval_sec": 600,
+    }
+    (reservation_dir / "metadata.json").write_text(json.dumps(metadata))
+
+    result = json.loads(server.list_gpu_reservations(scope="mine", fresh=False))
+
+    assert len(result["reservations"]) == 1
+    row = result["reservations"][0]
+    assert row["job_id"] == "job-20260530T123456Z-abc123"
+    assert row["reservation_key"] == key
+    assert row["host"] == "gpu-a"
+    assert row["gpu_index"] == 0
+    assert row["script_name"] == "train.py"
+    assert row["reservation_state"] in {"RESERVED", "STALE_RESERVED"}
+    assert row["computed_state"] == row["reservation_state"]
+    assert row["metadata_status"] == "ok"
+    assert row["server_instance_id"] == "server-login-1234-srv"
+    assert row["owned_by_current_server"] is False
+    assert row["allowed_actions"] == ["status"]
+    assert row["last_inspection"] is None
+    assert "script_path" not in json.dumps(result)
+    assert "output_file" not in json.dumps(result)
+    assert "args" not in json.dumps(result)
+
+
+def test_phase0_list_reservations_rejects_symlink_and_malformed_metadata(
+    repo_fixture,
+    tmp_path,
+    monkeypatch,
+):
+    config = _write_config(repo_fixture)
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    server = _import_server_with_config(monkeypatch, config)
+    registry.mkdir()
+    (registry / "gpu-a.gpu0").symlink_to(tmp_path)
+    malformed = registry / "gpu-a.gpu1"
+    malformed.mkdir()
+    (malformed / "metadata.json").write_text("[]")
+
+    result = json.loads(server.list_gpu_reservations(scope="all", fresh=False))
+
+    rows = {row["reservation_key"]: row for row in result["reservations"]}
+    assert rows["gpu-a.gpu0"]["reservation_state"] == "UNKNOWN_RESERVED"
+    assert rows["gpu-a.gpu1"]["reservation_state"] == "UNKNOWN_RESERVED"
+    assert rows["gpu-a.gpu1"]["job_id"] is None
+    assert rows["gpu-a.gpu1"]["script_name"] is None
+
+
+def test_phase0_manage_rejects_noncanonical_reservation_key(repo_fixture, monkeypatch):
+    config = _write_config(repo_fixture)
+    server = _import_server_with_config(monkeypatch, config)
+
+    result = json.loads(server.manage_gpu_job(action="status", reservation_key=".."))
+
+    assert result["status"] == "refused"
+    assert "reservation_key" in result["reason"]
+
+
+def test_phase0_check_gpus_returns_structured_registry_overlay(repo_fixture, tmp_path, monkeypatch):
+    config = _write_config(repo_fixture)
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    server = _import_server_with_config(monkeypatch, config)
+
+    def fake_host_run(host, cmd, user=server.GPU_MCP_USER, timeout=15):
+        assert "query-gpu=index,name" in cmd
+        return "0, NVIDIA RTX 4090, 0, 1, 24576\n"
+
+    monkeypatch.setattr(server, "_host_run", fake_host_run)
+
+    result = json.loads(server.check_gpus(samples=1, threshold=10))
+
+    assert result["registry_status"] == "ok"
+    assert result["gpus"][0]["host"] == "gpu-a"
+    assert result["gpus"][0]["gpu_index"] == 0
+    assert result["gpus"][0]["availability"] == "available"
+    assert result["gpus"][0]["reservation_key"] == "gpu-a.gpu0"
+
+
+def test_phase0_check_gpus_fails_closed_when_registry_unavailable(
+    repo_fixture,
+    tmp_path,
+    monkeypatch,
+):
+    config = _write_config(repo_fixture)
+    registry_file = tmp_path / "not-a-directory"
+    registry_file.write_text("nope")
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry_file))
+    server = _import_server_with_config(monkeypatch, config)
+
+    def fake_host_run(host, cmd, user=server.GPU_MCP_USER, timeout=15):
+        return "0, NVIDIA RTX 4090, 0, 1, 24576\n"
+
+    monkeypatch.setattr(server, "_host_run", fake_host_run)
+
+    result = json.loads(server.check_gpus(samples=1, threshold=10))
+
+    assert result["registry_status"] == "unavailable"
+    assert result["gpus"][0]["availability"] == "unknown_unavailable"
+
+
+def test_phase0_check_gpus_fails_closed_when_registry_iterdir_fails(
+    repo_fixture,
+    monkeypatch,
+):
+    config = _write_config(repo_fixture)
+    server = _import_server_with_config(monkeypatch, config)
+
+    class BrokenRegistry:
+        def exists(self):
+            return True
+
+        def iterdir(self):
+            raise OSError("simulated registry listing failure")
+
+    def fake_host_run(host, cmd, user=server.GPU_MCP_USER, timeout=15):
+        return "0, NVIDIA RTX 4090, 0, 1, 24576\n"
+
+    monkeypatch.setattr(server.reservations, "reservation_registry_root", lambda: BrokenRegistry())
+    monkeypatch.setattr(server, "_host_run", fake_host_run)
+
+    result = json.loads(server.check_gpus(samples=1, threshold=10))
+
+    assert result["status"] == "error"
+    assert result["registry_status"] == "unavailable"
+    assert "simulated registry listing failure" in result["registry_error"]
+    assert result["gpus"][0]["availability"] == "unknown_unavailable"
+
+
+def test_phase0_run_python_returns_managed_handle_for_sync_compat(
+    repo_fixture,
+    tmp_path,
+    monkeypatch,
+):
+    config = _write_config(repo_fixture)
+    script = repo_fixture / "jobs" / "ok.py"
+    script.write_text("print('ok')\n")
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    server = _import_server_with_config(monkeypatch, config)
+    monkeypatch.setattr(server, "_is_local_host", lambda host: False)
+    captured = {}
+
+    def fake_ssh(host, cmd):
+        captured["cmd"] = cmd
+        return "12345\n"
+
+    monkeypatch.setattr(server, "_ssh_run", fake_ssh)
+
+    result = json.loads(server.run_python_on_gpu(
+        host="gpu-a",
+        gpu_index=0,
+        script_path="jobs/ok.py",
+        async_mode=False,
+        output_file=".gpu_mcp_logs/job.log",
+    ))
+
+    assert result["status"] == "launched"
+    assert result["job_id"].startswith("job-")
+    assert result["attempt_id"].startswith("attempt-")
+    assert result["reservation_key"] == "gpu-a.gpu0"
+    assert result["host"] == "gpu-a"
+    assert result["gpu_index"] == 0
+    assert result["server_instance_id"].startswith("server-")
+    assert result["process"]["remote_pid"] == 12345
+    assert "GPU_MCP_PROCESS_FINGERPRINT" in captured["cmd"]
+    assert result["process"]["process_fingerprint"] in captured["cmd"]
+    assert result["output"]["path"] == str(repo_fixture / ".gpu_mcp_logs" / "job.log")
+    assert result["next_poll_after"]
+    assert result["async_mode_requested"] is False
+    metadata = json.loads((repo_fixture / ".gpu_mcp_state" / "jobs" / result["job_id"] / "job.json").read_text())
+    assert metadata["reservation_key"] == "gpu-a.gpu0"
+    reservation_metadata = json.loads(
+        (registry / "gpu-a.gpu0" / "metadata.json").read_text()
+    )
+    assert reservation_metadata["job_id"] == result["job_id"]
+
+
+def test_phase0_two_repos_share_registry_but_not_job_state(tmp_path, monkeypatch):
+    repo_a = tmp_path / "repo_a"
+    repo_b = tmp_path / "repo_b"
+    for repo in (repo_a, repo_b):
+        (repo / "jobs").mkdir(parents=True)
+        (repo / "results").mkdir()
+        (repo / ".gpu_mcp_logs").mkdir()
+        (repo / "jobs" / "ok.py").write_text("print('ok')\n")
+    config_a = _write_config(repo_a)
+    config_b = _write_config(repo_b)
+    registry = tmp_path / "shared_reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+
+    server_a = _import_server_with_config(monkeypatch, config_a)
+    monkeypatch.setattr(server_a, "_is_local_host", lambda host: False)
+    monkeypatch.setattr(server_a, "_ssh_run", lambda host, cmd: "12345\n")
+    launch = json.loads(server_a.run_python_on_gpu(
+        host="gpu-a",
+        gpu_index=0,
+        script_path="jobs/ok.py",
+        output_file=".gpu_mcp_logs/a.log",
+    ))
+
+    assert launch["status"] == "launched"
+    assert (registry / "gpu-a.gpu0" / "metadata.json").exists()
+    assert (repo_a / ".gpu_mcp_state" / "jobs" / launch["job_id"] / "job.json").exists()
+    assert not (repo_b / ".gpu_mcp_state" / "jobs").exists()
+
+    server_b = _import_server_with_config(monkeypatch, config_b)
+    listed = json.loads(server_b.list_gpu_reservations(scope="all", fresh=False))
+
+    assert listed["registry_root"] == str(registry.resolve())
+    assert listed["reservations"][0]["job_id"] == launch["job_id"]
+    assert listed["reservations"][0]["reservation_key"] == "gpu-a.gpu0"
+    assert listed["reservations"][0]["owned_by_current_server"] is False
+
+
+def test_phase1_second_launch_same_gpu_is_refused_and_visible_in_check(
+    repo_fixture,
+    tmp_path,
+    monkeypatch,
+):
+    config = _write_config(repo_fixture)
+    script = repo_fixture / "jobs" / "ok.py"
+    script.write_text("print('ok')\n")
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    server = _import_server_with_config(monkeypatch, config)
+    monkeypatch.setattr(server, "_is_local_host", lambda host: False)
+    pids = iter(["12345\n", "23456\n"])
+    monkeypatch.setattr(server, "_ssh_run", lambda host, cmd: next(pids))
+
+    first = json.loads(server.run_python_on_gpu(
+        host="gpu-a",
+        gpu_index=0,
+        script_path="jobs/ok.py",
+        output_file=".gpu_mcp_logs/one.log",
+    ))
+    second = json.loads(server.run_python_on_gpu(
+        host="gpu-a",
+        gpu_index=0,
+        script_path="jobs/ok.py",
+        output_file=".gpu_mcp_logs/two.log",
+    ))
+
+    assert first["status"] == "launched"
+    assert second["status"] == "refused"
+    assert second["reservation_key"] == "gpu-a.gpu0"
+    assert "already exists" in second["reason"]
+
+    def fake_host_run(host, cmd, user=server.GPU_MCP_USER, timeout=15):
+        return "0, NVIDIA RTX 4090, 0, 1, 24576\n"
+
+    monkeypatch.setattr(server, "_host_run", fake_host_run)
+    checked = json.loads(server.check_gpus(samples=1, threshold=10))
+
+    assert checked["gpus"][0]["availability"] == "reserved"
+    assert checked["gpus"][0]["reservation"]["job_id"] == first["job_id"]
+
+
+def test_phase1_local_launch_failure_removes_prelaunch_reservation(
+    repo_fixture,
+    tmp_path,
+    monkeypatch,
+):
+    config = _write_config(repo_fixture)
+    script = repo_fixture / "jobs" / "ok.py"
+    script.write_text("print('ok')\n")
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    server = _import_server_with_config(monkeypatch, config)
+    monkeypatch.setattr(server, "_is_local_host", lambda host: True)
+
+    def fail_popen(*args, **kwargs):
+        raise OSError("local spawn failed before process exists")
+
+    monkeypatch.setattr(server.subprocess, "Popen", fail_popen)
+
+    result = json.loads(server.run_python_on_gpu(
+        host="gpu-a",
+        gpu_index=0,
+        script_path="jobs/ok.py",
+        output_file=".gpu_mcp_logs/fail.log",
+    ))
+
+    assert result["status"] == "refused"
+    assert "local spawn failed" in result["reason"]
+    assert not (registry / "gpu-a.gpu0").exists()
+
+
+def test_phase2_heartbeat_once_updates_owned_metadata(repo_fixture, tmp_path, monkeypatch):
+    config = _write_config(repo_fixture)
+    script = repo_fixture / "jobs" / "ok.py"
+    script.write_text("print('ok')\n")
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    server = _import_server_with_config(monkeypatch, config)
+    monkeypatch.setattr(server, "_is_local_host", lambda host: False)
+    monkeypatch.setattr(server, "_ssh_run", lambda host, cmd: "12345\n")
+    launched = json.loads(server.run_python_on_gpu(
+        host="gpu-a",
+        gpu_index=0,
+        script_path="jobs/ok.py",
+        output_file=".gpu_mcp_logs/job.log",
+    ))
+
+    assert launched["status"] == "launched"
+    assert server.HEARTBEAT_MANAGER.owned_keys() == ["gpu-a.gpu0"]
+    assert server.HEARTBEAT_MANAGER.heartbeat_once(
+        "gpu-a.gpu0",
+        now="2026-05-30T13:00:00Z",
+    )
+
+    metadata = json.loads((registry / "gpu-a.gpu0" / "metadata.json").read_text())
+    assert metadata["last_heartbeat_at"] == "2026-05-30T13:00:00Z"
+    assert metadata["heartbeat_interval_sec"] == 600
+
+
+def test_phase2_status_works_while_heartbeat_unhealthy_and_mutations_refuse(
+    repo_fixture,
+    tmp_path,
+    monkeypatch,
+):
+    config = _write_config(repo_fixture)
+    script = repo_fixture / "jobs" / "ok.py"
+    script.write_text("print('ok')\n")
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    server = _import_server_with_config(monkeypatch, config)
+    monkeypatch.setattr(server, "_is_local_host", lambda host: False)
+    monkeypatch.setattr(server, "_ssh_run", lambda host, cmd: "12345\n")
+    launched = json.loads(server.run_python_on_gpu(
+        host="gpu-a",
+        gpu_index=0,
+        script_path="jobs/ok.py",
+        output_file=".gpu_mcp_logs/job.log",
+    ))
+    monkeypatch.setattr(
+        server,
+        "_inspect_reservation_process",
+        lambda metadata: {"status": "alive", "reason": "still running", "remote_pid": 12345},
+    )
+    server.HEARTBEAT_MANAGER.mark_unhealthy_for_tests("disk full")
+
+    status = json.loads(server.manage_gpu_job(action="status", job_id=launched["job_id"]))
+    stop = json.loads(server.manage_gpu_job(action="stop", job_id=launched["job_id"]))
+    launch = json.loads(server.run_python_on_gpu(
+        host="gpu-a",
+        gpu_index=1,
+        script_path="jobs/ok.py",
+        output_file=".gpu_mcp_logs/job2.log",
+    ))
+
+    assert status["status"] == "ok"
+    assert status["heartbeat_manager_healthy"] is False
+    assert status["job_id"] == launched["job_id"]
+    assert status["allowed_actions"] == ["status"]
+    assert stop["status"] == "refused"
+    assert "heartbeat manager is unhealthy" in stop["reason"]
+    assert launch["status"] == "refused"
+    assert "heartbeat manager is unhealthy" in launch["reason"]
+
+
+def test_phase2_heartbeat_health_recovers_after_success(repo_fixture, tmp_path, monkeypatch):
+    config = _write_config(repo_fixture)
+    script = repo_fixture / "jobs" / "ok.py"
+    script.write_text("print('ok')\n")
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    server = _import_server_with_config(monkeypatch, config)
+    monkeypatch.setattr(server, "_is_local_host", lambda host: False)
+    monkeypatch.setattr(server, "_ssh_run", lambda host, cmd: "12345\n")
+    json.loads(server.run_python_on_gpu(
+        host="gpu-a",
+        gpu_index=0,
+        script_path="jobs/ok.py",
+        output_file=".gpu_mcp_logs/job.log",
+    ))
+
+    server.HEARTBEAT_MANAGER.force_write_failure_for_tests = True
+    assert not server.HEARTBEAT_MANAGER.heartbeat_once("gpu-a.gpu0")
+    assert not server.HEARTBEAT_MANAGER.is_healthy()
+    server.HEARTBEAT_MANAGER.force_write_failure_for_tests = False
+    assert server.HEARTBEAT_MANAGER.heartbeat_once("gpu-a.gpu0")
+    assert server.HEARTBEAT_MANAGER.is_healthy()
+
+
+def test_phase2_per_task_heartbeat_isolation(repo_fixture, tmp_path, monkeypatch):
+    config = _write_config(repo_fixture)
+    script = repo_fixture / "jobs" / "ok.py"
+    script.write_text("print('ok')\n")
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    server = _import_server_with_config(monkeypatch, config)
+    monkeypatch.setattr(server, "_is_local_host", lambda host: False)
+    pids = iter(["12345\n", "12346\n"])
+    monkeypatch.setattr(server, "_ssh_run", lambda host, cmd: next(pids))
+
+    first = json.loads(server.run_python_on_gpu(
+        host="gpu-a",
+        gpu_index=0,
+        script_path="jobs/ok.py",
+        output_file=".gpu_mcp_logs/job0.log",
+    ))
+    second = json.loads(server.run_python_on_gpu(
+        host="gpu-a",
+        gpu_index=1,
+        script_path="jobs/ok.py",
+        output_file=".gpu_mcp_logs/job1.log",
+    ))
+
+    assert first["status"] == "launched"
+    assert second["status"] == "launched"
+    assert server.HEARTBEAT_MANAGER.owned_keys() == ["gpu-a.gpu0", "gpu-a.gpu1"]
+    assert server.HEARTBEAT_MANAGER.heartbeat_once("gpu-a.gpu0", now="2026-05-30T13:00:00Z")
+    assert server.HEARTBEAT_MANAGER.heartbeat_once("gpu-a.gpu1", now="2026-05-30T13:05:00Z")
+    assert json.loads((registry / "gpu-a.gpu0" / "metadata.json").read_text())[
+        "last_heartbeat_at"
+    ] == "2026-05-30T13:00:00Z"
+    assert json.loads((registry / "gpu-a.gpu1" / "metadata.json").read_text())[
+        "last_heartbeat_at"
+    ] == "2026-05-30T13:05:00Z"
+
+
+def test_phase2_heartbeat_preserves_process_identity(repo_fixture, tmp_path, monkeypatch):
+    config = _write_config(repo_fixture)
+    script = repo_fixture / "jobs" / "ok.py"
+    script.write_text("print('ok')\n")
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    server = _import_server_with_config(monkeypatch, config)
+    monkeypatch.setattr(server, "_is_local_host", lambda host: False)
+    monkeypatch.setattr(server, "_ssh_run", lambda host, cmd: "12345\n")
+    launched = json.loads(server.run_python_on_gpu(
+        host="gpu-a",
+        gpu_index=0,
+        script_path="jobs/ok.py",
+        output_file=".gpu_mcp_logs/job.log",
+    ))
+
+    assert server.HEARTBEAT_MANAGER.heartbeat_once("gpu-a.gpu0", now="2026-05-30T13:00:00Z")
+    metadata = json.loads((registry / "gpu-a.gpu0" / "metadata.json").read_text())
+
+    assert metadata["remote_pid"] == 12345
+    assert metadata["process_fingerprint"] == launched["process"]["process_fingerprint"]
+    assert metadata["last_heartbeat_at"] == "2026-05-30T13:00:00Z"
+    assert (registry / ".locks" / "gpu-a.gpu0.lock").exists()
+
+
+def test_phase2_new_server_reports_but_does_not_adopt_old_reservation(
+    repo_fixture,
+    tmp_path,
+    monkeypatch,
+):
+    config = _write_config(repo_fixture)
+    script = repo_fixture / "jobs" / "ok.py"
+    script.write_text("print('ok')\n")
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    server_a = _import_server_with_config(monkeypatch, config)
+    monkeypatch.setattr(server_a, "_is_local_host", lambda host: False)
+    monkeypatch.setattr(server_a, "_ssh_run", lambda host, cmd: "12345\n")
+    launched = json.loads(server_a.run_python_on_gpu(
+        host="gpu-a",
+        gpu_index=0,
+        script_path="jobs/ok.py",
+        output_file=".gpu_mcp_logs/job.log",
+    ))
+    old_server_id = launched["server_instance_id"]
+
+    server_b = _import_server_with_config(monkeypatch, config)
+    listed = json.loads(server_b.list_gpu_reservations(scope="mine", fresh=False))
+    status = json.loads(server_b.manage_gpu_job(action="status", job_id=launched["job_id"]))
+
+    assert server_b.SERVER_INSTANCE_ID != old_server_id
+    assert server_b.HEARTBEAT_MANAGER.owned_keys() == []
+    assert not server_b.HEARTBEAT_MANAGER.heartbeat_once("gpu-a.gpu0")
+    assert listed["reservations"][0]["owned_by_current_server"] is False
+    assert status["status"] == "ok"
+    assert status["owned_by_current_server"] is False
+    assert status["allowed_actions"] == ["status"]
+
+
+def _seed_reservation(
+    registry: Path,
+    repo: Path,
+    *,
+    host="gpu-a",
+    gpu_index=0,
+    remote_pid=12345,
+    heartbeat="2020-01-01T00:00:00Z",
+    remote_start_time=None,
+    remote_boot_id=None,
+    process_fingerprint="gpu-mcp-process:seeded",
+):
+    key = f"{host}.gpu{gpu_index}"
+    reservation_dir = registry / key
+    reservation_dir.mkdir(parents=True)
+    metadata = {
+        "schema_version": 1,
+        "job_id": "job-20260530T123456Z-seeded",
+        "attempt_id": "attempt-20260530T123456Z-seeded",
+        "reservation_key": key,
+        "host": host,
+        "gpu_index": gpu_index,
+        "repo": str(repo.resolve()),
+        "script_name": "train.py",
+        "owner_user": "tingran",
+        "server_instance_id": "server-old-1234-seeded",
+        "remote_pid": remote_pid,
+        "remote_start_time": remote_start_time,
+        "remote_boot_id": remote_boot_id,
+        "process_fingerprint": process_fingerprint,
+        "reserved_at": heartbeat,
+        "last_heartbeat_at": heartbeat,
+        "heartbeat_interval_sec": 60,
+    }
+    (reservation_dir / "metadata.json").write_text(json.dumps(metadata))
+    return metadata
+
+
+def _fake_one_gpu(server):
+    def fake_host_run(host, cmd, user=server.GPU_MCP_USER, timeout=15):
+        return "0, NVIDIA RTX 4090, 0, 1, 24576\n"
+
+    return fake_host_run
+
+
+def test_phase3_stale_alive_process_remains_reserved(repo_fixture, tmp_path, monkeypatch):
+    config = _write_config(repo_fixture)
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    server = _import_server_with_config(monkeypatch, config)
+    _seed_reservation(registry, repo_fixture)
+    monkeypatch.setattr(server, "_host_run", _fake_one_gpu(server))
+    monkeypatch.setattr(
+        server,
+        "_inspect_reservation_process",
+        lambda metadata: {"status": "alive", "reason": "still running", "remote_pid": 12345},
+    )
+
+    result = json.loads(server.check_gpus(samples=1, threshold=10))
+
+    assert result["gpus"][0]["availability"] == "reserved"
+    assert result["gpus"][0]["reservation_state"] == "STALE_RESERVED"
+    assert (registry / "gpu-a.gpu0").exists()
+
+
+def test_phase3_stale_gone_process_is_quarantined_and_gpu_available(
+    repo_fixture,
+    tmp_path,
+    monkeypatch,
+):
+    config = _write_config(repo_fixture)
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    server = _import_server_with_config(monkeypatch, config)
+    _seed_reservation(registry, repo_fixture)
+    monkeypatch.setattr(server, "_host_run", _fake_one_gpu(server))
+    monkeypatch.setattr(
+        server,
+        "_inspect_reservation_process",
+        lambda metadata: {"status": "gone", "reason": "process exited", "remote_pid": 12345},
+    )
+
+    result = json.loads(server.check_gpus(samples=1, threshold=10))
+
+    assert result["gpus"][0]["availability"] == "available"
+    assert not (registry / "gpu-a.gpu0").exists()
+    assert list((registry / ".quarantine").glob("gpu-a.gpu0.*"))
+
+
+def test_phase3_stale_unknown_inspection_stays_unavailable(repo_fixture, tmp_path, monkeypatch):
+    config = _write_config(repo_fixture)
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    server = _import_server_with_config(monkeypatch, config)
+    _seed_reservation(registry, repo_fixture)
+    monkeypatch.setattr(server, "_host_run", _fake_one_gpu(server))
+    monkeypatch.setattr(
+        server,
+        "_inspect_reservation_process",
+        lambda metadata: {"status": "unknown", "reason": "host unreachable", "remote_pid": 12345},
+    )
+
+    result = json.loads(server.check_gpus(samples=1, threshold=10))
+
+    assert result["gpus"][0]["availability"] == "reserved"
+    assert result["gpus"][0]["reservation_state"] == "UNKNOWN_RESERVED"
+    assert (registry / "gpu-a.gpu0").exists()
+
+
+def test_phase3_stale_null_remote_pid_fails_closed(repo_fixture, tmp_path, monkeypatch):
+    config = _write_config(repo_fixture)
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    server = _import_server_with_config(monkeypatch, config)
+    _seed_reservation(registry, repo_fixture, remote_pid=None)
+    monkeypatch.setattr(server, "_host_run", _fake_one_gpu(server))
+
+    result = json.loads(server.check_gpus(samples=1, threshold=10))
+
+    assert result["gpus"][0]["availability"] == "reserved"
+    assert result["gpus"][0]["reservation_state"] == "UNKNOWN_RESERVED"
+    assert (registry / "gpu-a.gpu0").exists()
+
+
+def test_phase3_launch_cleans_stale_gone_then_reacquires(repo_fixture, tmp_path, monkeypatch):
+    config = _write_config(repo_fixture)
+    script = repo_fixture / "jobs" / "ok.py"
+    script.write_text("print('ok')\n")
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    server = _import_server_with_config(monkeypatch, config)
+    _seed_reservation(registry, repo_fixture)
+    monkeypatch.setattr(server, "_is_local_host", lambda host: False)
+    monkeypatch.setattr(server, "_ssh_run", lambda host, cmd: "54321\n")
+    monkeypatch.setattr(
+        server,
+        "_inspect_reservation_process",
+        lambda metadata: {"status": "gone", "reason": "process exited", "remote_pid": 12345},
+    )
+
+    result = json.loads(server.run_python_on_gpu(
+        host="gpu-a",
+        gpu_index=0,
+        script_path="jobs/ok.py",
+        output_file=".gpu_mcp_logs/job.log",
+    ))
+    metadata = json.loads((registry / "gpu-a.gpu0" / "metadata.json").read_text())
+
+    assert result["status"] == "launched"
+    assert result["process"]["remote_pid"] == 54321
+    assert metadata["job_id"] == result["job_id"]
+    assert list((registry / ".quarantine").glob("gpu-a.gpu0.*"))
+
+
+def test_phase3_process_inspection_treats_start_boot_and_fingerprint_mismatch_as_gone(
+    repo_fixture,
+    tmp_path,
+    monkeypatch,
+):
+    config = _write_config(repo_fixture)
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(tmp_path / "reservations"))
+    server = _import_server_with_config(monkeypatch, config)
+    metadata = _seed_reservation(
+        tmp_path / "reservations",
+        repo_fixture,
+        remote_start_time="Thu May 30 12:00:00 2026",
+        remote_boot_id="boot-a",
+        process_fingerprint="gpu-mcp-process:expected",
+    )
+
+    def start_mismatch(host, cmd, user=server.GPU_MCP_USER, timeout=15):
+        if cmd.startswith("ps -p 12345"):
+            return "12345 tingran S Thu May 30 12:01:00 2026"
+        raise AssertionError(cmd)
+
+    monkeypatch.setattr(server, "_host_run", start_mismatch)
+    assert server._inspect_reservation_process(metadata)["reason"] == "process start time mismatch"
+
+    def boot_mismatch(host, cmd, user=server.GPU_MCP_USER, timeout=15):
+        if cmd.startswith("ps -p 12345"):
+            return "12345 tingran S Thu May 30 12:00:00 2026"
+        if cmd == "cat /proc/sys/kernel/random/boot_id":
+            return "boot-b"
+        raise AssertionError(cmd)
+
+    monkeypatch.setattr(server, "_host_run", boot_mismatch)
+    assert server._inspect_reservation_process(metadata)["reason"] == "host boot id mismatch"
+
+    metadata_no_boot = dict(metadata)
+    metadata_no_boot["remote_boot_id"] = None
+
+    def fingerprint_mismatch(host, cmd, user=server.GPU_MCP_USER, timeout=15):
+        if cmd.startswith("ps -p 12345"):
+            return "12345 tingran S Thu May 30 12:00:00 2026"
+        if "GPU_MCP_PROCESS_FINGERPRINT" in cmd:
+            return "gpu-mcp-process:other"
+        raise AssertionError(cmd)
+
+    monkeypatch.setattr(server, "_host_run", fingerprint_mismatch)
+    assert (
+        server._inspect_reservation_process(metadata_no_boot)["reason"]
+        == "process fingerprint mismatch"
+    )
+
+
+def test_phase3_process_inspection_positive_identity_path(repo_fixture, tmp_path, monkeypatch):
+    config = _write_config(repo_fixture)
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(tmp_path / "reservations"))
+    server = _import_server_with_config(monkeypatch, config)
+    metadata = _seed_reservation(
+        tmp_path / "reservations",
+        repo_fixture,
+        remote_start_time="Thu May 30 12:00:00 2026",
+        remote_boot_id="boot-a",
+        process_fingerprint="gpu-mcp-process:expected",
+    )
+
+    def fake_host_run(host, cmd, user=server.GPU_MCP_USER, timeout=15):
+        if cmd.startswith("ps -p 12345"):
+            return "12345 tingran S Thu May 30 12:00:00 2026"
+        if cmd == "cat /proc/sys/kernel/random/boot_id":
+            return "boot-a"
+        if "GPU_MCP_PROCESS_FINGERPRINT" in cmd:
+            return "gpu-mcp-process:expected"
+        if "query-compute-apps" in cmd:
+            return "12345, GPU-deadbeef, 42"
+        if "query-gpu=index,uuid" in cmd:
+            return "0, GPU-deadbeef"
+        raise AssertionError(cmd)
+
+    monkeypatch.setattr(server, "_host_run", fake_host_run)
+    inspection = server._inspect_reservation_process(metadata)
+
+    assert inspection["status"] == "alive"
+    assert inspection["gpu_index"] == "0"
+
+
+def test_phase3_matching_live_process_off_gpu_remains_reserved(
+    repo_fixture,
+    tmp_path,
+    monkeypatch,
+):
+    config = _write_config(repo_fixture)
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    server = _import_server_with_config(monkeypatch, config)
+    _seed_reservation(
+        registry,
+        repo_fixture,
+        remote_start_time="Thu May 30 12:00:00 2026",
+        remote_boot_id="boot-a",
+        process_fingerprint="gpu-mcp-process:expected",
+    )
+
+    def fake_host_run(host, cmd, user=server.GPU_MCP_USER, timeout=15):
+        if "query-gpu=index,name" in cmd:
+            return "0, NVIDIA RTX 4090, 0, 1, 24576\n"
+        if cmd.startswith("ps -p 12345"):
+            return "12345 tingran S Thu May 30 12:00:00 2026"
+        if cmd == "cat /proc/sys/kernel/random/boot_id":
+            return "boot-a"
+        if "GPU_MCP_PROCESS_FINGERPRINT" in cmd:
+            return "gpu-mcp-process:expected"
+        if "query-compute-apps" in cmd:
+            return ""
+        if "query-gpu=index,uuid" in cmd:
+            return "0, GPU-deadbeef"
+        raise AssertionError(cmd)
+
+    monkeypatch.setattr(server, "_host_run", fake_host_run)
+
+    result = json.loads(server.check_gpus(samples=1, threshold=10))
+
+    row = result["gpus"][0]
+    assert row["availability"] == "reserved"
+    assert row["reservation_state"] == "STALE_RESERVED"
+    assert row["reservation"]["last_inspection"]["status"] == "alive"
+    assert row["reservation"]["last_inspection"]["gpu_index"] is None
+    assert (registry / "gpu-a.gpu0").exists()
+
+
+def test_phase3_zombie_process_is_gone_for_cleanup(
+    repo_fixture,
+    tmp_path,
+    monkeypatch,
+):
+    config = _write_config(repo_fixture)
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    server = _import_server_with_config(monkeypatch, config)
+    _seed_reservation(
+        registry,
+        repo_fixture,
+        remote_start_time="Thu May 30 12:00:00 2026",
+        process_fingerprint="gpu-mcp-process:expected",
+    )
+
+    def fake_host_run(host, cmd, user=server.GPU_MCP_USER, timeout=15):
+        if "query-gpu=index,name" in cmd:
+            return "0, NVIDIA RTX 4090, 0, 1, 24576\n"
+        if cmd.startswith("ps -p 12345"):
+            return "12345 tingran Z Thu May 30 12:00:00 2026"
+        raise AssertionError(cmd)
+
+    monkeypatch.setattr(server, "_host_run", fake_host_run)
+
+    result = json.loads(server.check_gpus(samples=1, threshold=10))
+
+    assert result["gpus"][0]["availability"] == "available"
+    assert not (registry / "gpu-a.gpu0").exists()
+    assert list((registry / ".quarantine").glob("gpu-a.gpu0.*"))
+
+
+def test_phase3_metadata_mismatch_fails_closed(repo_fixture, tmp_path, monkeypatch):
+    config = _write_config(repo_fixture)
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    server = _import_server_with_config(monkeypatch, config)
+    metadata = _seed_reservation(registry, repo_fixture, host="gpu-b")
+    mismatched_dir = registry / "gpu-a.gpu0"
+    (registry / "gpu-b.gpu0").rename(mismatched_dir)
+    metadata["reservation_key"] = "gpu-b.gpu0"
+    (mismatched_dir / "metadata.json").write_text(json.dumps(metadata))
+    monkeypatch.setattr(server, "_host_run", _fake_one_gpu(server))
+
+    result = json.loads(server.check_gpus(samples=1, threshold=10))
+
+    assert result["gpus"][0]["availability"] == "reserved"
+    assert result["gpus"][0]["reservation_state"] == "UNKNOWN_RESERVED"
+    assert (registry / "gpu-a.gpu0").exists()
+
+
+def test_phase3_stale_inspection_budget_skips_fail_closed(repo_fixture, tmp_path, monkeypatch):
+    config = _write_config(repo_fixture)
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    server = _import_server_with_config(monkeypatch, config)
+    for index in range(6):
+        _seed_reservation(registry, repo_fixture, gpu_index=index, remote_pid=12000 + index)
+    calls = []
+
+    def fake_inspect(metadata):
+        calls.append(metadata["reservation_key"])
+        return {"status": "alive", "reason": "still running", "remote_pid": metadata["remote_pid"]}
+
+    monkeypatch.setattr(server, "_inspect_reservation_process", fake_inspect)
+    rows = server._refresh_stale_reservations(server._load_reservation_rows(scope="all")[2])
+
+    assert len(calls) == 2
+    skipped = [row for row in rows.values() if row.get("last_inspection", {}).get("status") == "skipped"]
+    assert len(skipped) == 4
+    assert all(row["reservation_state"] == "UNKNOWN_RESERVED" for row in skipped)
+
+
+def test_phase3_cleanup_re_read_aborts_on_heartbeat_refresh(repo_fixture, tmp_path, monkeypatch):
+    config = _write_config(repo_fixture)
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    server = _import_server_with_config(monkeypatch, config)
+    stale_metadata = _seed_reservation(registry, repo_fixture)
+    fresh_metadata = dict(stale_metadata)
+    fresh_metadata["last_heartbeat_at"] = server.reservations.iso_timestamp()
+    (registry / "gpu-a.gpu0" / "metadata.json").write_text(json.dumps(fresh_metadata))
+    monkeypatch.setattr(
+        server,
+        "_inspect_reservation_process",
+        lambda metadata: {"status": "gone", "reason": "process exited", "remote_pid": 12345},
+    )
+
+    cleaned, inspection = server._cleanup_stale_gone_reservation("gpu-a.gpu0", stale_metadata)
+
+    assert cleaned is False
+    assert "heartbeat refreshed" in inspection["reason"]
+    assert (registry / "gpu-a.gpu0").exists()
+
+
+def test_phase3_cleanup_re_read_aborts_on_metadata_change(repo_fixture, tmp_path, monkeypatch):
+    config = _write_config(repo_fixture)
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    server = _import_server_with_config(monkeypatch, config)
+    stale_metadata = _seed_reservation(registry, repo_fixture)
+    changed_metadata = dict(stale_metadata)
+    changed_metadata["remote_pid"] = 99999
+    (registry / "gpu-a.gpu0" / "metadata.json").write_text(json.dumps(changed_metadata))
+    monkeypatch.setattr(
+        server,
+        "_inspect_reservation_process",
+        lambda metadata: {"status": "gone", "reason": "process exited", "remote_pid": 12345},
+    )
+
+    cleaned, inspection = server._cleanup_stale_gone_reservation("gpu-a.gpu0", stale_metadata)
+
+    assert cleaned is False
+    assert "metadata changed" in inspection["reason"]
+    assert (registry / "gpu-a.gpu0").exists()
+
+
+def test_phase3_cleanup_guard_excludes_cross_process_heartbeat_refresh(
+    repo_fixture,
+    tmp_path,
+):
+    config = _write_config(repo_fixture)
+    registry = tmp_path / "reservations"
+    metadata = _seed_reservation(registry, repo_fixture)
+    metadata_path = registry / "gpu-a.gpu0" / "metadata.json"
+    ready_path = tmp_path / "heartbeat-ready"
+    release_path = tmp_path / "release-heartbeat"
+    cleanup_entered_path = tmp_path / "cleanup-entered"
+    env = _server_subprocess_env(registry)
+
+    heartbeat_code = textwrap.dedent(
+        f"""
+        import json
+        import time
+        from pathlib import Path
+
+        import gpu_mcp_reservations as reservations
+
+        registry = Path({str(registry)!r})
+        metadata_path = Path({str(metadata_path)!r})
+        ready_path = Path({str(ready_path)!r})
+        release_path = Path({str(release_path)!r})
+
+        with reservations.cleanup_finalization_guard(registry, "gpu-a.gpu0"):
+            ready_path.write_text("locked")
+            while not release_path.exists():
+                time.sleep(0.01)
+            metadata = json.loads(metadata_path.read_text())
+            metadata["last_heartbeat_at"] = reservations.iso_timestamp()
+            reservations.atomic_write_json(metadata_path, metadata)
+        """
+    )
+    cleanup_code = textwrap.dedent(
+        f"""
+        import json
+        import sys
+        from pathlib import Path
+
+        sys.argv = [{str(SERVER)!r}, "--config", {str(config)!r}]
+        import gpu_mcp_server as server
+
+        server._inspect_reservation_process = lambda metadata: {{
+            "status": "gone",
+            "reason": "process exited",
+            "remote_pid": metadata.get("remote_pid"),
+        }}
+        metadata = json.loads(Path({str(metadata_path)!r}).read_text())
+        Path({str(cleanup_entered_path)!r}).write_text("entered")
+        cleaned, inspection = server._cleanup_stale_gone_reservation("gpu-a.gpu0", metadata)
+        print(json.dumps({{"cleaned": cleaned, "inspection": inspection}}, sort_keys=True))
+        """
+    )
+
+    heartbeat_proc = subprocess.Popen(
+        [sys.executable, "-c", heartbeat_code],
+        cwd=REPO_ROOT,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    _wait_for_path(ready_path)
+    cleanup_proc = subprocess.Popen(
+        [sys.executable, "-c", cleanup_code],
+        cwd=REPO_ROOT,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    _wait_for_path(cleanup_entered_path)
+    time.sleep(0.2)
+    completed_while_guard_held = cleanup_proc.poll() is not None
+    release_path.write_text("go")
+    heartbeat_stdout, heartbeat_stderr = heartbeat_proc.communicate(timeout=10)
+    cleanup_stdout, cleanup_stderr = cleanup_proc.communicate(timeout=10)
+
+    assert heartbeat_proc.returncode == 0, heartbeat_stderr or heartbeat_stdout
+    assert cleanup_proc.returncode == 0, cleanup_stderr or cleanup_stdout
+    assert completed_while_guard_held is False
+    payload = json.loads(cleanup_stdout)
+    assert payload["cleaned"] is False
+    assert "heartbeat refreshed" in payload["inspection"]["reason"]
+    assert (registry / "gpu-a.gpu0").exists()
+    refreshed = json.loads(metadata_path.read_text())
+    assert refreshed["last_heartbeat_at"] != metadata["last_heartbeat_at"]
+
+
+def test_phase3_two_cleaners_racing_one_quarantines_one_aborts(
+    repo_fixture,
+    tmp_path,
+):
+    config = _write_config(repo_fixture)
+    registry = tmp_path / "reservations"
+    _seed_reservation(registry, repo_fixture)
+    metadata_path = registry / "gpu-a.gpu0" / "metadata.json"
+    ready_dir = tmp_path / "cleaner-ready"
+    ready_dir.mkdir()
+    start_path = tmp_path / "start-cleaners"
+    env = _server_subprocess_env(registry)
+
+    cleaner_code = textwrap.dedent(
+        f"""
+        import json
+        import os
+        import sys
+        import time
+        from pathlib import Path
+
+        sys.argv = [{str(SERVER)!r}, "--config", {str(config)!r}]
+        import gpu_mcp_server as server
+
+        metadata = json.loads(Path({str(metadata_path)!r}).read_text())
+        worker = os.environ["GPU_MCP_CLEANER_WORKER"]
+        (Path({str(ready_dir)!r}) / worker).write_text("ready")
+        start_path = Path({str(start_path)!r})
+        while not start_path.exists():
+            time.sleep(0.01)
+        server._inspect_reservation_process = lambda metadata: {{
+            "status": "gone",
+            "reason": "process exited",
+            "remote_pid": metadata.get("remote_pid"),
+        }}
+        cleaned, inspection = server._cleanup_stale_gone_reservation("gpu-a.gpu0", metadata)
+        print(json.dumps({{"worker": worker, "cleaned": cleaned, "inspection": inspection}}, sort_keys=True))
+        """
+    )
+    procs = []
+    for index in range(2):
+        child_env = env.copy()
+        child_env["GPU_MCP_CLEANER_WORKER"] = str(index)
+        procs.append(
+            subprocess.Popen(
+                [sys.executable, "-c", cleaner_code],
+                cwd=REPO_ROOT,
+                env=child_env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        )
+    for index in range(2):
+        _wait_for_path(ready_dir / str(index))
+    start_path.write_text("go")
+    outputs = [proc.communicate(timeout=10) for proc in procs]
+
+    payloads = []
+    for proc, (stdout, stderr) in zip(procs, outputs):
+        assert proc.returncode == 0, stderr or stdout
+        payloads.append(json.loads(stdout))
+    assert [payload["cleaned"] for payload in payloads].count(True) == 1
+    assert [payload["cleaned"] for payload in payloads].count(False) == 1
+    losing = next(payload for payload in payloads if not payload["cleaned"])
+    assert losing["inspection"]["reason"] in {
+        "reservation disappeared during cleanup",
+        "reservation already gone",
+    }
+    assert not (registry / "gpu-a.gpu0").exists()
+    assert len(list((registry / ".quarantine").glob("gpu-a.gpu0.*"))) == 1
+
+
+def test_phase4_status_maps_terminal_outcome(repo_fixture, tmp_path, monkeypatch):
+    config = _write_config(repo_fixture)
+    script = repo_fixture / "jobs" / "ok.py"
+    script.write_text("print('ok')\n")
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    server = _import_server_with_config(monkeypatch, config)
+    monkeypatch.setattr(server, "_is_local_host", lambda host: False)
+    monkeypatch.setattr(server, "_ssh_run", lambda host, cmd: "12345\n")
+    launched = json.loads(server.run_python_on_gpu(
+        host="gpu-a",
+        gpu_index=0,
+        script_path="jobs/ok.py",
+        output_file=".gpu_mcp_logs/job.log",
+    ))
+    monkeypatch.setattr(
+        server,
+        "_inspect_reservation_process",
+        lambda metadata: {"status": "gone", "reason": "process exited", "remote_pid": 12345},
+    )
+    outcome_path = server.reservations.outcome_record_path(
+        repo_fixture,
+        launched["job_id"],
+        launched["attempt_id"],
+    )
+    server.reservations.atomic_write_json(outcome_path, server.reservations.build_outcome_record(
+        job_id=launched["job_id"],
+        attempt_id=launched["attempt_id"],
+        reservation_key_value="gpu-a.gpu0",
+        host="gpu-a",
+        gpu_index=0,
+        terminal_status="success",
+        remote_pid=12345,
+        exit_code=0,
+        ended_at="2026-05-30T13:00:00Z",
+    ))
+
+    status = json.loads(server.manage_gpu_job(action="status", job_id=launched["job_id"]))
+
+    assert status["job_lifecycle"] == "succeeded"
+    assert status["outcome"]["terminal_status"] == "success"
+    assert status["next_poll_after"] is None
+
+
+def test_phase4_managed_local_launch_writes_outcome_record(repo_fixture, tmp_path, monkeypatch):
+    config = _write_config(repo_fixture)
+    script = repo_fixture / "jobs" / "quick.py"
+    script.write_text("print('quick done')\n")
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    server = _import_server_with_config(monkeypatch, config)
+    monkeypatch.setattr(server, "_is_local_host", lambda host: True)
+
+    launched = json.loads(server.run_python_on_gpu(
+        host="gpu-a",
+        gpu_index=0,
+        script_path="jobs/quick.py",
+        output_file=".gpu_mcp_logs/quick.log",
+    ))
+    outcome_path = server.reservations.outcome_record_path(
+        repo_fixture,
+        launched["job_id"],
+        launched["attempt_id"],
+    )
+    for _ in range(30):
+        if outcome_path.exists():
+            break
+        time.sleep(0.1)
+
+    outcome = json.loads(outcome_path.read_text())
+    assert outcome["terminal_status"] == "success"
+    assert outcome["exit_code"] == 0
+    assert outcome["reservation_key"] == "gpu-a.gpu0"
+
+
+def test_phase4_missing_outcome_reports_unknown(repo_fixture, tmp_path, monkeypatch):
+    config = _write_config(repo_fixture)
+    script = repo_fixture / "jobs" / "ok.py"
+    script.write_text("print('ok')\n")
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    server = _import_server_with_config(monkeypatch, config)
+    monkeypatch.setattr(server, "_is_local_host", lambda host: False)
+    monkeypatch.setattr(server, "_ssh_run", lambda host, cmd: "12345\n")
+    launched = json.loads(server.run_python_on_gpu(
+        host="gpu-a",
+        gpu_index=0,
+        script_path="jobs/ok.py",
+        output_file=".gpu_mcp_logs/job.log",
+    ))
+    monkeypatch.setattr(
+        server,
+        "_inspect_reservation_process",
+        lambda metadata: {"status": "gone", "reason": "process exited", "remote_pid": 12345},
+    )
+
+    status = json.loads(server.manage_gpu_job(action="status", job_id=launched["job_id"]))
+
+    assert status["job_lifecycle"] == "process_gone_unknown_outcome"
+    assert status["outcome"] is None
+
+
+def test_phase4_corrupt_outcome_reports_unknown(
+    repo_fixture,
+    tmp_path,
+    monkeypatch,
+):
+    config = _write_config(repo_fixture)
+    script = repo_fixture / "jobs" / "ok.py"
+    script.write_text("print('ok')\n")
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    server = _import_server_with_config(monkeypatch, config)
+    monkeypatch.setattr(server, "_is_local_host", lambda host: False)
+    monkeypatch.setattr(server, "_ssh_run", lambda host, cmd: "12345\n")
+    launched = json.loads(server.run_python_on_gpu(
+        host="gpu-a",
+        gpu_index=0,
+        script_path="jobs/ok.py",
+        output_file=".gpu_mcp_logs/job.log",
+    ))
+    monkeypatch.setattr(
+        server,
+        "_inspect_reservation_process",
+        lambda metadata: {"status": "gone", "reason": "process exited", "remote_pid": 12345},
+    )
+    outcome_path = server.reservations.outcome_record_path(
+        repo_fixture,
+        launched["job_id"],
+        launched["attempt_id"],
+    )
+    outcome_path.parent.mkdir(parents=True, exist_ok=True)
+    outcome_path.write_text("{not valid json")
+
+    status = json.loads(server.manage_gpu_job(action="status", job_id=launched["job_id"]))
+
+    assert status["job_lifecycle"] == "process_gone_unknown_outcome"
+    assert status["outcome"] is None
+
+
+def test_phase4_recovers_single_current_repo_reservation_without_job_id(
+    repo_fixture,
+    tmp_path,
+    monkeypatch,
+):
+    config = _write_config(repo_fixture)
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    server = _import_server_with_config(monkeypatch, config)
+    _seed_reservation(registry, repo_fixture, heartbeat=server.reservations.iso_timestamp())
+    monkeypatch.setattr(
+        server,
+        "_inspect_reservation_process",
+        lambda metadata: {"status": "alive", "reason": "still running", "remote_pid": 12345},
+    )
+
+    status = json.loads(server.manage_gpu_job(action="status"))
+
+    assert status["status"] == "ok"
+    assert status["job_id"] == "job-20260530T123456Z-seeded"
+    assert status["reservation_key"] == "gpu-a.gpu0"
+    assert status["owned_by_current_server"] is False
+
+
+def test_phase4_ambiguous_recovery_returns_candidates(repo_fixture, tmp_path, monkeypatch):
+    config = _write_config(repo_fixture)
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    server = _import_server_with_config(monkeypatch, config)
+    _seed_reservation(registry, repo_fixture, gpu_index=0, heartbeat=server.reservations.iso_timestamp())
+    _seed_reservation(registry, repo_fixture, gpu_index=1, remote_pid=12346, heartbeat=server.reservations.iso_timestamp())
+    monkeypatch.setattr(
+        server,
+        "_inspect_reservation_process",
+        lambda metadata: {"status": "alive", "reason": "still running", "remote_pid": metadata["remote_pid"]},
+    )
+
+    status = json.loads(server.manage_gpu_job(action="status"))
+
+    assert status["status"] == "ambiguous_target"
+    assert len(status["candidates"]) == 2
+    assert {row["reservation_key"] for row in status["candidates"]} == {"gpu-a.gpu0", "gpu-a.gpu1"}
+
+
+def test_phase4_reservation_key_resolution_ignores_historical_local_job(
+    repo_fixture,
+    tmp_path,
+    monkeypatch,
+):
+    config = _write_config(repo_fixture)
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    server = _import_server_with_config(monkeypatch, config)
+    stale_job = server.reservations.build_job_record(
+        job_id="job-20260530T123456Z-oldjob",
+        attempt_id="attempt-20260530T123456Z-oldattempt",
+        reservation_key_value="gpu-a.gpu0",
+        host="gpu-a",
+        gpu_index=0,
+        script_path=repo_fixture / "jobs" / "old.py",
+        args=[],
+        output_file=repo_fixture / ".gpu_mcp_logs" / "old.log",
+        server_instance_id="server-old-1111-local",
+        next_poll_after="2026-05-30T13:00:00Z",
+    )
+    server.reservations.atomic_write_json(
+        server.reservations.job_record_path(repo_fixture, "job-20260530T123456Z-oldjob"),
+        stale_job,
+    )
+    _seed_reservation(registry, repo_fixture, heartbeat=server.reservations.iso_timestamp())
+    monkeypatch.setattr(
+        server,
+        "_inspect_reservation_process",
+        lambda metadata: {"status": "alive", "reason": "still running", "remote_pid": 12345},
+    )
+
+    status = json.loads(server.manage_gpu_job(action="status", reservation_key="gpu-a.gpu0"))
+
+    assert status["job_id"] == "job-20260530T123456Z-seeded"
+    assert status["output"]["path"] is None
+    assert not (
+        repo_fixture
+        / ".gpu_mcp_state"
+        / "jobs"
+        / "job-20260530T123456Z-seeded"
+        / "job.json"
+    ).exists()
+
+
+def test_phase4_explicit_historical_job_id_does_not_bind_current_reservation(
+    repo_fixture,
+    tmp_path,
+    monkeypatch,
+):
+    config = _write_config(repo_fixture)
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    server = _import_server_with_config(monkeypatch, config)
+    old_job_id = "job-20260530T123456Z-oldjob"
+    old_record = server.reservations.build_job_record(
+        job_id=old_job_id,
+        attempt_id="attempt-20260530T123456Z-oldattempt",
+        reservation_key_value="gpu-a.gpu0",
+        host="gpu-a",
+        gpu_index=0,
+        script_path=repo_fixture / "jobs" / "old.py",
+        args=[],
+        output_file=repo_fixture / ".gpu_mcp_logs" / "old.log",
+        server_instance_id="server-old-1111-local",
+        next_poll_after="2026-05-30T13:00:00Z",
+    )
+    server.reservations.atomic_write_json(
+        server.reservations.job_record_path(repo_fixture, old_job_id),
+        old_record,
+    )
+    _seed_reservation(registry, repo_fixture, heartbeat=server.reservations.iso_timestamp())
+    monkeypatch.setattr(
+        server,
+        "_inspect_reservation_process",
+        lambda metadata: (_ for _ in ()).throw(AssertionError("must not inspect current reservation")),
+    )
+
+    status = json.loads(server.manage_gpu_job(action="status", job_id=old_job_id))
+    reread = json.loads(
+        (repo_fixture / ".gpu_mcp_state" / "jobs" / old_job_id / "job.json").read_text()
+    )
+
+    assert status["status"] == "ok"
+    assert status["job_id"] == old_job_id
+    assert status["active_reservation"] is False
+    assert status["reservation_identity_mismatch"] is True
+    assert status["reservation_state"] is None
+    assert status["job_lifecycle"] == "process_gone_unknown_outcome"
+    assert status["next_poll_after"] == "2026-05-30T13:00:00Z"
+    assert reread["last_status_checked_at"] is None
+
+
+def test_phase5_owner_mutation_refused_for_non_owned_reservation(
+    repo_fixture,
+    tmp_path,
+    monkeypatch,
+):
+    config = _write_config(repo_fixture)
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    server = _import_server_with_config(monkeypatch, config)
+    _seed_reservation(registry, repo_fixture, heartbeat=server.reservations.iso_timestamp())
+
+    result = json.loads(server.manage_gpu_job(action="stop", reservation_key="gpu-a.gpu0"))
+
+    assert result["status"] == "refused"
+    assert "owns this reservation" in result["reason"]
+    assert (registry / "gpu-a.gpu0").exists()
+
+
+def test_phase5_retry_refuses_while_matching_process_alive(
+    repo_fixture,
+    tmp_path,
+    monkeypatch,
+):
+    config = _write_config(repo_fixture)
+    script = repo_fixture / "jobs" / "hold.py"
+    script.write_text("print('holding')\n")
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    server = _import_server_with_config(monkeypatch, config)
+    monkeypatch.setattr(server, "_is_local_host", lambda host: False)
+    monkeypatch.setattr(server, "_ssh_run", lambda host, cmd: "12345\n")
+    launched = json.loads(server.run_python_on_gpu(
+        host="gpu-a",
+        gpu_index=0,
+        script_path="jobs/hold.py",
+        output_file=".gpu_mcp_logs/hold.log",
+    ))
+    monkeypatch.setattr(
+        server,
+        "_inspect_reservation_process",
+        lambda metadata: {"status": "alive", "reason": "still running", "remote_pid": 12345},
+    )
+
+    retry = json.loads(server.manage_gpu_job(action="retry", job_id=launched["job_id"]))
+
+    assert retry["status"] == "refused"
+    assert "second process" in retry["reason"]
+    assert retry["owned_by_current_server"] is True
+    assert retry["allowed_actions"] == ["status", "stop", "retry", "finish"]
+    metadata = json.loads((registry / "gpu-a.gpu0" / "metadata.json").read_text())
+    assert metadata["attempt_id"] == launched["attempt_id"]
+    assert metadata["remote_pid"] == 12345
+
+
+def test_phase5_stop_signals_but_keeps_reservation(
+    repo_fixture,
+    tmp_path,
+    monkeypatch,
+):
+    config = _write_config(repo_fixture)
+    script = repo_fixture / "jobs" / "term_delay.py"
+    script.write_text("print('term delay')\n")
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    server = _import_server_with_config(monkeypatch, config)
+    monkeypatch.setattr(server, "_is_local_host", lambda host: False)
+    monkeypatch.setattr(server, "_ssh_run", lambda host, cmd: "12345\n")
+    launched = json.loads(server.run_python_on_gpu(
+        host="gpu-a",
+        gpu_index=0,
+        script_path="jobs/term_delay.py",
+        output_file=".gpu_mcp_logs/term_delay.log",
+    ))
+    monkeypatch.setattr(
+        server,
+        "_inspect_reservation_process",
+        lambda metadata: {"status": "alive", "reason": "still running", "remote_pid": 12345},
+    )
+    signals = []
+
+    def fake_host_run(host, cmd, user=server.GPU_MCP_USER, timeout=15):
+        signals.append(cmd)
+        return ""
+
+    monkeypatch.setattr(server, "_host_run", fake_host_run)
+
+    stopped = json.loads(server.manage_gpu_job(action="stop", job_id=launched["job_id"]))
+
+    assert stopped["status"] == "stop_requested"
+    assert stopped["job_lifecycle"] == "stopping"
+    assert signals == ["kill -15 12345"]
+    assert (registry / "gpu-a.gpu0" / "metadata.json").exists()
+    assert server.HEARTBEAT_MANAGER.owned_keys() == ["gpu-a.gpu0"]
+
+
+def test_phase5_local_stop_uses_start_time_when_fingerprint_env_unreadable(
+    repo_fixture,
+    tmp_path,
+    monkeypatch,
+):
+    config = _write_config(repo_fixture)
+    script = repo_fixture / "jobs" / "sleep.py"
+    script.write_text("import time\ntime.sleep(30)\n")
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    server = _import_server_with_config(monkeypatch, config)
+    monkeypatch.setattr(server, "_is_local_host", lambda host: True)
+
+    launched = json.loads(server.run_python_on_gpu(
+        host="gpu-a",
+        gpu_index=0,
+        script_path="jobs/sleep.py",
+        output_file=".gpu_mcp_logs/sleep.log",
+    ))
+    metadata = json.loads((registry / "gpu-a.gpu0" / "metadata.json").read_text())
+    assert metadata["remote_start_time"]
+
+    def fake_host_run(host, cmd, user=server.GPU_MCP_USER, timeout=15):
+        if "/proc/" in cmd and "environ" in cmd:
+            return None
+        if cmd.startswith("ps -p") and "-o pid=" in cmd:
+            return f"{metadata['remote_pid']} {server.GPU_MCP_USER} S {metadata['remote_start_time']}"
+        return ""
+
+    monkeypatch.setattr(server, "_host_run", fake_host_run)
+
+    stopped = json.loads(server.manage_gpu_job(action="stop", job_id=launched["job_id"]))
+
+    assert stopped["status"] == "stop_requested"
+    assert "fingerprint env unreadable but start time matched" in stopped["process"]["reason"]
+
+
+def test_phase5_retry_after_gone_relaunches_same_job_under_same_reservation(
+    repo_fixture,
+    tmp_path,
+    monkeypatch,
+):
+    config = _write_config(repo_fixture)
+    script = repo_fixture / "jobs" / "hold.py"
+    script.write_text("print('retry')\n")
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    server = _import_server_with_config(monkeypatch, config)
+    monkeypatch.setattr(server, "_is_local_host", lambda host: False)
+    pids = iter(["12345\n", "23456\n"])
+    monkeypatch.setattr(server, "_ssh_run", lambda host, cmd: next(pids))
+    launched = json.loads(server.run_python_on_gpu(
+        host="gpu-a",
+        gpu_index=0,
+        script_path="jobs/hold.py",
+        output_file=".gpu_mcp_logs/hold.log",
+    ))
+    monkeypatch.setattr(
+        server,
+        "_inspect_reservation_process",
+        lambda metadata: {"status": "gone", "reason": "process exited", "remote_pid": metadata["remote_pid"]},
+    )
+
+    retried = json.loads(server.manage_gpu_job(action="retry", job_id=launched["job_id"]))
+
+    assert retried["status"] == "retried"
+    assert retried["job_id"] == launched["job_id"]
+    assert retried["attempt_id"] != launched["attempt_id"]
+    assert retried["reservation_key"] == "gpu-a.gpu0"
+    assert retried["process"]["remote_pid"] == 23456
+    metadata = json.loads((registry / "gpu-a.gpu0" / "metadata.json").read_text())
+    assert metadata["job_id"] == launched["job_id"]
+    assert metadata["attempt_id"] == retried["attempt_id"]
+    assert metadata["remote_pid"] == 23456
+    job_record = json.loads(
+        (repo_fixture / ".gpu_mcp_state" / "jobs" / launched["job_id"] / "job.json").read_text()
+    )
+    assert job_record["active_attempt_id"] == retried["attempt_id"]
+
+
+def test_phase5_retry_local_launch_failure_rolls_back_claim(
+    repo_fixture,
+    tmp_path,
+    monkeypatch,
+):
+    config = _write_config(repo_fixture)
+    script = repo_fixture / "jobs" / "hold.py"
+    script.write_text("print('retry fail')\n")
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    server = _import_server_with_config(monkeypatch, config)
+    monkeypatch.setattr(server, "_is_local_host", lambda host: False)
+    monkeypatch.setattr(server, "_ssh_run", lambda host, cmd: "12345\n")
+    launched = json.loads(server.run_python_on_gpu(
+        host="gpu-a",
+        gpu_index=0,
+        script_path="jobs/hold.py",
+        output_file=".gpu_mcp_logs/hold.log",
+    ))
+    monkeypatch.setattr(
+        server,
+        "_inspect_reservation_process",
+        lambda metadata: {"status": "gone", "reason": "process exited", "remote_pid": metadata["remote_pid"]},
+    )
+    monkeypatch.setattr(server, "_is_local_host", lambda host: True)
+
+    def fail_popen(*args, **kwargs):
+        raise OSError("retry spawn failed before process exists")
+
+    monkeypatch.setattr(server.subprocess, "Popen", fail_popen)
+
+    retried = json.loads(server.manage_gpu_job(action="retry", job_id=launched["job_id"]))
+
+    assert retried["status"] == "refused"
+    assert "retry spawn failed" in retried["reason"]
+    metadata = json.loads((registry / "gpu-a.gpu0" / "metadata.json").read_text())
+    assert metadata["attempt_id"] == launched["attempt_id"]
+    assert metadata["remote_pid"] == 12345
+    job_record = json.loads(
+        (repo_fixture / ".gpu_mcp_state" / "jobs" / launched["job_id"] / "job.json").read_text()
+    )
+    assert job_record["active_attempt_id"] == launched["attempt_id"]
+    assert job_record["remote_pid"] == 12345
+
+
+def test_phase5_retry_remote_no_pid_stays_fail_closed(
+    repo_fixture,
+    tmp_path,
+    monkeypatch,
+):
+    config = _write_config(repo_fixture)
+    script = repo_fixture / "jobs" / "hold.py"
+    script.write_text("print('retry no pid')\n")
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    server = _import_server_with_config(monkeypatch, config)
+    monkeypatch.setattr(server, "_is_local_host", lambda host: False)
+    pids = iter(["12345\n", None])
+    monkeypatch.setattr(server, "_ssh_run", lambda host, cmd: next(pids))
+    launched = json.loads(server.run_python_on_gpu(
+        host="gpu-a",
+        gpu_index=0,
+        script_path="jobs/hold.py",
+        output_file=".gpu_mcp_logs/hold.log",
+    ))
+    monkeypatch.setattr(
+        server,
+        "_inspect_reservation_process",
+        lambda metadata: {"status": "gone", "reason": "process exited", "remote_pid": metadata["remote_pid"]},
+    )
+
+    retried = json.loads(server.manage_gpu_job(action="retry", job_id=launched["job_id"]))
+
+    assert retried["status"] == "launch_outcome_unknown"
+    assert "reservation kept fail-closed" in retried["reason"]
+    metadata = json.loads((registry / "gpu-a.gpu0" / "metadata.json").read_text())
+    assert metadata["attempt_id"] == retried["attempt_id"]
+    assert metadata["remote_pid"] is None
+    job_record = json.loads(
+        (repo_fixture / ".gpu_mcp_state" / "jobs" / launched["job_id"] / "job.json").read_text()
+    )
+    assert job_record["active_attempt_id"] == retried["attempt_id"]
+    assert job_record["remote_pid"] is None
+
+
+def test_pytest_harness_controls_require_explicit_enable(
+    repo_fixture,
+    tmp_path,
+    monkeypatch,
+):
+    config = _write_config(repo_fixture)
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    fake_probe = fake_bin / "fake-probe"
+    fake_probe.write_text("#!/usr/bin/env python3\nprint('fake-ran')\n")
+    fake_probe.chmod(0o755)
+    control_file = tmp_path / "control.json"
+    control_file.write_text(json.dumps({"heartbeat_unhealthy_reason": "disabled controls should not apply"}))
+    monkeypatch.setenv("GPU_MCP_TEST_FAKE_BIN", str(fake_bin))
+    monkeypatch.setenv("GPU_MCP_TEST_CONTROL_FILE", str(control_file))
+    monkeypatch.delenv("GPU_MCP_TEST_ENABLE_HARNESS_CONTROLS", raising=False)
+    server = _import_server_with_config(monkeypatch, config)
+
+    assert server._local_shell_run("fake-probe") is None
+    server._apply_test_controls_from_file()
+    assert server.HEARTBEAT_MANAGER.is_healthy()
+
+
+def test_pytest_harness_controls_apply_only_when_explicitly_enabled(
+    repo_fixture,
+    tmp_path,
+    monkeypatch,
+):
+    config = _write_config(repo_fixture)
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    fake_probe = fake_bin / "fake-probe"
+    fake_probe.write_text("#!/usr/bin/env python3\nprint('fake-ran')\n")
+    fake_probe.chmod(0o755)
+    control_file = tmp_path / "control.json"
+    control_file.write_text(json.dumps({"heartbeat_unhealthy_reason": "enabled control"}))
+    monkeypatch.setenv("GPU_MCP_TEST_FAKE_BIN", str(fake_bin))
+    monkeypatch.setenv("GPU_MCP_TEST_CONTROL_FILE", str(control_file))
+    monkeypatch.setenv("GPU_MCP_TEST_ENABLE_HARNESS_CONTROLS", "1")
+    server = _import_server_with_config(monkeypatch, config)
+
+    assert server._local_shell_run("fake-probe") == "fake-ran"
+    server._apply_test_controls_from_file()
+    assert not server.HEARTBEAT_MANAGER.is_healthy()
+    assert "enabled control" in server.HEARTBEAT_MANAGER.health_reason()
+
+
+def test_phase5_retry_claim_prevents_stale_second_relaunch(
+    repo_fixture,
+    tmp_path,
+    monkeypatch,
+):
+    config = _write_config(repo_fixture)
+    script = repo_fixture / "jobs" / "hold.py"
+    script.write_text("print('retry race')\n")
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    server = _import_server_with_config(monkeypatch, config)
+    monkeypatch.setattr(server, "_is_local_host", lambda host: False)
+    pids = iter(["12345\n", "23456\n"])
+    monkeypatch.setattr(server, "_ssh_run", lambda host, cmd: next(pids))
+    launched = json.loads(server.run_python_on_gpu(
+        host="gpu-a",
+        gpu_index=0,
+        script_path="jobs/hold.py",
+        output_file=".gpu_mcp_logs/hold.log",
+    ))
+    old_record = json.loads(
+        (repo_fixture / ".gpu_mcp_state" / "jobs" / launched["job_id"] / "job.json").read_text()
+    )
+    old_metadata = json.loads((registry / "gpu-a.gpu0" / "metadata.json").read_text())
+    first_attempt = server.reservations.generate_attempt_id(suffix="first")
+    second_attempt = server.reservations.generate_attempt_id(suffix="second")
+
+    first = json.loads(server._start_managed_attempt(
+        job_record=old_record,
+        metadata=old_metadata,
+        attempt_id=first_attempt,
+        output_path=repo_fixture / ".gpu_mcp_logs" / "hold.log",
+        next_poll_after="2026-05-30T13:00:00Z",
+        async_mode_requested=False,
+    ))
+    second = json.loads(server._start_managed_attempt(
+        job_record=old_record,
+        metadata=old_metadata,
+        attempt_id=second_attempt,
+        output_path=repo_fixture / ".gpu_mcp_logs" / "hold.log",
+        next_poll_after="2026-05-30T13:00:00Z",
+        async_mode_requested=False,
+    ))
+
+    assert first["status"] == "retried"
+    assert second["status"] == "refused"
+    assert "reservation changed before retry launch" in second["reason"]
+    metadata = json.loads((registry / "gpu-a.gpu0" / "metadata.json").read_text())
+    assert metadata["attempt_id"] == first_attempt
+    assert metadata["remote_pid"] == 23456
+
+
+def test_phase5_retry_missing_pid_with_ack_file_stays_fail_closed(
+    repo_fixture,
+    tmp_path,
+    monkeypatch,
+):
+    config = _write_config(repo_fixture)
+    script = repo_fixture / "jobs" / "hold.py"
+    script.write_text("print('retry ack uncertain')\n")
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    server = _import_server_with_config(monkeypatch, config)
+    monkeypatch.setattr(server, "_is_local_host", lambda host: False)
+    monkeypatch.setattr(server, "_ssh_run", lambda host, cmd: "12345\n")
+    launched = json.loads(server.run_python_on_gpu(
+        host="gpu-a",
+        gpu_index=0,
+        script_path="jobs/hold.py",
+        output_file=".gpu_mcp_logs/hold.log",
+    ))
+    old_record = json.loads(
+        (repo_fixture / ".gpu_mcp_state" / "jobs" / launched["job_id"] / "job.json").read_text()
+    )
+    old_metadata = json.loads((registry / "gpu-a.gpu0" / "metadata.json").read_text())
+    attempt_id = server.reservations.generate_attempt_id(suffix="ackuncertain")
+    ack_path = (
+        server.reservations.outcome_record_path(repo_fixture, launched["job_id"], attempt_id).parent
+        / "launcher_pid.json"
+    )
+    ack_path.parent.mkdir(parents=True)
+    ack_path.write_text("")
+    monkeypatch.setattr(server, "_ssh_run", lambda host, cmd: None)
+
+    retried = json.loads(server._start_managed_attempt(
+        job_record=old_record,
+        metadata=old_metadata,
+        attempt_id=attempt_id,
+        output_path=repo_fixture / ".gpu_mcp_logs" / "hold.log",
+        next_poll_after="2026-05-30T13:00:00Z",
+        async_mode_requested=False,
+    ))
+
+    assert retried["status"] == "launch_outcome_unknown"
+    metadata = json.loads((registry / "gpu-a.gpu0" / "metadata.json").read_text())
+    assert metadata["attempt_id"] == attempt_id
+    assert metadata["remote_pid"] is None
+    job_record = json.loads(
+        (repo_fixture / ".gpu_mcp_state" / "jobs" / launched["job_id"] / "job.json").read_text()
+    )
+    assert job_record["active_attempt_id"] == attempt_id
+    assert job_record["remote_pid"] is None
+
+
+def test_phase5_finish_gone_removes_reservation_immediately(
+    repo_fixture,
+    tmp_path,
+    monkeypatch,
+):
+    config = _write_config(repo_fixture)
+    script = repo_fixture / "jobs" / "quick.py"
+    script.write_text("print('done')\n")
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    server = _import_server_with_config(monkeypatch, config)
+    monkeypatch.setattr(server, "_is_local_host", lambda host: False)
+    monkeypatch.setattr(server, "_ssh_run", lambda host, cmd: "12345\n")
+    launched = json.loads(server.run_python_on_gpu(
+        host="gpu-a",
+        gpu_index=0,
+        script_path="jobs/quick.py",
+        output_file=".gpu_mcp_logs/quick.log",
+    ))
+    monkeypatch.setattr(
+        server,
+        "_inspect_reservation_process",
+        lambda metadata: {"status": "gone", "reason": "process exited", "remote_pid": 12345},
+    )
+
+    finished = json.loads(server.manage_gpu_job(action="finish", job_id=launched["job_id"]))
+
+    assert finished["status"] == "finished"
+    assert finished["job_lifecycle"] == "finished"
+    assert not (registry / "gpu-a.gpu0").exists()
+    assert server.HEARTBEAT_MANAGER.owned_keys() == []
+
+
+def test_phase6_status_action_writes_status_acknowledgement(
+    repo_fixture,
+    tmp_path,
+    monkeypatch,
+):
+    config = _write_config(repo_fixture)
+    script = repo_fixture / "jobs" / "hold.py"
+    script.write_text("print('still alive')\n")
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    monkeypatch.delenv("GPU_MCP_HOOK_REMINDER_MODE", raising=False)
+    server = _import_server_with_config(monkeypatch, config)
+    monkeypatch.setattr(server, "_is_local_host", lambda host: False)
+    monkeypatch.setattr(server, "_ssh_run", lambda host, cmd: "12345\n")
+    launched = json.loads(server.run_python_on_gpu(
+        host="gpu-a",
+        gpu_index=0,
+        script_path="jobs/hold.py",
+        output_file=".gpu_mcp_logs/hold.log",
+    ))
+    record_path = server.reservations.job_record_path(repo_fixture, launched["job_id"])
+    before_status = json.loads(record_path.read_text())
+    monkeypatch.setattr(
+        server,
+        "_inspect_reservation_process",
+        lambda metadata: {"status": "alive", "reason": "still running", "remote_pid": 12345},
+    )
+
+    status = json.loads(server.manage_gpu_job(action="status", job_id=launched["job_id"]))
+    after_status = json.loads(record_path.read_text())
+    hook = importlib.import_module("gpu_mcp_policy_hook")
+    reminder = hook.check_gpu_job_reminders(repo_fixture)
+
+    assert before_status["last_status_checked_at"] is None
+    assert status["status"] == "ok"
+    assert status["job_lifecycle"] == "running"
+    assert after_status["last_status_checked_at"] is not None
+    assert after_status["next_poll_after"] == status["next_poll_after"]
+    assert reminder is None
+
+
+def test_phase5_finish_alive_refuses_and_keeps_heartbeat(
+    repo_fixture,
+    tmp_path,
+    monkeypatch,
+):
+    config = _write_config(repo_fixture)
+    script = repo_fixture / "jobs" / "hold.py"
+    script.write_text("print('still alive')\n")
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    server = _import_server_with_config(monkeypatch, config)
+    monkeypatch.setattr(server, "_is_local_host", lambda host: False)
+    monkeypatch.setattr(server, "_ssh_run", lambda host, cmd: "12345\n")
+    launched = json.loads(server.run_python_on_gpu(
+        host="gpu-a",
+        gpu_index=0,
+        script_path="jobs/hold.py",
+        output_file=".gpu_mcp_logs/hold.log",
+    ))
+    monkeypatch.setattr(
+        server,
+        "_inspect_reservation_process",
+        lambda metadata: {"status": "alive", "reason": "still running", "remote_pid": 12345},
+    )
+
+    finished = json.loads(server.manage_gpu_job(action="finish", job_id=launched["job_id"]))
+    listed = json.loads(server.list_gpu_reservations(scope="mine", fresh=False))
+
+    assert finished["status"] == "refused"
+    assert "stop" in finished["reason"]
+    assert "status" in finished["reason"]
+    assert "finish" in finished["reason"]
+    assert (registry / "gpu-a.gpu0" / "metadata.json").exists()
+    assert server.HEARTBEAT_MANAGER.owned_keys() == ["gpu-a.gpu0"]
+    assert listed["reservations"][0]["owned_by_current_server"] is True
+    assert listed["reservations"][0]["allowed_actions"] == ["status", "stop", "retry", "finish"]
+
+
+def test_phase5_zombie_is_process_gone_for_retry(
+    repo_fixture,
+    tmp_path,
+    monkeypatch,
+):
+    config = _write_config(repo_fixture)
+    script = repo_fixture / "jobs" / "hold.py"
+    script.write_text("print('zombie retry')\n")
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    server = _import_server_with_config(monkeypatch, config)
+    monkeypatch.setattr(server, "_is_local_host", lambda host: False)
+    pids = iter(["12345\n", "23456\n"])
+    monkeypatch.setattr(server, "_ssh_run", lambda host, cmd: next(pids))
+    launched = json.loads(server.run_python_on_gpu(
+        host="gpu-a",
+        gpu_index=0,
+        script_path="jobs/hold.py",
+        output_file=".gpu_mcp_logs/hold.log",
+    ))
+    monkeypatch.setattr(
+        server,
+        "_inspect_reservation_process",
+        lambda metadata: {"status": "gone", "reason": "process is zombie", "remote_pid": 12345},
+    )
+
+    retried = json.loads(server.manage_gpu_job(action="retry", job_id=launched["job_id"]))
+
+    assert retried["status"] == "retried"
+    assert retried["process"]["remote_pid"] == 23456
+
+
+def test_phase5_kill_gpu_process_does_not_remove_reservation(
+    repo_fixture,
+    tmp_path,
+    monkeypatch,
+):
+    config = _write_config(repo_fixture)
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    server = _import_server_with_config(monkeypatch, config)
+    _seed_reservation(registry, repo_fixture, heartbeat=server.reservations.iso_timestamp())
+    process_info = {
+        "pid": "12345",
+        "ppid": "1",
+        "pgid": "12345",
+        "owner": server.GPU_MCP_USER,
+        "start_time": "Thu May 30 12:00:00 2026",
+        "command": "python ignore_term.py",
+        "cmd_hash": "abc123",
+        "cmd_preview": "python ignore_term.py",
+        "gpu_index": "0",
+        "gpu_memory_mib": "1",
+    }
+    process_info["fingerprint"] = server._kill_fingerprint("gpu-a", process_info)
+    monkeypatch.setattr(server, "_inspect_kill_target", lambda host, pid: process_info)
+    monkeypatch.setattr(server, "_host_run", lambda host, cmd, user=server.GPU_MCP_USER, timeout=15: "")
+
+    inspected = json.loads(server.kill_gpu_process(host="gpu-a", pid=12345))
+    signaled = json.loads(server.kill_gpu_process(
+        host="gpu-a",
+        pid=12345,
+        fingerprint=inspected["fingerprint"],
+        signal="TERM",
+    ))
+
+    assert inspected["status"] == "inspect"
+    assert signaled["status"] == "signaled"
+    assert (registry / "gpu-a.gpu0" / "metadata.json").exists()
+
+
+def test_phase5_kill_gpu_process_refuses_stale_policy(repo_fixture, monkeypatch):
+    config = _write_config(repo_fixture)
+    server = _import_server_with_config(monkeypatch, config)
+    monkeypatch.setattr(server, "_stale_policy_refusal", lambda: "GPU MCP policy changed after server start")
+
+    result = server.kill_gpu_process(host="gpu-a", pid=12345)
+
+    assert "policy changed" in result
 
 
 def test_nvidia_smi_parser_tolerates_non_numeric_fields(repo_fixture, monkeypatch):
@@ -440,6 +2454,20 @@ def test_static_scan_rejects_raw_io_modules(repo_fixture, monkeypatch):
     assert any("posix" in issue for issue in server.scan_python_gpu_script_safety(str(posix_script)))
 
 
+def test_static_scan_rejects_codex_self_spawn_commands(repo_fixture, monkeypatch):
+    config = _write_config(repo_fixture)
+    script = repo_fixture / "jobs" / "codex_bypass.py"
+    script.write_text(
+        "import os\n"
+        "os.system('codex exec --ignore-rules --dangerously-bypass-approvals-and-sandbox run')\n"
+    )
+    server = _import_server_with_config(monkeypatch, config)
+
+    issues = server.scan_python_gpu_script_safety(str(script))
+
+    assert any("codex" in issue for issue in issues)
+
+
 def test_guard_run_job_does_not_prepend_script_dir_to_sys_path(repo_fixture):
     (repo_fixture / "jobs" / "os.py").write_text("SHADOWED = True\n")
     script = repo_fixture / "jobs" / "import_os.py"
@@ -555,10 +2583,11 @@ def test_output_parent_must_not_be_symlink(repo_fixture, monkeypatch):
         server._prepare_output_parent(logs / "job.log")
 
 
-def test_async_remote_launch_rejects_invalid_pid(repo_fixture, monkeypatch):
+def test_async_remote_launch_rejects_invalid_pid(repo_fixture, tmp_path, monkeypatch):
     config = _write_config(repo_fixture)
     script = repo_fixture / "jobs" / "ok.py"
     script.write_text("print('ok')\n")
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(tmp_path / "reservations"))
     server = _import_server_with_config(monkeypatch, config)
     monkeypatch.setattr(server, "_is_local_host", lambda host: False)
     monkeypatch.setattr(server, "_ssh_run", lambda host, cmd: "not-a-pid\n")
@@ -571,7 +2600,12 @@ def test_async_remote_launch_rejects_invalid_pid(repo_fixture, monkeypatch):
         output_file=".gpu_mcp_logs/job.log",
     )
 
-    assert "invalid async pid" in result
+    parsed = json.loads(result)
+    assert parsed["status"] == "launch_outcome_unknown"
+    assert "invalid async pid" in parsed["reason"]
+    assert parsed["job_id"].startswith("job-")
+    assert parsed["reservation_key"] == "gpu-a.gpu0"
+    assert (tmp_path / "reservations" / "gpu-a.gpu0" / "metadata.json").exists()
 
 
 def test_kill_rejects_bool_pid(repo_fixture, monkeypatch):
@@ -618,3 +2652,21 @@ def test_local_host_alias_does_not_assume_mit_domain(repo_fixture, monkeypatch):
 
     assert server._is_local_host("gpu01")
     assert server._is_local_host("gpu01.example.edu")
+
+
+def test_canonical_policy_host_prefers_exact_fqdn_and_rejects_ambiguous_short(
+    repo_fixture,
+    monkeypatch,
+):
+    config = _write_config(repo_fixture)
+    config.write_text(
+        config.read_text().replace(
+            "nodes = ['gpu-a']",
+            "nodes = ['gpu-a.domain1.example', 'gpu-a.domain2.example']",
+        )
+    )
+    server = _import_server_with_config(monkeypatch, config)
+
+    assert server._canonical_policy_host("gpu-a.domain2.example") == "gpu-a.domain2.example"
+    with pytest.raises(ValueError, match="ambiguous"):
+        server._canonical_policy_host("gpu-a")

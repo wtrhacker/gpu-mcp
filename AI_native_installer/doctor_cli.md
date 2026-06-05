@@ -32,7 +32,8 @@ Readiness checks:
 - remote `realpath(repo_root)`, Python executable, probe script hash, working
   directory, and minimal imports;
 - repo-local Codex MCP config with real `codex exec` probe;
-- global Codex execpolicy prompt rules for `ssh`, `scp`, `sftp`, and `rsync`;
+- global Codex execpolicy prompt rules for `ssh`, `scp`, `sftp`, `rsync`, and
+  `codex`;
 - blocked `codex exec` probes for those commands when approvals are disabled;
 - no raw-command probe may include `--ignore-rules`;
 - client `tool_timeout_sec > sync_timeout_sec`.

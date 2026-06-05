@@ -52,7 +52,7 @@ def test_required_remote_command_ban_probes_are_simple_and_global(
 def test_required_remote_commands_use_codex_prompt_rules(codex_config_module):
     rules = codex_config_module.required_remote_command_prompt_rules()
 
-    for command in ("ssh", "scp", "sftp", "rsync"):
+    for command in ("ssh", "scp", "sftp", "rsync", "codex"):
         assert rules[command] == f'prefix_rule(pattern=["{command}"], decision="prompt")'
 
 
@@ -63,6 +63,7 @@ def test_global_prompt_rules_validate(codex_config_module):
             'prefix_rule(pattern=["scp"], decision="prompt")',
             'prefix_rule(pattern=["sftp"], decision="prompt")',
             'prefix_rule(pattern=["rsync"], decision="prompt")',
+            'prefix_rule(pattern=["codex"], decision="prompt")',
         ]
     )
 
@@ -70,7 +71,21 @@ def test_global_prompt_rules_validate(codex_config_module):
 
     assert result["status"] == "ok"
     assert result["scope"] == "global"
-    assert set(result["prompt_commands"]) >= {"ssh", "scp", "sftp", "rsync"}
+    assert set(result["prompt_commands"]) >= {"ssh", "scp", "sftp", "rsync", "codex"}
+
+
+def test_missing_codex_spawn_prompt_rule_is_rejected(codex_config_module):
+    rules_text = "\n".join(
+        [
+            'prefix_rule(pattern=["ssh"], decision="prompt")',
+            'prefix_rule(pattern=["scp"], decision="prompt")',
+            'prefix_rule(pattern=["sftp"], decision="prompt")',
+            'prefix_rule(pattern=["rsync"], decision="prompt")',
+        ]
+    )
+
+    with pytest.raises(codex_config_module.CodexConfigError, match="codex"):
+        codex_config_module.validate_remote_command_prompt_rules(rules_text)
 
 
 def test_allow_rules_do_not_count_as_raw_remote_blocks(codex_config_module):
@@ -80,6 +95,7 @@ def test_allow_rules_do_not_count_as_raw_remote_blocks(codex_config_module):
             'prefix_rule(pattern=["scp"], decision="prompt")',
             'prefix_rule(pattern=["sftp"], decision="prompt")',
             'prefix_rule(pattern=["rsync"], decision="prompt")',
+            'prefix_rule(pattern=["codex"], decision="prompt")',
         ]
     )
 
@@ -95,6 +111,7 @@ def test_conflicting_allow_rule_rejects_remote_command_policy(codex_config_modul
             'prefix_rule(pattern=["scp"], decision="prompt")',
             'prefix_rule(pattern=["sftp"], decision="prompt")',
             'prefix_rule(pattern=["rsync"], decision="prompt")',
+            'prefix_rule(pattern=["codex"], decision="prompt")',
         ]
     )
 

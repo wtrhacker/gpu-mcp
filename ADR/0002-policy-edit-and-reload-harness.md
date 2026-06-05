@@ -27,13 +27,15 @@ Implemented:
 - Normal MCP cluster tools refuse while `gpu-mcp.toml` on disk is stale
   relative to the active in-memory policy.
 - `gpu_mcp_policy_hook.py` provides small PreToolUse and PostToolUse
-  policy-drift hook behavior for Codex-style clients.
+  policy-drift hook behavior for Codex-style clients. It is installed as a
+  user-global GPU MCP companion hook and discovers the relevant repo by walking
+  upward from the hook working directory.
 
 Still human-supervised:
 
 - Interactive Codex hook acceptance, because automated tests can verify the
   hook output but cannot prove the human approval judgment.
-- Site-specific Codex hook installation, because hook registration is
+- Codex hook trust/acceptance, because hook registration and trusted hashes are
   client-version and local-config dependent.
 
 ADR numbering should stay as-is. ADR 003 was implemented first because remote
@@ -196,12 +198,15 @@ the situation silently:
 ```text
 gpu-mcp.toml has changed but has not been reloaded.
 Active policy is still the old approved policy.
-Do not revert the file. Do not edit any policy or Codex config file.
+Do not revert the file. Do not edit Codex config or unrelated files.
 Stop immediately and explain to the human what you were trying to do,
 what changed, and why GPU MCP refused to continue.
 If the human intentionally changed the policy, the next step is
 preview_policy_reload. Show the safety diff and call reload_policy only
 after explicit human approval.
+Only edit gpu-mcp.toml while stale after explicit human rejection or
+cancellation of the prior candidate and explicit human re-orientation to the
+next candidate edit.
 ```
 
 This is secure and clearer than silently continuing under the old policy. It
@@ -317,9 +322,10 @@ Hooks are useful agent engineering. They are not the final authority.
 
 A Codex hook should be small, final-purpose, and workflow-oriented:
 
-- run before and after Codex tool use as `PreToolUse` and `PostToolUse` hooks;
+- run before and after Codex tool use as user-global `PreToolUse` and
+  `PostToolUse` companion hooks for GPU MCP;
 - find the nearest `gpu-mcp.toml` by walking upward from the hook working
-  directory;
+  directory, exiting quietly when the current workspace has no GPU MCP policy;
 - compare that file's hash with the approved-policy record;
 - if the file is unchanged and approved, exit quietly;
 - if the file is changed or unapproved, tell the agent that the edit is
@@ -330,10 +336,10 @@ A Codex hook should be small, final-purpose, and workflow-oriented:
 - allow a narrow direct edit of `gpu-mcp.toml` while stale when the human asks
   to replace the inactive candidate;
   This exception must be target-based, not tool-name-only: structured edit
-  events may carry `file_path`, while patch-style events may carry the patch
-  body as `patch`, `cmd`, top-level `command`, or a raw string. The hook should
-  allow the edit only when every touched file resolves to the discovered
-  `gpu-mcp.toml`;
+  events may carry `file_path` or `path`, while patch-style update events may
+  carry the patch body as `patch`, `cmd`, top-level `command`, or a raw string.
+  The hook should allow the edit only when every touched file resolves to the
+  discovered `gpu-mcp.toml`;
 - tell the agent not to revert the policy file silently and not to keep trying
   cluster actions until the human has reviewed the state;
 - include the human-edited versus Codex-edited branch in the hook output,
@@ -560,8 +566,13 @@ Deterministic tests should cover:
 - refusal text tells the agent to stop and explain instead of silently
   reverting/editing policy;
 - hook helper detects `gpu-mcp.toml` drift against the approved-policy record
-  and emits the correct procedural warning.
-- hook helper allows policy reload/reject tools while stale.
+  and emits the correct procedural warning;
+- hook helper allows policy preview/reload/reject tools while stale;
+- hook helper allows narrow stale-time edits of the discovered `gpu-mcp.toml`
+  for structured `file_path`/`path` edit events and patch-style update events
+  carried as `patch`, `cmd`, top-level `command`, or raw string;
+- hook helper refuses mixed patches, unrelated file edits, and add/delete patch
+  operations while stale.
 
 `codex exec` battlefield tests should cover the MCP-facing parts of this
 lifecycle: startup approval checks, protected policy-mutation failure, preview

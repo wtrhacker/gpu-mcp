@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from gpu_mcp_codex_config import CodexConfigError, validate_remote_command_prompt_rules
 from gpu_mcp_config import ConfigError, load_policy
 from gpu_mcp_policy_approval import approve_policy, policy_file_hash, policy_summary
 
@@ -137,6 +138,13 @@ def validate_repo_local_codex_config(repo: str | Path, config_path: str | Path) 
             "tool_timeout_sec": tool_timeout_sec,
         }
     raise DoctorError(f"repo-local Codex config must register {MCP_SERVER_NAME} with --config")
+
+
+def validate_codex_execpolicy_rules(rules_text: str) -> dict:
+    try:
+        return validate_remote_command_prompt_rules(rules_text)
+    except CodexConfigError as exc:
+        raise DoctorError(str(exc)) from exc
 
 
 def run_codex_mcp_probe(

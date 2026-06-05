@@ -168,10 +168,11 @@ Implemented follow-up behavior:
 - the hook allows a narrow direct edit of `gpu-mcp.toml` to supersede an
   inactive candidate without activating the rejected one;
 - the hook must recognize the edit target across the event shapes Codex has
-  used in practice: structured `file_path` edit payloads, patch payloads in
-  `patch`/`cmd`, top-level `command`, and raw string patch bodies;
+  used in practice: structured `file_path`/`path` edit payloads, update patch
+  payloads in `patch`/`cmd`, top-level `command`, and raw string patch bodies;
 - the allow rule is target-based: every touched path must resolve to the
-  discovered `gpu-mcp.toml`; mixed patches or edits to other files still block;
+  discovered `gpu-mcp.toml`; mixed patches, add/delete patches, or edits to
+  other files still block;
 - any superseded candidate requires a fresh `preview_policy_reload`;
 - the agent must not call `reload_policy` for a rejected/cancelled candidate
   unless the human explicitly approves that exact preview again.
@@ -195,7 +196,8 @@ Manual experiment evidence from this session, not deterministic pytest coverage:
 - the model may still produce a final explanatory message after the hook fires;
 - registering the same policy check as `PreToolUse` blocks subsequent normal
   tools before they execute while the policy is stale;
-- therefore the repo config uses both `PreToolUse` and `PostToolUse`;
+- therefore the installed global GPU MCP companion hook uses both `PreToolUse`
+  and `PostToolUse`;
 - the hook is not the security boundary. The server's stale-policy refusal is
   the reliable backstop if a client skips hooks or has different hook behavior.
 
@@ -239,9 +241,12 @@ policy-edit workflow.
 Interactive approval UI:
 
 ```text
-1. Start a fresh trusted Codex session after `.codex/config.toml` is loaded.
-2. Make a harmless `gpu-mcp.toml` edit.
-3. Confirm the hook fires.
+1. Start a fresh trusted Codex session after the repo-local MCP config and
+   user-global hook config are loaded.
+2. From a nested working directory in that repo, with no repo-local hook config
+   or hook state, make a harmless `gpu-mcp.toml` edit.
+3. Confirm the user-global hook fires for that repo by discovering the nearest
+   `gpu-mcp.toml`.
 4. Call `preview_policy_reload`.
 5. If Codex prompts for preview, approve it and continue; preview is
    non-activating.
@@ -260,7 +265,7 @@ Fresh install:
 
 ```text
 1. Run the installer/doctor flow in a new repo or account.
-2. Confirm it writes the repo-local hook config.
+2. Confirm it registers the user-global GPU MCP companion hook.
 3. Confirm it puts the required human prompt on `reload_policy`.
 4. Confirm `preview_policy_reload` and `reject_policy_reload` remain callable
    recovery tools; any client prompt on them is extra friction, not the policy

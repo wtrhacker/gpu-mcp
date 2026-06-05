@@ -11,12 +11,13 @@ Usage:
 Register in Codex or another MCP-aware client as a stdio MCP server.
 """
 
-import sys, os, json, time, subprocess, re, shlex, hashlib, signal as signal_lib, secrets
-from datetime import datetime, timezone
+import sys, os, json, time, subprocess, re, shlex, hashlib, signal as signal_lib, secrets, shutil, threading, atexit
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
 import gpu_mcp_guard
+import gpu_mcp_reservations as reservations
 from gpu_mcp_config import ConfigError, GpuMcpPolicy, load_policy
 from gpu_mcp_policy_approval import (
     PolicyApprovalError,
@@ -50,6 +51,13 @@ def _pop_config_arg(argv: list[str]) -> str:
 GPU_MCP_CONFIG_PATH = _pop_config_arg(sys.argv)
 GPU_MCP_TEST_DISABLE_POLICY_APPROVAL = (
     os.environ.get("GPU_MCP_TEST_DISABLE_POLICY_APPROVAL", "").strip().lower()
+    in {"1", "true", "yes"}
+    and "PYTEST_CURRENT_TEST" in os.environ
+)
+GPU_MCP_TEST_CONTROL_FILE = os.environ.get("GPU_MCP_TEST_CONTROL_FILE", "").strip()
+GPU_MCP_TEST_FAKE_BIN = os.environ.get("GPU_MCP_TEST_FAKE_BIN", "").strip()
+GPU_MCP_TEST_ENABLE_HARNESS_CONTROLS = (
+    os.environ.get("GPU_MCP_TEST_ENABLE_HARNESS_CONTROLS", "").strip().lower()
     in {"1", "true", "yes"}
     and "PYTEST_CURRENT_TEST" in os.environ
 )
@@ -114,6 +122,7 @@ POLICY_RELOAD_MAX_PENDING = 64
 
 SSH_CONNECT_TIMEOUT = 8
 HOST_RUN_ERRORS: dict[tuple[str, str], str] = {}
+SERVER_INSTANCE_ID = reservations.generate_server_instance_id()
 
 POLICY_RELOAD_AGENT_INSTRUCTIONS = [
     "Show this raw preview output, including diff_summary and hashes, to the human.",
@@ -154,12 +163,15 @@ def _pop_pending_policy_reload(token: str) -> tuple[dict[str, object] | None, st
 STALE_POLICY_REFUSAL = (
     "gpu-mcp.toml has changed but has not been reloaded.\n"
     "Active policy is still the old approved policy.\n"
-    "Do not revert the file. Do not edit any policy or Codex config file.\n"
+    "Do not revert the file. Do not edit Codex config or unrelated files.\n"
     "Stop immediately and explain to the human what you were trying to do, "
     "what changed, and why GPU MCP refused to continue.\n"
     "If the human intentionally changed the policy, the next step is "
     "preview_policy_reload. Show the safety diff and call reload_policy only "
-    "after explicit human approval."
+    "after explicit human approval.\n"
+    "Only edit gpu-mcp.toml while stale after explicit human rejection or "
+    "cancellation of the prior candidate and explicit human re-orientation "
+    "to the next candidate edit."
 )
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -244,6 +256,26 @@ def _is_allowed_host(host: str) -> bool:
     return requested in _allowed_host_names()
 
 
+def _canonical_policy_host(host: str) -> str:
+    """Return the canonical policy node host for an allowed input host alias."""
+    requested = host.split("@")[-1].strip().lower()
+    exact_matches: list[str] = []
+    short_matches: list[str] = []
+    for node in NODES:
+        listed = node.split("@")[-1].strip().lower()
+        if requested == listed:
+            exact_matches.append(listed)
+        elif requested == listed.split(".", 1)[0]:
+            short_matches.append(listed)
+    if len(exact_matches) == 1:
+        return reservations.canonical_host_component(exact_matches[0])
+    if len(short_matches) == 1:
+        return reservations.canonical_host_component(short_matches[0])
+    if len(short_matches) > 1:
+        raise ValueError(f"host alias {host!r} is ambiguous in GPU MCP NODES")
+    raise ValueError("host must be one of the configured GPU MCP NODES")
+
+
 def _host_run_error(host: str, cmd: str) -> str:
     return HOST_RUN_ERRORS.get((host, cmd), "")
 
@@ -269,6 +301,10 @@ def _local_shell_run(cmd: str, timeout: int = 15) -> Optional[str]:
     HOST_RUN_ERRORS.pop(("local", cmd), None)
     try:
         argv = shlex.split(cmd)
+        if GPU_MCP_TEST_ENABLE_HARNESS_CONTROLS and GPU_MCP_TEST_FAKE_BIN and argv:
+            fake = Path(GPU_MCP_TEST_FAKE_BIN).expanduser() / argv[0]
+            if fake.exists() and not fake.is_symlink():
+                argv[0] = str(fake)
         result = subprocess.run(
             argv,
             check=False,
@@ -576,7 +612,140 @@ def _build_python_gpu_argv(
     ] + [str(arg) for arg in (args or [])]
 
 
-def _remote_async_launch_command(argv: list[str], out_path: Path, env_values: dict[str, str]) -> str:
+def _managed_supervisor_argv(
+    argv: list[str],
+    out_path: Path,
+    env_values: dict[str, str],
+    outcome_path: Path,
+    outcome_base: dict,
+) -> list[str]:
+    wrapper = (
+        "import json, os, signal, subprocess, sys, time, traceback\n"
+        "out_path, cwd, argv_json, env_json, outcome_path, outcome_base_json = sys.argv[1:7]\n"
+        "flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC\n"
+        "if hasattr(os, 'O_NOFOLLOW'):\n"
+        "    flags |= os.O_NOFOLLOW\n"
+        "os.makedirs(os.path.dirname(outcome_path), mode=0o700, exist_ok=True)\n"
+        "env = os.environ.copy()\n"
+        "env.update(json.loads(env_json))\n"
+        "out_fd = os.open(out_path, flags, 0o600)\n"
+        "started_at = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())\n"
+        "rc = None\n"
+        "error_summary = None\n"
+        "proc = None\n"
+        "def forward_signal(signum, frame):\n"
+        "    if proc is not None and proc.poll() is None:\n"
+        "        try:\n"
+        "            os.killpg(proc.pid, signum)\n"
+        "        except ProcessLookupError:\n"
+        "            pass\n"
+        "        except Exception:\n"
+        "            traceback.print_exc(file=sys.stderr)\n"
+        "signal.signal(signal.SIGTERM, forward_signal)\n"
+        "signal.signal(signal.SIGINT, forward_signal)\n"
+        "try:\n"
+        "    proc = subprocess.Popen(json.loads(argv_json), stdout=out_fd, stderr=subprocess.STDOUT, "
+        "stdin=subprocess.DEVNULL, env=env, cwd=cwd, start_new_session=True)\n"
+        "    rc = proc.wait()\n"
+        "except Exception as exc:\n"
+        "    rc = 127\n"
+        "    error_summary = str(exc)\n"
+        "finally:\n"
+        "    os.close(out_fd)\n"
+        "ended_at = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())\n"
+        "outcome = json.loads(outcome_base_json)\n"
+        "outcome['remote_pid'] = os.getpid()\n"
+        "outcome['started_at'] = started_at\n"
+        "outcome['ended_at'] = ended_at\n"
+        "outcome['error_summary'] = error_summary\n"
+        "if rc == 0:\n"
+        "    outcome['terminal_status'] = 'success'\n"
+        "    outcome['exit_code'] = 0\n"
+        "    outcome['signal'] = None\n"
+        "elif rc < 0:\n"
+        "    outcome['terminal_status'] = 'signaled'\n"
+        "    outcome['exit_code'] = None\n"
+        "    outcome['signal'] = str(-rc)\n"
+        "else:\n"
+        "    outcome['terminal_status'] = 'failure'\n"
+        "    outcome['exit_code'] = rc\n"
+        "    outcome['signal'] = None\n"
+        "tmp = outcome_path + '.tmp.' + str(os.getpid())\n"
+        "with open(tmp, 'w') as fh:\n"
+        "    json.dump(outcome, fh, sort_keys=True)\n"
+        "    fh.write('\\n')\n"
+        "os.replace(tmp, outcome_path)\n"
+    )
+    return [
+        PYTHON,
+        "-c",
+        wrapper,
+        str(out_path),
+        str(REPO_ROOT),
+        json.dumps(argv),
+        json.dumps(env_values),
+        str(outcome_path),
+        json.dumps(outcome_base),
+    ]
+
+
+def _remote_async_launch_command(
+    argv: list[str],
+    out_path: Path,
+    env_values: dict[str, str],
+    outcome_path: Path,
+    outcome_base: dict,
+    pid_ack_path: Path | None = None,
+) -> str:
+    """Build a remote managed launcher that writes an outcome record."""
+    supervisor_argv = _managed_supervisor_argv(argv, out_path, env_values, outcome_path, outcome_base)
+    if pid_ack_path is not None:
+        wrapper = (
+            "import json, os, subprocess, sys\n"
+            "supervisor_argv = json.loads(sys.argv[1])\n"
+            "pid_ack_path = sys.argv[2]\n"
+            "os.makedirs(os.path.dirname(pid_ack_path), mode=0o700, exist_ok=True)\n"
+            "ack_fh = open(pid_ack_path, 'w')\n"
+            "try:\n"
+            "    proc = subprocess.Popen(supervisor_argv, stdout=subprocess.DEVNULL, "
+            "stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, start_new_session=True)\n"
+            "except Exception:\n"
+            "    ack_fh.close()\n"
+            "    try:\n"
+            "        os.unlink(pid_ack_path)\n"
+            "    except FileNotFoundError:\n"
+            "        pass\n"
+            "    raise\n"
+            "json.dump({'schema_version': 1, 'remote_pid': proc.pid}, ack_fh, sort_keys=True)\n"
+            "ack_fh.write('\\n')\n"
+            "ack_fh.flush()\n"
+            "os.fsync(ack_fh.fileno())\n"
+            "ack_fh.close()\n"
+            "print(proc.pid)\n"
+        )
+        return " ".join([
+            _shell_env_prefix(env_values),
+            shlex.join([
+                PYTHON,
+                "-c",
+                wrapper,
+                json.dumps(supervisor_argv),
+                str(pid_ack_path),
+            ]),
+        ])
+    return " ".join([
+        _shell_env_prefix(env_values),
+        "nohup",
+        shlex.join(supervisor_argv),
+        ">/dev/null",
+        "2>&1",
+        "&",
+        "echo",
+        "$!",
+    ])
+
+
+def _remote_legacy_async_launch_command(argv: list[str], out_path: Path, env_values: dict[str, str]) -> str:
     """Build a remote launcher that opens async output with O_NOFOLLOW."""
     wrapper = (
         "import json, os, subprocess, sys\n"
@@ -616,6 +785,184 @@ def _gpu_job_env(gpu_index: int) -> dict[str, str]:
     if GPU_MCP_WRITE_ROOTS_RAW:
         env["GPU_MCP_WRITE_ROOTS"] = GPU_MCP_WRITE_ROOTS_RAW
     return env
+
+
+def _managed_process_fingerprint(job_id: str, attempt_id: str, host: str, nonce: str) -> str:
+    payload = {
+        "job_id": job_id,
+        "attempt_id": attempt_id,
+        "host": reservations.canonical_host_component(host),
+        "nonce": str(nonce),
+        "server_instance_id": SERVER_INSTANCE_ID,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return "gpu-mcp-process:" + hashlib.sha256(encoded).hexdigest()
+
+
+def _launch_handle_response(
+    *,
+    status: str,
+    job_id: str,
+    attempt_id: str,
+    reservation_key_value: str,
+    host: str,
+    gpu_index: int,
+    output_path: Path,
+    next_poll_after: str,
+    job_lifecycle: str,
+    launch: str,
+    async_mode_requested: bool,
+    process: dict | None = None,
+    reason: str = "",
+) -> str:
+    return _json_tool_response({
+        "status": status,
+        "reason": reason,
+        "job_id": job_id,
+        "attempt_id": attempt_id,
+        "reservation_key": reservation_key_value,
+        "host": host,
+        "gpu_index": gpu_index,
+        "server_instance_id": SERVER_INSTANCE_ID,
+        "process": process or {
+            "remote_pid": None,
+            "remote_start_time": None,
+            "remote_boot_id": None,
+            "process_fingerprint": None,
+        },
+        "output": {
+            "path": str(output_path),
+        },
+        "next_poll_after": next_poll_after,
+        "heartbeat_interval_sec": reservations.DEFAULT_HEARTBEAT_INTERVAL_SEC,
+        "job_lifecycle": job_lifecycle,
+        "launch": launch,
+        "async_mode_requested": async_mode_requested,
+    })
+
+
+class HeartbeatManager:
+    """Per-task lease heartbeats owned by this MCP server instance."""
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._owned: dict[str, dict[str, object]] = {}
+        self._unhealthy_reason = ""
+        self.force_write_failure_for_tests = False
+
+    def register(self, reservation_key_value: str, *, interval_sec: int) -> None:
+        with self._lock:
+            self._owned[reservation_key_value] = {
+                "interval_sec": interval_sec,
+                "last_attempt_monotonic": 0.0,
+            }
+            self._ensure_thread_locked()
+
+    def unregister(self, reservation_key_value: str) -> None:
+        with self._lock:
+            self._owned.pop(reservation_key_value, None)
+
+    def owned_keys(self) -> list[str]:
+        with self._lock:
+            return sorted(self._owned)
+
+    def is_healthy(self) -> bool:
+        with self._lock:
+            return not self._unhealthy_reason
+
+    def health_reason(self) -> str:
+        with self._lock:
+            return self._unhealthy_reason
+
+    def mark_unhealthy_for_tests(self, reason: str = "test heartbeat failure") -> None:
+        with self._lock:
+            self._unhealthy_reason = reason
+
+    def clear_unhealthy_for_tests(self, *, prefix: str | None = None) -> None:
+        with self._lock:
+            if prefix is None or self._unhealthy_reason.startswith(prefix):
+                self._unhealthy_reason = ""
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=1.0)
+
+    def heartbeat_once(self, reservation_key_value: str, *, now: str | None = None) -> bool:
+        with self._lock:
+            if reservation_key_value not in self._owned:
+                return False
+            interval = int(self._owned[reservation_key_value]["interval_sec"])
+            if self.force_write_failure_for_tests:
+                self._unhealthy_reason = "heartbeat write failed: test forced failure"
+                return False
+            try:
+                self._write_heartbeat(reservation_key_value, interval_sec=interval, now=now)
+            except Exception as exc:
+                self._unhealthy_reason = f"heartbeat write failed: {exc}"
+                return False
+            self._unhealthy_reason = ""
+            self._owned[reservation_key_value]["last_attempt_monotonic"] = time.monotonic()
+            return True
+
+    def update_owned_metadata(self, reservation_key_value: str, updates: dict[str, object]) -> None:
+        with self._lock:
+            if reservation_key_value not in self._owned:
+                raise PermissionError("current server does not own this reservation")
+            self._merge_owned_metadata(reservation_key_value, updates)
+
+    def _ensure_thread_locked(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._thread = threading.Thread(
+            target=self._run,
+            name="gpu-mcp-heartbeats",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _run(self) -> None:
+        while not self._stop_event.wait(timeout=1.0):
+            with self._lock:
+                keys = list(self._owned)
+            for key in keys:
+                with self._lock:
+                    item = self._owned.get(key)
+                    if item is None:
+                        continue
+                    interval = int(item["interval_sec"])
+                    last_attempt = float(item["last_attempt_monotonic"])
+                    if time.monotonic() - last_attempt < max(1, min(interval, 60)):
+                        continue
+                self.heartbeat_once(key)
+
+    def _write_heartbeat(self, reservation_key_value: str, *, interval_sec: int, now: str | None) -> None:
+        self._merge_owned_metadata(
+            reservation_key_value,
+            {
+                "last_heartbeat_at": now or reservations.iso_timestamp(),
+                "heartbeat_interval_sec": interval_sec,
+            },
+        )
+
+    def _merge_owned_metadata(self, reservation_key_value: str, updates: dict[str, object]) -> None:
+        registry_root = reservations.reservation_registry_root()
+        metadata_path = reservations.reservation_dir(registry_root, reservation_key_value) / "metadata.json"
+        with reservations.cleanup_finalization_guard(registry_root, reservation_key_value):
+            metadata = reservations.read_json_file_no_follow(metadata_path)
+            if not isinstance(metadata, dict):
+                raise ValueError("metadata JSON must be an object")
+            if metadata.get("server_instance_id") != SERVER_INSTANCE_ID:
+                raise PermissionError("current server does not own this reservation")
+            metadata.update(updates)
+            reservations.atomic_write_json(metadata_path, metadata)
+
+
+HEARTBEAT_MANAGER = HeartbeatManager()
+atexit.register(HEARTBEAT_MANAGER.stop)
 
 
 def _shell_env_prefix(env_values: dict[str, str]) -> str:
@@ -667,15 +1014,15 @@ def _parse_ps_process_line(raw: str) -> Optional[dict[str, str]]:
     }
 
 
-def _process_gpu_usage(host: str, pid: int) -> tuple[Optional[str], Optional[str]]:
+def _process_gpu_usage(host: str, pid: int, *, timeout: int = 15) -> tuple[Optional[str], Optional[str]]:
     """Return GPU index and memory for a PID when nvidia-smi reports it."""
     proc_query = (
         "nvidia-smi --query-compute-apps=pid,gpu_uuid,used_gpu_memory "
         "--format=csv,noheader,nounits"
     )
     uuid_query = "nvidia-smi --query-gpu=index,uuid --format=csv,noheader"
-    proc_raw = _host_run(host, proc_query)
-    uuid_raw = _host_run(host, uuid_query)
+    proc_raw = _host_run(host, proc_query, timeout=timeout)
+    uuid_raw = _host_run(host, uuid_query, timeout=timeout)
     if proc_raw is None or uuid_raw is None:
         return None, None
 
@@ -725,7 +1072,7 @@ def _kill_fingerprint(host: str, process_info: dict[str, str]) -> str:
 def _inspect_kill_target(host: str, pid: int) -> Optional[dict[str, str]]:
     """Inspect a single process for owner/fingerprint-based cancellation."""
     ps_cmd = f"ps -p {pid} -o pid= -o ppid= -o pgid= -o user= -o lstart= -o args="
-    ps_raw = _host_run(host, ps_cmd)
+    ps_raw = _host_run(host, ps_cmd, timeout=2)
     if ps_raw is None:
         return None
     info = _parse_ps_process_line(ps_raw)
@@ -774,6 +1121,1329 @@ def _kill_process_response(
             "fingerprint": process_info["fingerprint"],
         })
     return json.dumps(response, sort_keys=True)
+
+
+def _json_tool_response(payload: dict) -> str:
+    return json.dumps(payload, sort_keys=True)
+
+
+def _test_controls_enabled() -> bool:
+    return GPU_MCP_TEST_ENABLE_HARNESS_CONTROLS
+
+
+def _apply_test_controls_from_file() -> None:
+    """Apply pytest-only harness controls that are invisible to MCP clients."""
+    if not _test_controls_enabled() or not GPU_MCP_TEST_CONTROL_FILE:
+        return
+    control_path = Path(GPU_MCP_TEST_CONTROL_FILE).expanduser()
+    try:
+        raw = reservations.read_json_file_no_follow(control_path)
+    except FileNotFoundError:
+        HEARTBEAT_MANAGER.clear_unhealthy_for_tests(prefix="test control:")
+        return
+    except Exception:
+        return
+    if not isinstance(raw, dict):
+        return
+    reason = raw.get("heartbeat_unhealthy_reason")
+    if isinstance(reason, str) and reason.strip():
+        HEARTBEAT_MANAGER.mark_unhealthy_for_tests(f"test control: {reason.strip()}")
+        remaining = raw.get("heartbeat_unhealthy_remaining")
+        if isinstance(remaining, int) and not isinstance(remaining, bool):
+            raw["heartbeat_unhealthy_remaining"] = max(0, remaining - 1)
+            if raw["heartbeat_unhealthy_remaining"] <= 0:
+                raw["heartbeat_unhealthy_reason"] = None
+            try:
+                reservations.atomic_write_json(control_path, raw)
+            except Exception:
+                pass
+    elif reason is None:
+        HEARTBEAT_MANAGER.clear_unhealthy_for_tests(prefix="test control:")
+
+
+def _launch_refusal(reason: str, **extra: object) -> str:
+    payload = {
+        "status": "refused",
+        "reason": reason,
+        "job_id": None,
+        "reservation_key": extra.pop("reservation_key", None),
+        "host": extra.pop("host", None),
+        "gpu_index": extra.pop("gpu_index", None),
+        "server_instance_id": SERVER_INSTANCE_ID,
+    }
+    payload.update(extra)
+    return _json_tool_response(payload)
+
+
+def _parse_iso_timestamp(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    text = value
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _next_poll_after(interval_sec: int = reservations.DEFAULT_HEARTBEAT_INTERVAL_SEC) -> str:
+    interval = max(
+        reservations.MIN_HEARTBEAT_INTERVAL_SEC,
+        min(reservations.MAX_HEARTBEAT_INTERVAL_SEC, int(interval_sec)),
+    )
+    return (
+        datetime.now(timezone.utc).replace(microsecond=0)
+        + timedelta(seconds=interval)
+    ).isoformat().replace("+00:00", "Z")
+
+
+def _reservation_age_fields(metadata: dict, *, now: datetime | None = None) -> dict:
+    current = now or datetime.now(timezone.utc)
+    last = _parse_iso_timestamp(metadata.get("last_heartbeat_at"))
+    interval_raw = metadata.get("heartbeat_interval_sec")
+    try:
+        interval = int(interval_raw)
+    except (TypeError, ValueError):
+        interval = reservations.DEFAULT_HEARTBEAT_INTERVAL_SEC
+    if last is None:
+        return {
+            "heartbeat_age_sec": None,
+            "heartbeat_interval_sec": interval,
+            "heartbeat_stale": True,
+        }
+    age = max(0.0, (current - last).total_seconds())
+    return {
+        "heartbeat_age_sec": age,
+        "heartbeat_interval_sec": interval,
+        "heartbeat_stale": age > interval * reservations.STALE_MULTIPLIER,
+    }
+
+
+def _reservation_row_from_error(key: str, reason: str) -> dict:
+    return {
+        "job_id": None,
+        "reservation_key": key,
+        "host": None,
+        "gpu_index": None,
+        "script_name": None,
+        "reservation_state": "UNKNOWN_RESERVED",
+        "computed_state": "UNKNOWN_RESERVED",
+        "metadata_status": "unreadable",
+        "metadata_error": reason,
+        "heartbeat": None,
+        "server_instance_id": None,
+        "owned_by_current_server": False,
+        "allowed_actions": ["status"],
+        "last_inspection": None,
+    }
+
+
+def _safe_script_name(value: object) -> str | None:
+    if not isinstance(value, str) or not value:
+        return None
+    name = Path(value).name
+    if name in {"", ".", ".."}:
+        return None
+    return name
+
+
+def _safe_host_from_metadata(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return reservations.canonical_host_component(value)
+    except ValueError:
+        return None
+
+
+def _reservation_row_from_metadata(metadata: dict, *, key: str) -> dict:
+    heartbeat = _reservation_age_fields(metadata)
+    state = "STALE_RESERVED" if heartbeat["heartbeat_stale"] else "RESERVED"
+    owned = (
+        metadata.get("server_instance_id") == SERVER_INSTANCE_ID
+        and key in HEARTBEAT_MANAGER.owned_keys()
+    )
+    return {
+        "job_id": metadata.get("job_id") if reservations.is_job_id(metadata.get("job_id")) else None,
+        "reservation_key": (
+            metadata.get("reservation_key")
+            if reservations.is_reservation_key(metadata.get("reservation_key"))
+            else key
+        ),
+        "host": _safe_host_from_metadata(metadata.get("host")),
+        "gpu_index": metadata.get("gpu_index") if isinstance(metadata.get("gpu_index"), int) else None,
+        "script_name": _safe_script_name(metadata.get("script_name")),
+        "reservation_state": state,
+        "computed_state": state,
+        "metadata_status": "ok",
+        "metadata_error": "",
+        "heartbeat": heartbeat,
+        "server_instance_id": metadata.get("server_instance_id")
+        if reservations.is_server_instance_id(metadata.get("server_instance_id"))
+        else None,
+        "owned_by_current_server": owned,
+        "allowed_actions": (
+            ["status", "stop", "retry", "finish"]
+            if owned and HEARTBEAT_MANAGER.is_healthy()
+            else ["status"]
+        ),
+        "last_inspection": None,
+    }
+
+
+def _load_reservation_rows(scope: str = "all") -> tuple[str, str, dict[str, dict]]:
+    registry_root = reservations.reservation_registry_root()
+    rows: dict[str, dict] = {}
+    try:
+        entries = sorted(registry_root.iterdir()) if registry_root.exists() else []
+    except OSError as exc:
+        return "unavailable", str(exc), rows
+
+    for entry in entries:
+        if entry.name.startswith("."):
+            continue
+        if entry.is_symlink() or not entry.is_dir():
+            rows[entry.name] = _reservation_row_from_error(entry.name, "reservation entry is not a real directory")
+            continue
+        key = entry.name
+        metadata_path = entry / "metadata.json"
+        try:
+            metadata = reservations.read_json_file_no_follow(metadata_path)
+            if not isinstance(metadata, dict):
+                raise ValueError("metadata JSON must be an object")
+        except Exception as exc:
+            rows[key] = _reservation_row_from_error(key, str(exc))
+            continue
+        if scope == "mine" and str(metadata.get("repo")) != str(REPO_ROOT):
+            continue
+        rows[key] = _reservation_row_from_metadata(metadata, key=key)
+    return "ok", "", rows
+
+
+def _read_reservation_metadata(reservation_key_value: str) -> dict | None:
+    try:
+        metadata = reservations.read_json_file_no_follow(
+            reservations.reservation_dir(
+                reservations.reservation_registry_root(),
+                reservation_key_value,
+            )
+            / "metadata.json"
+        )
+    except Exception:
+        return None
+    return metadata if isinstance(metadata, dict) else None
+
+
+def _metadata_stale(metadata: dict) -> bool:
+    return bool(_reservation_age_fields(metadata)["heartbeat_stale"])
+
+
+def _reservation_key_parts(reservation_key_value: str) -> tuple[str, int] | None:
+    if not reservations.is_reservation_key(reservation_key_value):
+        return None
+    host, gpu_text = reservation_key_value.rsplit(".gpu", 1)
+    return host, int(gpu_text)
+
+
+def _metadata_matches_reservation_key(reservation_key_value: str, metadata: dict) -> bool:
+    parts = _reservation_key_parts(reservation_key_value)
+    if parts is None:
+        return False
+    host, gpu_index = parts
+    try:
+        metadata_host = reservations.canonical_host_component(str(metadata.get("host")))
+    except ValueError:
+        return False
+    return (
+        metadata.get("reservation_key") == reservation_key_value
+        and metadata_host == host
+        and metadata.get("gpu_index") == gpu_index
+    )
+
+
+def _process_start_time(host: str, pid: int) -> str | None:
+    for _ in range(5):
+        raw = _host_run(host, f"ps -p {pid} -o lstart=", timeout=1)
+        if raw is not None:
+            value = raw.strip()
+            if value:
+                return value
+        time.sleep(0.05)
+    return None
+
+
+def _inspect_reservation_process(metadata: dict) -> dict:
+    """Return whether the original process is alive, gone, or unknown.
+
+    This is the central process-proof boundary. Tests may monkeypatch it with
+    precise fake process-table facts; production uses conservative ps/nvidia-smi
+    probes and treats missing identity as unknown rather than available.
+    """
+    pid = metadata.get("remote_pid")
+    host = metadata.get("host")
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return {
+            "status": "unknown",
+            "reason": "reservation has no recorded remote_pid; launch outcome is unknown",
+            "remote_pid": pid,
+        }
+    if not isinstance(host, str) or not _is_allowed_host(host):
+        return {
+            "status": "unknown",
+            "reason": "reservation host is not inspectable under active policy",
+            "remote_pid": pid,
+        }
+    ps_cmd = f"ps -p {pid} -o pid= -o user= -o stat= -o lstart="
+    ps_raw = _host_run(host, ps_cmd, timeout=2)
+    if ps_raw is None:
+        reason = _host_run_error(host, ps_cmd) or "process inspection failed"
+        return {"status": "unknown", "reason": reason, "remote_pid": pid}
+    if not ps_raw.strip():
+        return {"status": "gone", "reason": "process not found", "remote_pid": pid}
+    fields = ps_raw.split(None, 3)
+    if len(fields) < 4:
+        return {"status": "unknown", "reason": "malformed ps output", "remote_pid": pid}
+    _, owner, state, start_time = fields[:4]
+    if owner != metadata.get("owner_user"):
+        return {
+            "status": "gone",
+            "reason": "process owner mismatch; original process is gone",
+            "remote_pid": pid,
+        }
+    if "Z" in state:
+        return {"status": "gone", "reason": "process is zombie", "remote_pid": pid}
+    expected_start = metadata.get("remote_start_time")
+    if expected_start and start_time.strip() != str(expected_start).strip():
+        return {"status": "gone", "reason": "process start time mismatch", "remote_pid": pid}
+    expected_boot = metadata.get("remote_boot_id")
+    if expected_boot:
+        boot_raw = _host_run(host, "cat /proc/sys/kernel/random/boot_id", timeout=1)
+        if boot_raw is None:
+            return {"status": "unknown", "reason": "host boot id could not be inspected", "remote_pid": pid}
+        if boot_raw.strip() != str(expected_boot).strip():
+            return {"status": "gone", "reason": "host boot id mismatch", "remote_pid": pid}
+    expected_fingerprint = metadata.get("process_fingerprint")
+    if expected_fingerprint:
+        env_cmd = (
+            f"{shlex.quote(PYTHON)} -c "
+            + shlex.quote(
+                "import os,sys;"
+                "p=f'/proc/{}/environ'.format(sys.argv[1]);"
+                "data=open(p,'rb').read().split(b'\\0');"
+                "print(next((x.split(b'=',1)[1].decode() for x in data "
+                "if x.startswith(b'GPU_MCP_PROCESS_FINGERPRINT=')), ''))"
+            )
+            + f" {pid}"
+        )
+        observed_fingerprint = _host_run(host, env_cmd, timeout=1)
+        if observed_fingerprint is None:
+            reservation_key_value = metadata.get("reservation_key")
+            current_owner_start_match = (
+                metadata.get("server_instance_id") == SERVER_INSTANCE_ID
+                and reservations.is_reservation_key(reservation_key_value)
+                and str(reservation_key_value) in HEARTBEAT_MANAGER.owned_keys()
+                and bool(expected_start)
+            )
+            if current_owner_start_match:
+                gpu_index, gpu_memory = _process_gpu_usage(host, pid, timeout=1)
+                return {
+                    "status": "alive",
+                    "reason": "matching current-owner process exists; fingerprint env unreadable but start time matched",
+                    "remote_pid": pid,
+                    "gpu_index": gpu_index,
+                    "gpu_memory_mib": gpu_memory,
+                }
+            return {"status": "unknown", "reason": "process fingerprint could not be inspected", "remote_pid": pid}
+        if observed_fingerprint.strip() != str(expected_fingerprint):
+            return {"status": "gone", "reason": "process fingerprint mismatch", "remote_pid": pid}
+    gpu_index, gpu_memory = _process_gpu_usage(host, pid, timeout=1)
+    return {
+        "status": "alive",
+        "reason": "matching process exists",
+        "remote_pid": pid,
+        "gpu_index": gpu_index,
+        "gpu_memory_mib": gpu_memory,
+    }
+
+
+def _cleanup_stale_gone_reservation(reservation_key_value: str, metadata: dict) -> tuple[bool, dict]:
+    inspection = _inspect_reservation_process(metadata)
+    if inspection["status"] != "gone":
+        return False, inspection
+    registry_root = reservations.reservation_registry_root()
+    try:
+        with reservations.cleanup_finalization_guard(registry_root, reservation_key_value):
+            latest = _read_reservation_metadata(reservation_key_value)
+            if latest is None:
+                return False, {"status": "unknown", "reason": "reservation disappeared during cleanup"}
+            if not _metadata_stale(latest):
+                return False, {"status": "alive", "reason": "heartbeat refreshed during cleanup"}
+            if (
+                latest.get("job_id") != metadata.get("job_id")
+                or latest.get("remote_pid") != metadata.get("remote_pid")
+                or latest.get("server_instance_id") != metadata.get("server_instance_id")
+                or not _metadata_matches_reservation_key(reservation_key_value, latest)
+            ):
+                return False, {"status": "alive", "reason": "metadata changed during cleanup"}
+            target = reservations.quarantine_reservation(
+                registry_root=registry_root,
+                reservation_key_value=reservation_key_value,
+                suffix=reservations.utc_timestamp(),
+            )
+            return True, {
+                "status": "gone",
+                "reason": "stale reservation quarantined after process-gone proof",
+                "quarantine_path": str(target),
+            }
+    except FileNotFoundError:
+        return False, {"status": "gone", "reason": "reservation already gone"}
+
+
+def _refresh_stale_reservations(
+    rows: dict[str, dict],
+    *,
+    max_total: int = 5,
+    max_per_host: int = 2,
+) -> dict[str, dict]:
+    refreshed = dict(rows)
+    inspected_total = 0
+    inspected_by_host: dict[str, int] = {}
+    for key, row in list(rows.items()):
+        heartbeat = row.get("heartbeat") or {}
+        if not heartbeat.get("heartbeat_stale"):
+            continue
+        host = str(row.get("host") or "")
+        if inspected_total >= max_total or inspected_by_host.get(host, 0) >= max_per_host:
+            row = dict(row)
+            row["reservation_state"] = "UNKNOWN_RESERVED"
+            row["computed_state"] = "UNKNOWN_RESERVED"
+            row["last_inspection"] = {
+                "status": "skipped",
+                "reason": "stale inspection budget exhausted",
+            }
+            refreshed[key] = row
+            continue
+        metadata = _read_reservation_metadata(key)
+        if metadata is None:
+            refreshed[key] = _reservation_row_from_error(key, "metadata unavailable during stale refresh")
+            continue
+        if not _metadata_matches_reservation_key(key, metadata):
+            row = dict(row)
+            row["reservation_state"] = "UNKNOWN_RESERVED"
+            row["computed_state"] = "UNKNOWN_RESERVED"
+            row["last_inspection"] = {
+                "status": "unknown",
+                "reason": "metadata does not match reservation key",
+            }
+            refreshed[key] = row
+            continue
+        if not isinstance(metadata.get("remote_pid"), int):
+            row = dict(row)
+            row["reservation_state"] = "UNKNOWN_RESERVED"
+            row["computed_state"] = "UNKNOWN_RESERVED"
+            row["last_inspection"] = {
+                "status": "unknown",
+                "reason": "stale reservation has no recorded remote_pid",
+            }
+            refreshed[key] = row
+            continue
+        inspected_total += 1
+        inspected_by_host[host] = inspected_by_host.get(host, 0) + 1
+        cleaned, inspection = _cleanup_stale_gone_reservation(key, metadata)
+        if cleaned:
+            refreshed.pop(key, None)
+            continue
+        row = _reservation_row_from_metadata(metadata, key=key)
+        row["last_inspection"] = inspection
+        if inspection["status"] == "unknown":
+            row["reservation_state"] = "UNKNOWN_RESERVED"
+            row["computed_state"] = "UNKNOWN_RESERVED"
+        elif inspection["status"] == "alive":
+            row["reservation_state"] = "STALE_RESERVED"
+            row["computed_state"] = "STALE_RESERVED"
+        refreshed[key] = row
+    return refreshed
+
+
+def _empty_status_response(*, action: str, reason: str) -> str:
+    return _json_tool_response({
+        "status": "no_target" if action == "status" else "refused",
+        "action": action,
+        "reason": reason,
+        "job_id": None,
+        "reservation_key": None,
+        "reservation_state": None,
+        "job_lifecycle": None,
+        "owned_by_current_server": False,
+        "heartbeat": None,
+        "process": None,
+        "allowed_actions": ["status"],
+        "output": None,
+        "next_poll_after": None,
+        "server_instance_id": SERVER_INSTANCE_ID,
+    })
+
+
+def _read_repo_job_record(job_id: str) -> dict | None:
+    try:
+        record = reservations.read_json_file_no_follow(reservations.job_record_path(REPO_ROOT, job_id))
+    except Exception:
+        return None
+    return record if isinstance(record, dict) else None
+
+
+def _job_record_matches_current_metadata(record: dict, metadata: dict | None) -> bool:
+    if metadata is None:
+        return False
+    reservation_key_value = record.get("reservation_key")
+    return (
+        reservations.is_reservation_key(reservation_key_value)
+        and _metadata_matches_reservation_key(str(reservation_key_value), metadata)
+        and metadata.get("job_id") == record.get("job_id")
+        and metadata.get("attempt_id") == record.get("active_attempt_id")
+        and metadata.get("server_instance_id") == record.get("server_instance_id")
+    )
+
+
+def _read_outcome_record(job_record: dict) -> dict | None:
+    job_id = job_record.get("job_id")
+    attempt_id = job_record.get("active_attempt_id")
+    if not reservations.is_job_id(job_id) or not reservations.is_attempt_id(attempt_id):
+        return None
+    try:
+        outcome = reservations.read_json_file_no_follow(
+            reservations.outcome_record_path(REPO_ROOT, job_id, attempt_id)
+        )
+    except Exception:
+        return None
+    if not isinstance(outcome, dict):
+        return None
+    if outcome.get("job_id") != job_id or outcome.get("attempt_id") != attempt_id:
+        return None
+    if outcome.get("schema_version") != 1:
+        return None
+    if outcome.get("reservation_key") != job_record.get("reservation_key"):
+        return None
+    if outcome.get("host") != job_record.get("host"):
+        return None
+    if outcome.get("gpu_index") != job_record.get("gpu_index"):
+        return None
+    if (
+        job_record.get("remote_pid") is not None
+        and outcome.get("remote_pid") not in {None, job_record.get("remote_pid")}
+    ):
+        return None
+    if outcome.get("terminal_status") not in {"success", "failure", "signaled", "launcher_error"}:
+        return None
+    return outcome
+
+
+def _job_record_from_reservation_key(
+    reservation_key_value: str,
+    *,
+    metadata: dict | None = None,
+) -> dict | None:
+    jobs_root = reservations.repo_job_state_root(REPO_ROOT)
+    if not jobs_root.exists():
+        return None
+    expected_job_id = None if metadata is None else metadata.get("job_id")
+    expected_attempt_id = None if metadata is None else metadata.get("attempt_id")
+    expected_server_id = None if metadata is None else metadata.get("server_instance_id")
+    for job_file in sorted(jobs_root.glob("job-*/job.json")):
+        try:
+            record = reservations.read_json_file_no_follow(job_file)
+        except Exception:
+            continue
+        if not isinstance(record, dict) or record.get("reservation_key") != reservation_key_value:
+            continue
+        if expected_job_id is not None and record.get("job_id") != expected_job_id:
+            continue
+        if expected_attempt_id is not None and record.get("active_attempt_id") != expected_attempt_id:
+            continue
+        if expected_server_id is not None and record.get("server_instance_id") != expected_server_id:
+            continue
+        if record.get("reservation_key") == reservation_key_value:
+            return record
+    return None
+
+
+def _repo_reservation_candidates() -> list[dict]:
+    registry_status, _registry_error, rows = _load_reservation_rows(scope="mine")
+    if registry_status != "ok":
+        return []
+    return [rows[key] for key in sorted(rows)]
+
+
+def _resolve_job_target(job_id: str | None, reservation_key_value: str | None) -> tuple[dict | None, str, list[dict]]:
+    if job_id is not None:
+        record = _read_repo_job_record(job_id)
+        if record is not None and reservations.is_reservation_key(record.get("reservation_key")):
+            metadata = _read_reservation_metadata(str(record["reservation_key"]))
+            if not _job_record_matches_current_metadata(record, metadata):
+                record = dict(record)
+                record["active_reservation"] = False
+                record["reservation_identity_mismatch"] = True
+        return record, "job_id", []
+    if reservation_key_value is not None:
+        metadata = _read_reservation_metadata(reservation_key_value)
+        record = _job_record_from_reservation_key(reservation_key_value, metadata=metadata)
+        if record is not None:
+            return record, "reservation_key", []
+        if metadata is not None:
+            return {
+                "schema_version": 1,
+                "repo_local_record": False,
+                "job_id": metadata.get("job_id"),
+                "active_attempt_id": metadata.get("attempt_id"),
+                "reservation_key": reservation_key_value,
+                "host": metadata.get("host"),
+                "gpu_index": metadata.get("gpu_index"),
+                "script_name": metadata.get("script_name"),
+                "output_file": None,
+                "next_poll_after": None,
+                "remote_pid": metadata.get("remote_pid"),
+                "process_fingerprint": metadata.get("process_fingerprint"),
+            }, "reservation_key", []
+        return None, "reservation_key", []
+    candidates = _repo_reservation_candidates()
+    if len(candidates) == 1:
+        metadata = _read_reservation_metadata(str(candidates[0]["reservation_key"]))
+        record = _job_record_from_reservation_key(str(candidates[0]["reservation_key"]), metadata=metadata)
+        if record is not None:
+            return record, "single_repo_reservation", []
+        if metadata is not None:
+            return {
+                "schema_version": 1,
+                "repo_local_record": False,
+                "job_id": metadata.get("job_id"),
+                "active_attempt_id": metadata.get("attempt_id"),
+                "reservation_key": metadata.get("reservation_key"),
+                "host": metadata.get("host"),
+                "gpu_index": metadata.get("gpu_index"),
+                "script_name": metadata.get("script_name"),
+                "output_file": None,
+                "next_poll_after": None,
+                "remote_pid": metadata.get("remote_pid"),
+                "process_fingerprint": metadata.get("process_fingerprint"),
+            }, "single_repo_reservation", []
+    if len(candidates) > 1:
+        return None, "ambiguous", candidates
+    return None, "none", []
+
+
+def _read_current_job_metadata(job_record: dict) -> tuple[dict | None, str]:
+    reservation_key_value = job_record.get("reservation_key")
+    if not reservations.is_reservation_key(reservation_key_value):
+        return None, "job record has invalid reservation_key"
+    metadata = _read_reservation_metadata(str(reservation_key_value))
+    if metadata is None:
+        return None, "reservation metadata is unavailable"
+    if not _metadata_matches_reservation_key(str(reservation_key_value), metadata):
+        return None, "reservation metadata does not match reservation_key"
+    if metadata.get("job_id") != job_record.get("job_id"):
+        return None, "reservation metadata belongs to a different job"
+    if metadata.get("attempt_id") != job_record.get("active_attempt_id"):
+        return None, "reservation metadata belongs to a different attempt"
+    return metadata, ""
+
+
+def _owned_lifecycle_metadata(job_record: dict) -> tuple[dict | None, str]:
+    metadata, reason = _read_current_job_metadata(job_record)
+    if metadata is None:
+        return None, reason
+    reservation_key_value = str(metadata["reservation_key"])
+    if metadata.get("server_instance_id") != SERVER_INSTANCE_ID:
+        return None, "only the server that owns this reservation may change the job"
+    if reservation_key_value not in HEARTBEAT_MANAGER.owned_keys():
+        return None, "current server is not heartbeating this reservation"
+    return metadata, ""
+
+
+def _write_repo_job_record(job_record: dict) -> None:
+    job_id = job_record.get("job_id")
+    if not reservations.is_job_id(job_id):
+        raise ValueError("job record has invalid job_id")
+    reservations.atomic_write_json(
+        reservations.job_record_path(REPO_ROOT, str(job_id)),
+        job_record,
+    )
+
+
+def _signal_managed_process(metadata: dict, *, signal_name: str = "TERM") -> tuple[bool, str]:
+    pid = metadata.get("remote_pid")
+    host = metadata.get("host")
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False, "reservation has no positive remote_pid to signal"
+    if not isinstance(host, str) or not _is_allowed_host(host):
+        return False, "reservation host is not signalable under active policy"
+    try:
+        normalized, signal_number = _normalize_kill_signal(signal_name)
+    except ValueError as exc:
+        return False, str(exc)
+    result = _host_run(host, f"kill -{signal_number} {pid}", timeout=2)
+    if result is None:
+        return False, _host_run_error(host, f"kill -{signal_number} {pid}") or "signal command failed"
+    return True, normalized
+
+
+def _owned_lifecycle_refusal(action: str, job_record: dict, reason: str, *, process: dict | None = None) -> str:
+    reservation_key_value = job_record.get("reservation_key")
+    owned = (
+        reservations.is_reservation_key(reservation_key_value)
+        and str(reservation_key_value) in HEARTBEAT_MANAGER.owned_keys()
+    )
+    healthy = HEARTBEAT_MANAGER.is_healthy()
+    return _json_tool_response({
+        "status": "refused",
+        "action": action,
+        "reason": reason,
+        "job_id": job_record.get("job_id"),
+        "attempt_id": job_record.get("active_attempt_id"),
+        "reservation_key": job_record.get("reservation_key"),
+        "owned_by_current_server": owned,
+        "heartbeat_manager_healthy": healthy,
+        "heartbeat_manager_reason": HEARTBEAT_MANAGER.health_reason(),
+        "process": process,
+        "allowed_actions": ["status", "stop", "retry", "finish"] if owned and healthy else ["status"],
+        "server_instance_id": SERVER_INSTANCE_ID,
+    })
+
+
+def _outcome_base(
+    *,
+    job_id: str,
+    attempt_id: str,
+    reservation_key_value: str,
+    host: str,
+    gpu_index: int,
+) -> dict:
+    return {
+        "schema_version": 1,
+        "job_id": job_id,
+        "attempt_id": attempt_id,
+        "reservation_key": reservation_key_value,
+        "host": host,
+        "gpu_index": gpu_index,
+        "remote_pid": None,
+        "terminal_status": "launcher_error",
+        "exit_code": None,
+        "signal": None,
+        "started_at": None,
+        "ended_at": None,
+        "error_summary": None,
+    }
+
+
+def _metadata_still_matches_retry_source(latest: dict, source: dict) -> bool:
+    return (
+        latest.get("job_id") == source.get("job_id")
+        and latest.get("attempt_id") == source.get("attempt_id")
+        and latest.get("reservation_key") == source.get("reservation_key")
+        and latest.get("server_instance_id") == source.get("server_instance_id")
+        and latest.get("remote_pid") == source.get("remote_pid")
+        and _metadata_matches_reservation_key(str(source.get("reservation_key")), latest)
+    )
+
+
+def _metadata_path_for_key(registry_root: Path, reservation_key_value: str) -> Path:
+    return reservations.reservation_dir(registry_root, reservation_key_value) / "metadata.json"
+
+
+def _claim_retry_attempt(
+    *,
+    source_record: dict,
+    source_metadata: dict,
+    pending_record: dict,
+    attempt_id: str,
+) -> tuple[bool, str]:
+    reservation_key_value = str(source_metadata["reservation_key"])
+    registry_root = reservations.reservation_registry_root()
+    metadata_path = _metadata_path_for_key(registry_root, reservation_key_value)
+    with reservations.cleanup_finalization_guard(registry_root, reservation_key_value):
+        latest = _read_reservation_metadata(reservation_key_value)
+        if latest is None:
+            return False, "reservation disappeared before retry launch"
+        if not _metadata_still_matches_retry_source(latest, source_metadata):
+            return False, "reservation changed before retry launch; retry was not started"
+        updated_metadata = dict(latest)
+        updated_metadata.update({
+            "attempt_id": attempt_id,
+            "remote_pid": None,
+            "process_fingerprint": None,
+            "last_heartbeat_at": reservations.iso_timestamp(),
+        })
+        try:
+            _write_repo_job_record(pending_record)
+            reservations.atomic_write_json(metadata_path, updated_metadata)
+        except Exception as exc:
+            try:
+                _write_repo_job_record(source_record)
+            except Exception:
+                pass
+            return False, f"failed to claim retry attempt: {exc}"
+    return True, ""
+
+
+def _rollback_retry_claim(
+    *,
+    source_record: dict,
+    source_metadata: dict,
+    attempt_id: str,
+) -> None:
+    reservation_key_value = str(source_metadata["reservation_key"])
+    registry_root = reservations.reservation_registry_root()
+    metadata_path = _metadata_path_for_key(registry_root, reservation_key_value)
+    try:
+        with reservations.cleanup_finalization_guard(registry_root, reservation_key_value):
+            latest = _read_reservation_metadata(reservation_key_value)
+            if latest is None:
+                return
+            if (
+                latest.get("job_id") != source_metadata.get("job_id")
+                or latest.get("attempt_id") != attempt_id
+                or latest.get("server_instance_id") != source_metadata.get("server_instance_id")
+                or latest.get("remote_pid") is not None
+            ):
+                return
+            _write_repo_job_record(source_record)
+            restored = dict(source_metadata)
+            restored["last_heartbeat_at"] = reservations.iso_timestamp()
+            reservations.atomic_write_json(metadata_path, restored)
+    except Exception:
+        return
+
+
+def _finalize_retry_attempt(
+    *,
+    pending_record: dict,
+    source_metadata: dict,
+    attempt_id: str,
+    remote_pid: int,
+    process_fingerprint: str,
+    remote_start_time: str | None,
+    launch_mode: str,
+) -> tuple[bool, str]:
+    reservation_key_value = str(source_metadata["reservation_key"])
+    registry_root = reservations.reservation_registry_root()
+    metadata_path = _metadata_path_for_key(registry_root, reservation_key_value)
+    with reservations.cleanup_finalization_guard(registry_root, reservation_key_value):
+        latest = _read_reservation_metadata(reservation_key_value)
+        if latest is None:
+            return False, "reservation disappeared after retry launch"
+        if (
+            latest.get("job_id") != source_metadata.get("job_id")
+            or latest.get("attempt_id") != attempt_id
+            or latest.get("server_instance_id") != source_metadata.get("server_instance_id")
+            or latest.get("remote_pid") is not None
+            or not _metadata_matches_reservation_key(reservation_key_value, latest)
+        ):
+            return False, "reservation changed after retry launch"
+        launched_record = dict(pending_record)
+        launched_record.update({
+            "remote_pid": remote_pid,
+            "remote_start_time": remote_start_time,
+            "process_fingerprint": process_fingerprint,
+            "launch_mode": launch_mode,
+        })
+        latest.update({
+            "remote_pid": remote_pid,
+            "remote_start_time": remote_start_time,
+            "process_fingerprint": process_fingerprint,
+            "last_heartbeat_at": reservations.iso_timestamp(),
+        })
+        _write_repo_job_record(launched_record)
+        reservations.atomic_write_json(metadata_path, latest)
+    return True, ""
+
+
+def _read_retry_pid_ack(pid_ack_path: Path, *, attempts: int = 10) -> int | None:
+    for _ in range(attempts):
+        try:
+            ack = reservations.read_json_file_no_follow(pid_ack_path)
+        except Exception:
+            time.sleep(0.05)
+            continue
+        if isinstance(ack, dict):
+            pid = ack.get("remote_pid")
+            if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0:
+                return pid
+        return None
+    return None
+
+
+def _positive_pid_from_text(value: object) -> int | None:
+    if not isinstance(value, str):
+        return None
+    for line in reversed(value.strip().splitlines()):
+        text = line.strip()
+        if text.isdigit() and int(text) > 0:
+            return int(text)
+    return None
+
+
+def _start_managed_attempt(
+    *,
+    job_record: dict,
+    metadata: dict,
+    attempt_id: str,
+    output_path: Path,
+    next_poll_after: str,
+    async_mode_requested: bool,
+) -> str:
+    job_id = str(job_record["job_id"])
+    reservation_key_value = str(metadata["reservation_key"])
+    host = str(metadata["host"])
+    gpu_index = int(metadata["gpu_index"])
+    argv = _build_python_gpu_argv(
+        str(job_record["script_path"]),
+        args=[str(arg) for arg in job_record.get("args", [])],
+        execution_host=host,
+    )
+    job_env = _gpu_job_env(gpu_index)
+    process_nonce = secrets.token_urlsafe(18)
+    process_fingerprint = _managed_process_fingerprint(job_id, attempt_id, host, process_nonce)
+    job_env["GPU_MCP_PROCESS_FINGERPRINT"] = process_fingerprint
+    outcome_path = reservations.outcome_record_path(REPO_ROOT, job_id, attempt_id)
+    outcome_base = _outcome_base(
+        job_id=job_id,
+        attempt_id=attempt_id,
+        reservation_key_value=reservation_key_value,
+        host=host,
+        gpu_index=gpu_index,
+    )
+
+    pending_record = dict(job_record)
+    pending_record.update({
+        "active_attempt_id": attempt_id,
+        "next_poll_after": next_poll_after,
+        "last_status_checked_at": None,
+        "remote_pid": None,
+        "process_fingerprint": None,
+        "outcome_file": str(outcome_path),
+        "retry_started_at": reservations.iso_timestamp(),
+    })
+    claimed, claim_reason = _claim_retry_attempt(
+        source_record=job_record,
+        source_metadata=metadata,
+        pending_record=pending_record,
+        attempt_id=attempt_id,
+    )
+    if not claimed:
+        return _launch_handle_response(
+            status="refused",
+            reason=claim_reason,
+            job_id=job_id,
+            attempt_id=attempt_id,
+            reservation_key_value=reservation_key_value,
+            host=host,
+            gpu_index=gpu_index,
+            output_path=output_path,
+            next_poll_after=next_poll_after,
+            job_lifecycle="retry_not_started",
+            launch="none",
+            async_mode_requested=async_mode_requested,
+        )
+
+    if _is_local_host(host):
+        try:
+            env = os.environ.copy()
+            env.update(job_env)
+            supervisor_argv = _managed_supervisor_argv(
+                argv,
+                output_path,
+                job_env,
+                outcome_path,
+                outcome_base,
+            )
+            proc = subprocess.Popen(
+                supervisor_argv,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=env,
+                cwd=str(REPO_ROOT),
+                start_new_session=True,
+            )
+        except Exception as exc:
+            _rollback_retry_claim(
+                source_record=job_record,
+                source_metadata=metadata,
+                attempt_id=attempt_id,
+            )
+            return _launch_handle_response(
+                status="refused",
+                reason=f"Failed to relaunch local GPU job on {host}: {exc}",
+                job_id=job_id,
+                attempt_id=attempt_id,
+                reservation_key_value=reservation_key_value,
+                host=host,
+                gpu_index=gpu_index,
+                output_path=output_path,
+                next_poll_after=next_poll_after,
+                job_lifecycle="retry_launch_failed",
+                launch="local",
+                async_mode_requested=async_mode_requested,
+            )
+        pid_value = str(proc.pid)
+        launch_mode = "local"
+        remote_start_time = _process_start_time(host, int(pid_value))
+    else:
+        pid_ack_path = outcome_path.parent / "launcher_pid.json"
+        launch_cmd = _remote_async_launch_command(
+            argv,
+            output_path,
+            job_env,
+            outcome_path,
+            outcome_base,
+            pid_ack_path=pid_ack_path,
+        )
+        bg_cmd = _remote_repo_command(launch_cmd)
+        pid_str = _ssh_run(host, bg_cmd)
+        acknowledged_pid = _positive_pid_from_text(pid_str)
+        if acknowledged_pid is None:
+            acknowledged_pid = _read_retry_pid_ack(pid_ack_path)
+        if acknowledged_pid is None:
+            if pid_ack_path.exists():
+                return _launch_handle_response(
+                    status="launch_outcome_unknown",
+                    reason=(
+                        f"SSH retry did not return a usable PID from {host}, "
+                        "but the launcher acknowledgement file exists; reservation kept fail-closed"
+                    ),
+                    job_id=job_id,
+                    attempt_id=attempt_id,
+                    reservation_key_value=reservation_key_value,
+                    host=host,
+                    gpu_index=gpu_index,
+                    output_path=output_path,
+                    next_poll_after=next_poll_after,
+                    job_lifecycle="launch_outcome_unknown",
+                    launch="ssh",
+                    async_mode_requested=async_mode_requested,
+                )
+            return _launch_handle_response(
+                status="launch_outcome_unknown",
+                reason=(
+                    f"SSH retry did not return a PID acknowledgement from {host}; "
+                    "reservation kept fail-closed because the retry launch outcome is unknown"
+                ),
+                job_id=job_id,
+                attempt_id=attempt_id,
+                reservation_key_value=reservation_key_value,
+                host=host,
+                gpu_index=gpu_index,
+                output_path=output_path,
+                next_poll_after=next_poll_after,
+                job_lifecycle="launch_outcome_unknown",
+                launch="ssh",
+                async_mode_requested=async_mode_requested,
+            )
+        pid_value = str(acknowledged_pid)
+        launch_mode = "ssh"
+        remote_start_time = None
+
+    finalized, finalize_reason = _finalize_retry_attempt(
+        pending_record=pending_record,
+        source_metadata=metadata,
+        attempt_id=attempt_id,
+        remote_pid=int(pid_value),
+        process_fingerprint=process_fingerprint,
+        remote_start_time=remote_start_time,
+        launch_mode=launch_mode,
+    )
+    if not finalized:
+        return _launch_handle_response(
+            status="launched_with_warning",
+            reason=finalize_reason,
+            job_id=job_id,
+            attempt_id=attempt_id,
+            reservation_key_value=reservation_key_value,
+            host=host,
+            gpu_index=gpu_index,
+            output_path=output_path,
+            next_poll_after=next_poll_after,
+            job_lifecycle="running",
+            launch=launch_mode,
+            async_mode_requested=async_mode_requested,
+            process={
+                "remote_pid": int(pid_value),
+                "remote_start_time": remote_start_time,
+                "remote_boot_id": None,
+                "process_fingerprint": process_fingerprint,
+            },
+        )
+    return _launch_handle_response(
+        status="retried",
+        reason="",
+        job_id=job_id,
+        attempt_id=attempt_id,
+        reservation_key_value=reservation_key_value,
+        host=host,
+        gpu_index=gpu_index,
+        output_path=output_path,
+        next_poll_after=next_poll_after,
+        job_lifecycle="running",
+        launch=launch_mode,
+        async_mode_requested=async_mode_requested,
+        process={
+            "remote_pid": int(pid_value),
+            "remote_start_time": remote_start_time,
+            "remote_boot_id": None,
+            "process_fingerprint": process_fingerprint,
+        },
+    )
+
+
+def _remove_owned_finished_reservation(job_record: dict, metadata: dict) -> tuple[bool, str]:
+    reservation_key_value = str(metadata["reservation_key"])
+    registry_root = reservations.reservation_registry_root()
+    with reservations.cleanup_finalization_guard(registry_root, reservation_key_value):
+        latest = _read_reservation_metadata(reservation_key_value)
+        if latest is None:
+            return False, "reservation disappeared during finish"
+        if latest.get("server_instance_id") != SERVER_INSTANCE_ID:
+            return False, "reservation owner changed during finish"
+        if (
+            latest.get("job_id") != job_record.get("job_id")
+            or latest.get("attempt_id") != job_record.get("active_attempt_id")
+            or latest.get("remote_pid") != metadata.get("remote_pid")
+            or not _metadata_matches_reservation_key(reservation_key_value, latest)
+        ):
+            return False, "reservation metadata changed during finish"
+        reservations.remove_reservation_if_launch_failed(
+            registry_root=registry_root,
+            reservation_key_value=reservation_key_value,
+        )
+        return True, ""
+
+
+def _stop_owned_job(action: str, job_record: dict) -> str:
+    metadata, reason = _owned_lifecycle_metadata(job_record)
+    if metadata is None:
+        return _owned_lifecycle_refusal(action, job_record, reason)
+    inspection = _inspect_reservation_process(metadata)
+    if inspection["status"] == "unknown":
+        return _owned_lifecycle_refusal(
+            action,
+            job_record,
+            "cannot prove the original process identity; stop refused fail-closed",
+            process=inspection,
+        )
+    if inspection["status"] == "gone":
+        response = json.loads(_job_status_response(action="status", job_record=job_record))
+        response.update({
+            "status": "stop_not_needed",
+            "action": "stop",
+            "reason": "matching process is already gone; reservation remains until retry or finish",
+            "process": inspection,
+        })
+        return _json_tool_response(response)
+    ok, signal_or_reason = _signal_managed_process(metadata, signal_name="TERM")
+    if not ok:
+        return _owned_lifecycle_refusal(
+            action,
+            job_record,
+            f"failed to signal managed process: {signal_or_reason}",
+            process=inspection,
+        )
+    now = reservations.iso_timestamp()
+    updated = dict(job_record)
+    updated["stop_requested_at"] = now
+    _write_repo_job_record(updated)
+    HEARTBEAT_MANAGER.update_owned_metadata(str(metadata["reservation_key"]), {
+        "stop_requested_at": now,
+        "last_heartbeat_at": now,
+    })
+    response = json.loads(_job_status_response(action="status", job_record=updated))
+    response.update({
+        "status": "stop_requested",
+        "action": "stop",
+        "reason": "TERM sent to the managed launcher; reservation remains held until retry or finish",
+        "job_lifecycle": "stopping",
+        "process": dict(inspection, signal_sent=signal_or_reason),
+    })
+    return _json_tool_response(response)
+
+
+def _retry_owned_job(job_record: dict) -> str:
+    metadata, reason = _owned_lifecycle_metadata(job_record)
+    if metadata is None:
+        return _owned_lifecycle_refusal("retry", job_record, reason)
+    inspection = _inspect_reservation_process(metadata)
+    if inspection["status"] == "alive":
+        return _owned_lifecycle_refusal(
+            "retry",
+            job_record,
+            (
+                "retry would create a second process on the same reserved GPU; "
+                "keep checking status or explicitly stop the live attempt first"
+            ),
+            process=inspection,
+        )
+    if inspection["status"] == "unknown":
+        return _owned_lifecycle_refusal(
+            "retry",
+            job_record,
+            (
+                "retry would create a second process on the same reserved GPU unless "
+                "the previous attempt is proven gone; cannot prove the previous "
+                "attempt is gone, so retry is refused fail-closed"
+            ),
+            process=inspection,
+        )
+    output_file = job_record.get("output_file")
+    try:
+        out_path = _validate_output_path(None if output_file is None else str(output_file))
+        _prepare_output_parent(out_path)
+    except ValueError as exc:
+        return _owned_lifecycle_refusal("retry", job_record, str(exc), process=inspection)
+    attempt_id = reservations.generate_attempt_id()
+    next_poll_after = _next_poll_after(reservations.DEFAULT_HEARTBEAT_INTERVAL_SEC)
+    return _start_managed_attempt(
+        job_record=job_record,
+        metadata=metadata,
+        attempt_id=attempt_id,
+        output_path=out_path,
+        next_poll_after=next_poll_after,
+        async_mode_requested=False,
+    )
+
+
+def _finish_owned_job(job_record: dict) -> str:
+    metadata, reason = _owned_lifecycle_metadata(job_record)
+    if metadata is None:
+        return _owned_lifecycle_refusal("finish", job_record, reason)
+    reservation_key_value = str(metadata["reservation_key"])
+    inspection = _inspect_reservation_process(metadata)
+    if inspection["status"] == "gone":
+        HEARTBEAT_MANAGER.unregister(reservation_key_value)
+        removed, remove_reason = _remove_owned_finished_reservation(job_record, metadata)
+        response = json.loads(_job_status_response(action="status", job_record=job_record))
+        response.update({
+            "status": "finished" if removed else "refused",
+            "action": "finish",
+            "reason": remove_reason or "reservation removed after process-gone proof",
+            "reservation_state": None if removed else response.get("reservation_state"),
+            "job_lifecycle": "finished" if removed else response.get("job_lifecycle"),
+            "owned_by_current_server": False,
+            "allowed_actions": ["status"],
+            "process": inspection,
+            "next_poll_after": None if removed else response.get("next_poll_after"),
+        })
+        return _json_tool_response(response)
+    if inspection["status"] == "alive":
+        return _owned_lifecycle_refusal(
+            "finish",
+            job_record,
+            (
+                "finish refused because the matching process is still alive; call "
+                "stop first if you intend to terminate this job, or keep polling "
+                "status if you intend to wait; call finish only after status proves "
+                "the process is gone"
+            ),
+            process=inspection,
+        )
+    return _owned_lifecycle_refusal(
+        "finish",
+        job_record,
+        (
+            "finish refused because the matching process is not proven gone; keep "
+            "polling status or call stop first if you intend to terminate this job, "
+            "then call finish only after the process is gone"
+        ),
+        process=inspection,
+    )
+
+
+def _job_status_response(*, action: str, job_record: dict, reason: str = "") -> str:
+    reservation_key_value = job_record.get("reservation_key")
+    reservation = None
+    active_reservation = job_record.get("active_reservation", True) is not False
+    if active_reservation and reservations.is_reservation_key(reservation_key_value):
+        _, _, rows = _load_reservation_rows(scope="all")
+        reservation = rows.get(str(reservation_key_value))
+    owned = bool(reservation and reservation.get("owned_by_current_server"))
+    healthy = HEARTBEAT_MANAGER.is_healthy()
+    allowed_actions = (
+        ["status", "stop", "retry", "finish"]
+        if owned and healthy
+        else ["status"]
+    )
+    process = {
+        "remote_pid": job_record.get("remote_pid"),
+        "process_fingerprint": job_record.get("process_fingerprint"),
+    }
+    job_lifecycle = "running"
+    outcome = None
+    if not active_reservation:
+        outcome = _read_outcome_record(job_record)
+        if outcome is None:
+            job_lifecycle = "process_gone_unknown_outcome"
+        else:
+            terminal = outcome["terminal_status"]
+            job_lifecycle = "succeeded" if terminal == "success" else "failed"
+    if reservation is not None:
+        metadata = _read_reservation_metadata(str(reservation_key_value))
+        if metadata is not None and isinstance(metadata.get("remote_pid"), int):
+            inspection = _inspect_reservation_process(metadata)
+            process.update(inspection)
+            if inspection["status"] == "gone":
+                outcome = _read_outcome_record(job_record)
+                if outcome is None:
+                    job_lifecycle = "process_gone_unknown_outcome"
+                else:
+                    terminal = outcome["terminal_status"]
+                    job_lifecycle = "succeeded" if terminal == "success" else "failed"
+    return_next_poll_after = job_record.get("next_poll_after")
+    if (
+        job_lifecycle == "running"
+        and active_reservation
+        and job_record.get("repo_local_record", True)
+        and reservations.is_job_id(job_record.get("job_id"))
+    ):
+        return_next_poll_after = _next_poll_after(reservations.DEFAULT_HEARTBEAT_INTERVAL_SEC)
+        updated = dict(job_record)
+        updated["next_poll_after"] = return_next_poll_after
+        updated["last_status_checked_at"] = reservations.iso_timestamp()
+        try:
+            reservations.atomic_write_json(
+                reservations.job_record_path(REPO_ROOT, str(job_record["job_id"])),
+                updated,
+            )
+        except Exception:
+            pass
+    return _json_tool_response({
+        "status": "ok" if action == "status" else "refused",
+        "action": action,
+        "reason": reason,
+        "job_id": job_record.get("job_id"),
+        "attempt_id": job_record.get("active_attempt_id"),
+        "reservation_key": reservation_key_value,
+        "active_reservation": active_reservation,
+        "reservation_identity_mismatch": bool(job_record.get("reservation_identity_mismatch")),
+        "reservation_state": None if reservation is None else reservation.get("reservation_state"),
+        "job_lifecycle": job_lifecycle,
+        "outcome": outcome,
+        "owned_by_current_server": owned,
+        "heartbeat": None if reservation is None else reservation.get("heartbeat"),
+        "heartbeat_manager_healthy": healthy,
+        "heartbeat_manager_reason": HEARTBEAT_MANAGER.health_reason(),
+        "process": process,
+        "allowed_actions": allowed_actions,
+        "output": {
+            "path": job_record.get("output_file"),
+        },
+        "next_poll_after": None if job_lifecycle in {"succeeded", "failed"} else return_next_poll_after,
+        "agent_guidance": (
+            "Do not use output-dependent results until status is terminal; independent work may continue."
+            if job_lifecycle == "running"
+            else "Terminal status reached; outputs may be inspected."
+        ),
+        "server_instance_id": SERVER_INSTANCE_ID,
+    })
 
 
 # ── MCP Server ───────────────────────────────────────────────────────────────
@@ -910,36 +2580,36 @@ def check_gpus(
     samples: int = 2,
     threshold: int = 10,
 ):
-    """Check GPU availability across the cluster.
-
-    SSHes to configured nodes, takes multiple nvidia-smi samples, averages
-    utilization, applies repo policy GPU-name/free-memory filters, and reports
-    AVAILABLE/BUSY.
+    """Check GPU availability across the cluster with reservation overlay.
 
     Args:
         samples: Number of utilization samples to average (default 2).
         threshold: GPU utilization % at or below which a GPU is marked AVAILABLE (default 10).
 
     Returns:
-        Formatted report of GPU status across the cluster.
+        JSON report with per-GPU availability and registry status.
     """
+    _apply_test_controls_from_file()
     if stale := _stale_policy_refusal():
         return stale
     if not isinstance(samples, int) or isinstance(samples, bool) or samples < 1:
-        return "ERROR: samples must be a positive integer"
+        return _json_tool_response({"status": "refused", "reason": "samples must be a positive integer"})
     if not isinstance(threshold, int) or isinstance(threshold, bool) or threshold < 0:
-        return "ERROR: threshold must be a non-negative integer"
+        return _json_tool_response({"status": "refused", "reason": "threshold must be a non-negative integer"})
+    registry_status, registry_error, reservation_rows = _load_reservation_rows(scope="all")
+    if registry_status == "ok":
+        reservation_rows = _refresh_stale_reservations(reservation_rows)
     query = (
         "nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total "
         "--format=csv,noheader,nounits"
     )
-    lines = [
-        f"==> Starting GPU check: {samples} samples, threshold <= {threshold}%"
-    ]
+    gpu_rows: list[dict] = []
+    human_lines = [f"==> Starting GPU check: {samples} samples, threshold <= {threshold}%"]
     remote_successes = 0
 
     for node in NODES:
         user, host = _node_user_host(node)
+        canonical_host = reservations.canonical_host_component(host)
         short_host = host.split(".", 1)[0]
         local_host = _is_local_host(host)
         route = "local" if local_host else "ssh"
@@ -955,11 +2625,11 @@ def check_gpus(
             if samples > 1:
                 time.sleep(1)
 
-        lines.append(f"[{short_host} {route}]")
+        human_lines.append(f"[{short_host} {route}]")
         if failed or not sample_sets:
             reason = _host_run_error("local" if local_host else host, query)
             suffix = f": {reason}" if reason else ""
-            lines.append(f"  ssh/nvidia-smi failed{suffix}")
+            human_lines.append(f"  ssh/nvidia-smi failed{suffix}")
             continue
         if not local_host:
             remote_successes += 1
@@ -981,31 +2651,61 @@ def check_gpus(
                 if last["memory_total_MiB"] is not None and last["memory_used_MiB"] is not None
                 else None
             )
-            status = (
-                "AVAILABLE"
-                if avg_util is not None
+            key = reservations.reservation_key(canonical_host, int(last["index"]))
+            reservation = reservation_rows.get(key)
+            nvsmi_available = (
+                avg_util is not None
                 and avg_util <= threshold
                 and (mem_free is None or mem_free >= CONFIG_POLICY.min_free_memory_mib)
-                else "BUSY"
             )
+            if registry_status != "ok":
+                availability = "unknown_unavailable"
+                reservation_state = None
+            elif reservation is not None:
+                availability = "reserved"
+                reservation_state = reservation.get("reservation_state") or "RESERVED"
+            else:
+                availability = "available" if nvsmi_available else "busy"
+                reservation_state = None
             mem_text = (
                 f"{last['memory_used_MiB']}/{last['memory_total_MiB']} MiB"
                 if last["memory_total_MiB"] is not None
                 else f"{last['memory_used_MiB']} MiB"
             )
             util_text = f"{avg_util:.1f}%" if avg_util is not None else "N/A"
-            lines.append(
+            human_lines.append(
                 f"  GPU {last['index']} | {last['name']} | util_avg={util_text} | "
-                f"mem={mem_text} | {status}"
+                f"mem={mem_text} | {availability.upper()}"
             )
+            gpu_rows.append({
+                "host": canonical_host,
+                "gpu_index": int(last["index"]),
+                "name": last["name"],
+                "utilization_avg_pct": avg_util,
+                "memory_used_MiB": last["memory_used_MiB"],
+                "memory_total_MiB": last["memory_total_MiB"],
+                "memory_free_MiB": mem_free,
+                "availability": availability,
+                "reservation_key": key,
+                "reservation_state": reservation_state,
+                "reservation": reservation,
+            })
 
     if remote_successes == 0:
-        lines.append(
+        human_lines.append(
             "WARNING: no non-local SSH GPU host succeeded; remote MCP SSH "
             "routing is not installed from this control host."
         )
 
-    return "\n".join(lines) if len(lines) > 1 else "(no configured GPU nodes available)"
+    return _json_tool_response({
+        "status": "ok" if registry_status == "ok" else "error",
+        "registry_status": registry_status,
+        "registry_error": registry_error,
+        "samples": samples,
+        "threshold": threshold,
+        "gpus": gpu_rows,
+        "human_report": "\n".join(human_lines) if len(human_lines) > 1 else "(no configured GPU nodes available)",
+    })
 
 
 @mcp.tool()
@@ -1134,6 +2834,7 @@ def kill_gpu_process(
     Returns:
         Compact JSON describing the inspected target and whether a signal was sent.
     """
+    _apply_test_controls_from_file()
     if stale := _stale_policy_refusal():
         return stale
     if isinstance(pid, bool):
@@ -1245,6 +2946,138 @@ def kill_gpu_process(
 
 
 @mcp.tool()
+def manage_gpu_job(
+    action: str = "status",
+    job_id: Optional[str] = None,
+    reservation_key: Optional[str] = None,
+):
+    """Inspect or change a managed GPU job.
+
+    Phase 0 exposes the stable JSON contract and target-validation surface.
+    Reservation acquisition, status recovery, stop, retry, and finish behavior
+    are implemented in later ADR 0004 phases.
+    """
+    _apply_test_controls_from_file()
+    if stale := _stale_policy_refusal():
+        return stale
+    if not isinstance(action, str):
+        return _json_tool_response({
+            "status": "refused",
+            "reason": "action must be a string",
+            "allowed_actions": ["status", "stop", "retry", "finish"],
+        })
+    normalized_action = action.strip().lower()
+    if normalized_action not in {"status", "stop", "retry", "finish"}:
+        return _json_tool_response({
+            "status": "refused",
+            "action": normalized_action,
+            "reason": "action must be one of: status, stop, retry, finish",
+            "allowed_actions": ["status", "stop", "retry", "finish"],
+            "server_instance_id": SERVER_INSTANCE_ID,
+        })
+    if job_id is not None and not reservations.is_job_id(job_id):
+        return _json_tool_response({
+            "status": "refused",
+            "action": normalized_action,
+            "reason": "job_id has invalid format",
+            "job_id": job_id,
+            "reservation_key": reservation_key,
+            "server_instance_id": SERVER_INSTANCE_ID,
+        })
+    if reservation_key is not None and not reservations.is_reservation_key(reservation_key):
+        return _json_tool_response({
+            "status": "refused",
+            "action": normalized_action,
+            "reason": "reservation_key must match <canonical-host>.gpu<gpu-index>",
+            "job_id": job_id,
+            "reservation_key": reservation_key,
+            "server_instance_id": SERVER_INSTANCE_ID,
+        })
+    if normalized_action in {"stop", "retry", "finish"} and not HEARTBEAT_MANAGER.is_healthy():
+        return _json_tool_response({
+            "status": "refused",
+            "action": normalized_action,
+            "reason": "heartbeat manager is unhealthy; owner-side lifecycle actions are unsafe",
+            "job_id": job_id,
+            "reservation_key": reservation_key,
+            "heartbeat_manager_healthy": False,
+            "heartbeat_manager_reason": HEARTBEAT_MANAGER.health_reason(),
+            "server_instance_id": SERVER_INSTANCE_ID,
+        })
+    job_record, resolved_by, candidates = _resolve_job_target(job_id, reservation_key)
+    if candidates:
+        return _json_tool_response({
+            "status": "ambiguous_target",
+            "action": normalized_action,
+            "reason": "multiple current-repo reservations match; choose a job_id or reservation_key",
+            "resolved_by": resolved_by,
+            "candidates": candidates,
+            "server_instance_id": SERVER_INSTANCE_ID,
+        })
+    if job_record is not None:
+        if normalized_action == "stop":
+            return _stop_owned_job(normalized_action, job_record)
+        if normalized_action == "retry":
+            return _retry_owned_job(job_record)
+        if normalized_action == "finish":
+            return _finish_owned_job(job_record)
+        return _job_status_response(
+            action=normalized_action,
+            job_record=job_record,
+            reason="",
+        )
+    return _empty_status_response(
+        action=normalized_action,
+        reason="no managed GPU job matched the requested target",
+    )
+
+
+@mcp.tool()
+def list_gpu_reservations(scope: str = "mine", fresh: bool = False):
+    """List active GPU reservations for recovery or diagnostics.
+
+    `fresh` is a bounded refresh request, not a filter. Phase 0 only exposes the
+    stable read/report shape; stale inspection and cleanup are added later.
+    """
+    _apply_test_controls_from_file()
+    if stale := _stale_policy_refusal():
+        return stale
+    if scope not in {"mine", "all"}:
+        return _json_tool_response({
+            "status": "refused",
+            "reason": "scope must be 'mine' or 'all'",
+            "scope": scope,
+            "fresh": fresh,
+            "server_instance_id": SERVER_INSTANCE_ID,
+        })
+    if not isinstance(fresh, bool):
+        return _json_tool_response({
+            "status": "refused",
+            "reason": "fresh must be a boolean",
+            "scope": scope,
+            "fresh": fresh,
+            "server_instance_id": SERVER_INSTANCE_ID,
+        })
+
+    registry_root = reservations.reservation_registry_root()
+    registry_status, registry_error, rows_by_key = _load_reservation_rows(scope=scope)
+    if fresh and registry_status == "ok":
+        rows_by_key = _refresh_stale_reservations(rows_by_key)
+
+    return _json_tool_response({
+        "status": "ok" if registry_status == "ok" else "error",
+        "scope": scope,
+        "fresh": fresh,
+        "fresh_semantics": "bounded_refresh_not_filter",
+        "registry_root": str(registry_root),
+        "registry_status": registry_status,
+        "registry_error": registry_error,
+        "reservations": [rows_by_key[key] for key in sorted(rows_by_key)],
+        "server_instance_id": SERVER_INSTANCE_ID,
+    })
+
+
+@mcp.tool()
 def run_python_on_gpu(
     host: str,
     gpu_index: int,
@@ -1253,129 +3086,311 @@ def run_python_on_gpu(
     async_mode: bool = False,
     output_file: Optional[str] = None,
 ):
-    """Run an approved Python file on a specific GPU on a specific host.
+    """Launch an approved Python file as a managed GPU job.
 
     Args:
         host: Configured hostname.
         gpu_index: GPU device index to use (sets CUDA_VISIBLE_DEVICES).
         script_path: Existing .py file under an approved script root.
         args: Positional CLI args passed to the Python script.
-        async_mode: If True, run in background and return immediately with PID.
-        output_file: Approved path for stdout/stderr capture (used with async_mode).
+        async_mode: Compatibility input. Both true and false return a managed handle.
+        output_file: Approved path for stdout/stderr capture.
 
     Returns:
-        Command output (sync) or PID info (async).
+        JSON managed job handle.
     """
+    _apply_test_controls_from_file()
     if stale := _stale_policy_refusal():
         return stale
+    if not HEARTBEAT_MANAGER.is_healthy():
+        return _launch_refusal(
+            "heartbeat manager is unhealthy; new launches are unsafe",
+            heartbeat_manager_healthy=False,
+            heartbeat_manager_reason=HEARTBEAT_MANAGER.health_reason(),
+        )
     if not isinstance(gpu_index, int) or isinstance(gpu_index, bool) or gpu_index < 0:
-        return "ERROR: gpu_index must be a non-negative integer"
+        return _launch_refusal("gpu_index must be a non-negative integer", gpu_index=gpu_index)
     if args is not None and (
         not isinstance(args, list)
         or any(not isinstance(arg, (str, int, float, bool)) or arg is None for arg in args)
     ):
-        return "ERROR: args must be a list of string/number/boolean values"
+        return _launch_refusal("args must be a list of string/number/boolean values", gpu_index=gpu_index)
     if not isinstance(async_mode, bool):
-        return "ERROR: async_mode must be a boolean"
+        return _launch_refusal("async_mode must be a boolean", gpu_index=gpu_index)
     if output_file is not None and not isinstance(output_file, str):
-        return "ERROR: output_file must be a string path"
+        return _launch_refusal("output_file must be a string path", gpu_index=gpu_index)
     if not _is_allowed_host(host):
-        return "ERROR: host must be one of the configured GPU MCP NODES"
+        return _launch_refusal(
+            "host must be one of the configured GPU MCP NODES",
+            host=host,
+            gpu_index=gpu_index,
+        )
 
     try:
+        canonical_host = _canonical_policy_host(host)
+        reservation_key_value = reservations.reservation_key(canonical_host, gpu_index)
         argv = _build_python_gpu_argv(script_path, args=args, execution_host=host)
-        command = shlex.join(argv)
         out_path = _validate_output_path(output_file)
     except ValueError as e:
         message = str(e)
-        if message.startswith("REJECTED:"):
-            return message
-        return f"ERROR: {message}"
+        return _launch_refusal(message, host=host, gpu_index=gpu_index)
 
+    try:
+        _prepare_output_parent(out_path)
+    except ValueError as e:
+        return _launch_refusal(str(e), host=canonical_host, gpu_index=gpu_index, reservation_key=reservation_key_value)
+
+    job_id = reservations.generate_job_id()
+    attempt_id = reservations.generate_attempt_id()
+    next_poll_after = _next_poll_after(reservations.DEFAULT_HEARTBEAT_INTERVAL_SEC)
     job_env = _gpu_job_env(gpu_index)
-    env_prefix = _shell_env_prefix(job_env)
+    process_nonce = secrets.token_urlsafe(18)
+    process_fingerprint = _managed_process_fingerprint(job_id, attempt_id, canonical_host, process_nonce)
+    job_env["GPU_MCP_PROCESS_FINGERPRINT"] = process_fingerprint
+    script = _validate_python_script_path(script_path)
+    registry_root = reservations.reservation_registry_root()
+    outcome_path = reservations.outcome_record_path(REPO_ROOT, job_id, attempt_id)
+    outcome_base = {
+        "schema_version": 1,
+        "job_id": job_id,
+        "attempt_id": attempt_id,
+        "reservation_key": reservation_key_value,
+        "host": canonical_host,
+        "gpu_index": gpu_index,
+        "remote_pid": None,
+        "terminal_status": "launcher_error",
+        "exit_code": None,
+        "signal": None,
+        "started_at": None,
+        "ended_at": None,
+        "error_summary": None,
+    }
+    initial_metadata = reservations.build_shared_metadata(
+        job_id=job_id,
+        attempt_id=attempt_id,
+        reservation_key_value=reservation_key_value,
+        host=canonical_host,
+        gpu_index=gpu_index,
+        repo=REPO_ROOT,
+        script_path=script,
+        owner_user=GPU_MCP_USER,
+        server_instance_id=SERVER_INSTANCE_ID,
+        remote_pid=None,
+        process_fingerprint=None,
+        heartbeat_interval_sec=reservations.DEFAULT_HEARTBEAT_INTERVAL_SEC,
+    )
+    try:
+        acquired, acquire_reason = reservations.acquire_reservation(
+            registry_root=registry_root,
+            reservation_key_value=reservation_key_value,
+            metadata=initial_metadata,
+        )
+    except Exception as e:
+        return _launch_refusal(
+            f"failed to acquire reservation: {e}",
+            host=canonical_host,
+            gpu_index=gpu_index,
+            reservation_key=reservation_key_value,
+        )
+    if not acquired:
+        existing = _read_reservation_metadata(reservation_key_value)
+        if existing is not None and _metadata_stale(existing):
+            cleaned, _inspection = _cleanup_stale_gone_reservation(reservation_key_value, existing)
+            if cleaned:
+                try:
+                    acquired, acquire_reason = reservations.acquire_reservation(
+                        registry_root=registry_root,
+                        reservation_key_value=reservation_key_value,
+                        metadata=initial_metadata,
+                    )
+                except Exception as e:
+                    return _launch_refusal(
+                        f"failed to acquire reservation after stale cleanup: {e}",
+                        host=canonical_host,
+                        gpu_index=gpu_index,
+                        reservation_key=reservation_key_value,
+                    )
+        if acquired:
+            pass
+        else:
+            return _launch_refusal(
+                acquire_reason or "GPU is already reserved",
+                host=canonical_host,
+                gpu_index=gpu_index,
+                reservation_key=reservation_key_value,
+            )
 
-    if async_mode:
+    job_record = reservations.build_job_record(
+        job_id=job_id,
+        attempt_id=attempt_id,
+        reservation_key_value=reservation_key_value,
+        host=canonical_host,
+        gpu_index=gpu_index,
+        script_path=script,
+        args=args,
+        output_file=out_path,
+        server_instance_id=SERVER_INSTANCE_ID,
+        next_poll_after=next_poll_after,
+    )
+    try:
+        reservations.atomic_write_json(reservations.job_record_path(REPO_ROOT, job_id), job_record)
+    except Exception as e:
+        reservations.remove_reservation_if_launch_failed(
+            registry_root=registry_root,
+            reservation_key_value=reservation_key_value,
+        )
+        return _launch_refusal(
+            f"failed to record managed job state before launch: {e}",
+            host=canonical_host,
+            gpu_index=gpu_index,
+            reservation_key=reservation_key_value,
+        )
+    HEARTBEAT_MANAGER.register(
+        reservation_key_value,
+        interval_sec=reservations.DEFAULT_HEARTBEAT_INTERVAL_SEC,
+    )
+
+    if _is_local_host(host):
         try:
-            _prepare_output_parent(out_path)
-        except ValueError as e:
-            return f"ERROR: {e}"
-        if _is_local_host(host):
-            try:
-                env = os.environ.copy()
-                env.update(job_env)
-                out_handle = _open_output_no_follow(out_path)
-                proc = subprocess.Popen(
-                    argv,
-                    stdout=out_handle,
-                    stderr=subprocess.STDOUT,
-                    env=env,
-                    cwd=str(REPO_ROOT),
-                    start_new_session=True,
-                )
-                out_handle.close()
-            except Exception as e:
-                return f"ERROR: Failed to launch local GPU job on {host}: {e}"
-            return json.dumps({
-                "status": "launched",
-                "host": host,
-                "gpu_index": gpu_index,
-                "pid": str(proc.pid),
-                "output_file": str(out_path),
-                "launch": "local",
-            })
-        launch_cmd = _remote_async_launch_command(argv, out_path, job_env)
+            env = os.environ.copy()
+            env.update(job_env)
+            supervisor_argv = _managed_supervisor_argv(
+                argv,
+                out_path,
+                job_env,
+                outcome_path,
+                outcome_base,
+            )
+            proc = subprocess.Popen(
+                supervisor_argv,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=env,
+                cwd=str(REPO_ROOT),
+                start_new_session=True,
+            )
+        except Exception as e:
+            reservations.remove_reservation_if_launch_failed(
+                registry_root=registry_root,
+                reservation_key_value=reservation_key_value,
+            )
+            HEARTBEAT_MANAGER.unregister(reservation_key_value)
+            shutil.rmtree(reservations.job_record_path(REPO_ROOT, job_id).parent, ignore_errors=True)
+            return _launch_refusal(
+                f"Failed to launch local GPU job on {host}: {e}",
+                host=canonical_host,
+                gpu_index=gpu_index,
+                reservation_key=reservation_key_value,
+            )
+        pid_value = str(proc.pid)
+        launch_mode = "local"
+        remote_start_time = _process_start_time(host, int(pid_value))
+    else:
+        launch_cmd = _remote_async_launch_command(argv, out_path, job_env, outcome_path, outcome_base)
         bg_cmd = _remote_repo_command(launch_cmd)
         pid_str = _ssh_run(host, bg_cmd)
         if pid_str is None:
-            return f"ERROR: Failed to SSH to {host}"
+            return _launch_handle_response(
+                status="launch_outcome_unknown",
+                reason=f"SSH launch did not return a PID from {host}; reservation kept fail-closed",
+                job_id=job_id,
+                attempt_id=attempt_id,
+                reservation_key_value=reservation_key_value,
+                host=canonical_host,
+                gpu_index=gpu_index,
+                output_path=out_path,
+                next_poll_after=next_poll_after,
+                job_lifecycle="launch_outcome_unknown",
+                launch="ssh",
+                async_mode_requested=async_mode,
+            )
         pid_value = pid_str.strip()
         if not pid_value.isdigit() or int(pid_value) <= 0:
-            return f"ERROR: invalid async pid returned from {host}: {pid_value!r}"
-        return json.dumps({
-            "status": "launched",
-            "host": host,
-            "gpu_index": gpu_index,
-            "pid": pid_value,
-            "output_file": str(out_path),
-            "launch": "ssh",
-        })
-    else:
-        if _is_local_host(host):
-            try:
-                env = os.environ.copy()
-                env.update(job_env)
-                result = subprocess.run(
-                    argv,
-                    check=False,
-                    capture_output=True,
-                    text=True,
-                    timeout=SYNC_TIMEOUT_SEC,
-                    env=env,
-                    cwd=str(REPO_ROOT),
-                )
-            except Exception as e:
-                return f"ERROR: Failed to run local GPU job on {host}: {e}"
-            if result.returncode != 0:
-                return (
-                    f"ERROR: local GPU job exited with status {result.returncode}\n"
-                    f"{result.stdout}{result.stderr}"
-                )
-            return result.stdout
-        try:
-            c = _conn(host)
-            result = c.run(
-                _remote_repo_command(f"env {env_prefix} {command}"),
-                hide=True,
-                timeout=SYNC_TIMEOUT_SEC,
+            return _launch_handle_response(
+                status="launch_outcome_unknown",
+                reason=(
+                    f"invalid async pid returned from {host}: {pid_value!r}; "
+                    "reservation kept fail-closed"
+                ),
+                job_id=job_id,
+                attempt_id=attempt_id,
+                reservation_key_value=reservation_key_value,
+                host=canonical_host,
+                gpu_index=gpu_index,
+                output_path=out_path,
+                next_poll_after=next_poll_after,
+                job_lifecycle="launch_outcome_unknown",
+                launch="ssh",
+                async_mode_requested=async_mode,
             )
-            return result.stdout
-        except Exception as e:
-            result = getattr(e, "result", None)
-            stdout = getattr(result, "stdout", "") or ""
-            stderr = getattr(result, "stderr", "") or ""
-            details = f"{stdout}{stderr}"
-            return f"ERROR: {e}" + (f"\n{details}" if details else "")
+        launch_mode = "ssh"
+        remote_start_time = None
+
+    job_record.update({
+        "remote_pid": int(pid_value),
+        "remote_start_time": remote_start_time,
+        "process_fingerprint": process_fingerprint,
+        "launch_mode": launch_mode,
+        "async_mode_requested": async_mode,
+        "outcome_file": str(outcome_path),
+    })
+    launched_metadata = dict(initial_metadata)
+    launched_metadata.update({
+        "remote_pid": int(pid_value),
+        "remote_start_time": remote_start_time,
+        "process_fingerprint": process_fingerprint,
+        "last_heartbeat_at": reservations.iso_timestamp(),
+    })
+    try:
+        reservations.atomic_write_json(reservations.job_record_path(REPO_ROOT, job_id), job_record)
+        HEARTBEAT_MANAGER.update_owned_metadata(reservation_key_value, {
+            "remote_pid": int(pid_value),
+            "remote_start_time": remote_start_time,
+            "process_fingerprint": process_fingerprint,
+            "last_heartbeat_at": launched_metadata["last_heartbeat_at"],
+        })
+    except Exception as e:
+        return _launch_handle_response(
+            status="launched_with_warning",
+            reason=f"failed to record managed job state after launch: {e}",
+            job_id=job_id,
+            attempt_id=attempt_id,
+            reservation_key_value=reservation_key_value,
+            host=canonical_host,
+            gpu_index=gpu_index,
+            output_path=out_path,
+            next_poll_after=next_poll_after,
+            job_lifecycle="running",
+            launch=launch_mode,
+            async_mode_requested=async_mode,
+            process={
+                "remote_pid": int(pid_value),
+                "remote_start_time": remote_start_time,
+                "remote_boot_id": None,
+                "process_fingerprint": process_fingerprint,
+            },
+        )
+
+    return _launch_handle_response(
+        status="launched",
+        reason="",
+        job_id=job_id,
+        attempt_id=attempt_id,
+        reservation_key_value=reservation_key_value,
+        host=canonical_host,
+        gpu_index=gpu_index,
+        output_path=out_path,
+        next_poll_after=next_poll_after,
+        job_lifecycle="running",
+        launch=launch_mode,
+        async_mode_requested=async_mode,
+        process={
+            "remote_pid": int(pid_value),
+            "remote_start_time": remote_start_time,
+            "remote_boot_id": None,
+            "process_fingerprint": process_fingerprint,
+        },
+    )
 
 
 @mcp.tool()
@@ -1424,4 +3439,13 @@ def cluster_info():
 # ── Entry point ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    mcp.run(transport="stdio")
+    def _stop_heartbeat_and_exit(signum, frame):
+        HEARTBEAT_MANAGER.stop()
+        raise SystemExit(128 + int(signum))
+
+    signal_lib.signal(signal_lib.SIGTERM, _stop_heartbeat_and_exit)
+    signal_lib.signal(signal_lib.SIGINT, _stop_heartbeat_and_exit)
+    try:
+        mcp.run(transport="stdio")
+    finally:
+        HEARTBEAT_MANAGER.stop()

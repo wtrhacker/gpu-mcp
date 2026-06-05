@@ -131,9 +131,9 @@ Acceptance criteria:
   probe script hash, working directory, and minimal imports.
 - Doctor can print a repo-local Codex MCP config snippet or validate an
   installed repo-local one with a real `codex exec` probe.
-- Doctor can verify global Codex execpolicy prompt rules and blocked
-  `codex exec` probes for raw remote-access commands such as `ssh`, `scp`,
-  `sftp`, and `rsync`.
+- Doctor can verify global Codex execpolicy prompt rules for raw remote-access
+  commands and Codex self-spawn commands such as `ssh`, `scp`, `sftp`, `rsync`,
+  and `codex`, plus blocked `codex exec` probes for raw remote-access commands.
 - Doctor rejects raw-command probe invocations that include `--ignore-rules`,
   because that flag disables execpolicy.
 - Doctor can verify that client `tool_timeout_sec` is larger than
@@ -358,9 +358,10 @@ execpolicy command-blocking probe.
 
 The MCP server can only police MCP tool calls and scripts launched through MCP.
 It cannot stop the outer agent from using raw shell commands such as `ssh`,
-`scp`, `sftp`, or `rsync`. For v1, the answer is deliberately simple: the
-installer verifies Codex execpolicy prompt rules for raw remote-access commands
-and verifies that GPU-MCP automation runs with approvals disabled.
+`scp`, `sftp`, or `rsync`, or from trying to spawn a new Codex process with
+weaker flags. For v1, the answer is deliberately simple: the installer verifies
+Codex execpolicy prompt rules for raw remote-access commands and Codex
+self-spawn, and verifies that GPU-MCP automation runs with approvals disabled.
 
 The global rules should cover at least:
 
@@ -369,6 +370,7 @@ prefix_rule(pattern=["ssh"], decision="prompt")
 prefix_rule(pattern=["scp"], decision="prompt")
 prefix_rule(pattern=["sftp"], decision="prompt")
 prefix_rule(pattern=["rsync"], decision="prompt")
+prefix_rule(pattern=["codex"], decision="prompt")
 ```
 
 It should also cover obvious raw-SSH forms where Codex supports that:

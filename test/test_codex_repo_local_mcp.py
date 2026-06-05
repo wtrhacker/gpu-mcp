@@ -2,13 +2,18 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
+import secrets
 import subprocess
 import sys
 import tomllib
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
+
+from gpu_mcp_config import load_policy
+from gpu_mcp_policy_approval import approve_policy
+import gpu_mcp_reservations as reservations
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -21,8 +26,8 @@ def _load_toml(path: Path) -> dict:
         return tomllib.load(fh)
 
 
-def _write_repo(name: str, host: str, marker: str) -> Path:
-    repo = FIXTURE_ROOT / name
+def _write_repo(name: str, host: str, marker: str, *, fixture_root: Path = FIXTURE_ROOT) -> Path:
+    repo = fixture_root / name
     jobs = repo / "jobs"
     results = repo / "results"
     codex_dir = repo / ".codex"
@@ -58,9 +63,18 @@ def _write_repo(name: str, host: str, marker: str) -> Path:
             ]
         )
     )
+    approve_policy(
+        load_policy(repo / "gpu-mcp.toml"),
+        store_path=repo / ".gpu_mcp_state" / "approved-policies.json",
+        diff_summary=["repo-local codex fixture approval"],
+        approved_by="pytest",
+    )
     (codex_dir / "config.toml").write_text(
         "\n".join(
             [
+                "[features]",
+                "hooks = true",
+                "",
                 f"[mcp_servers.{name}-gpu-probe]",
                 f"command = {sys.executable!r}",
                 "args = [",
@@ -83,10 +97,10 @@ def _write_repo(name: str, host: str, marker: str) -> Path:
 
 
 @pytest.fixture()
-def repo_local_fixture():
-    shutil.rmtree(FIXTURE_ROOT, ignore_errors=True)
-    repo_a = _write_repo("repo-a", "gpu-a", "repo-a-ran")
-    repo_b = _write_repo("repo-b", "gpu-b", "repo-b-ran")
+def repo_local_fixture(tmp_path):
+    fixture_root = tmp_path / "repo_local_codex"
+    repo_a = _write_repo("repo-a", "gpu-a", "repo-a-ran", fixture_root=fixture_root)
+    repo_b = _write_repo("repo-b", "gpu-b", "repo-b-ran", fixture_root=fixture_root)
     return repo_a, repo_b
 
 
@@ -134,21 +148,34 @@ def test_repo_local_gpu_mcp_policies_are_distinct(repo_local_fixture):
     assert policy_b["nodes"] == ["gpu-b"]
 
 
-def _run_codex_exec(repo: Path, prompt: str, output_name: str) -> str:
+def _run_codex_exec(repo: Path, prompt: str, output_name: str, *, env: dict[str, str] | None = None) -> str:
     output_path = repo / output_name
+    child_env = os.environ.copy()
+    child_env.setdefault("PYTEST_CURRENT_TEST", os.environ.get("PYTEST_CURRENT_TEST", "codex-repo-local-mcp"))
+    if env:
+        child_env.update(env)
+    policy_store = repo / ".gpu_mcp_state" / "approved-policies.json"
+    if policy_store.exists():
+        child_env.setdefault("GPU_MCP_TEST_POLICY_APPROVAL_STORE", str(policy_store))
     completed = subprocess.run(
         [
             "codex",
             "exec",
             "-C",
             str(repo),
+            "-c",
+            f"projects.{json.dumps(str(repo))}.trust_level=\"trusted\"",
+            "--enable",
+            "hooks",
             "--sandbox",
             "workspace-write",
+            "--dangerously-bypass-hook-trust",
             "--output-last-message",
             str(output_path),
             prompt,
         ],
         cwd=REPO_ROOT,
+        env=child_env,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -239,3 +266,102 @@ def test_codex_exec_repo_a_rejects_repo_b_host(repo_local_fixture):
     parsed = _extract_mcp_result(result)
     assert parsed["status"] == "rejected"
     assert parsed["error"] == "host not allowed: gpu-b"
+
+
+@pytest.mark.codex_exec
+@live_codex_exec
+def test_codex_exec_installed_pretooluse_reminder_context_is_model_visible(tmp_path):
+    repo = REPO_ROOT
+    installed_hook = Path("/home/tingran/gpu-mcp/gpu_mcp_policy_hook.py")
+    assert installed_hook.read_bytes() == (REPO_ROOT / "gpu_mcp_policy_hook.py").read_bytes()
+    registry = tmp_path / "reservations"
+    suffix = f"phase6probe_{secrets.token_hex(4)}"
+    job_id = reservations.generate_job_id(
+        now=datetime(2026, 5, 30, 12, 10, tzinfo=timezone.utc),
+        suffix=suffix,
+    )
+    attempt_id = reservations.generate_attempt_id(
+        now=datetime(2026, 5, 30, 12, 10, tzinfo=timezone.utc),
+        suffix=suffix,
+    )
+    server_id = reservations.generate_server_instance_id(
+        hostname="phase6-probe",
+        pid=os.getpid(),
+        suffix=suffix,
+    )
+    reservation_key = reservations.reservation_key("localhost", 7)
+    reservation_dir = registry / reservation_key
+    reminder_path = reservations.hook_reminder_path(repo, job_id)
+    job_record_path = reservations.job_record_path(repo, job_id)
+
+    try:
+        reservation_dir.mkdir(parents=True)
+        reservations.atomic_write_json(
+            reservation_dir / "metadata.json",
+            reservations.build_shared_metadata(
+                job_id=job_id,
+                attempt_id=attempt_id,
+                reservation_key_value=reservation_key,
+                host="localhost",
+                gpu_index=7,
+                repo=repo,
+                script_path=repo / "jobs" / "mcp_mode_probe.py",
+                owner_user=os.environ.get("USER") or "pytest",
+                server_instance_id=server_id,
+                remote_pid=None,
+                reserved_at="2026-05-30T12:10:00Z",
+                last_heartbeat_at="2026-05-30T12:10:00Z",
+            ),
+        )
+        reservations.atomic_write_json(
+            job_record_path,
+            reservations.build_job_record(
+                job_id=job_id,
+                attempt_id=attempt_id,
+                reservation_key_value=reservation_key,
+                host="localhost",
+                gpu_index=7,
+                script_path=repo / "jobs" / "mcp_mode_probe.py",
+                args=[],
+                output_file=repo / ".gpu_mcp_logs" / "phase6_probe.log",
+                server_instance_id=server_id,
+                next_poll_after="2026-05-30T12:11:00Z",
+                created_at="2026-05-30T12:10:00Z",
+            ),
+        )
+
+        result = _run_codex_exec(
+            repo=repo,
+            output_name=str(tmp_path / "codex_exec_installed_hook_context_probe.txt"),
+            env={
+                "GPU_MCP_TEST_RESERVATION_ROOT": str(registry),
+                "GPU_MCP_TEST_NOW": "2099-01-01T00:00:00Z",
+            },
+            prompt=(
+                "Do not run shell commands. Do not edit files. Use the MCP tool "
+                "gpu-cluster-mcp/check_gpu_processes. Then report the exact tool "
+                "result and any hook additional context you saw."
+            ),
+        )
+
+        assert "status check" in result
+        assert job_id in result
+        assert reservation_key in result
+        assert reminder_path.exists()
+    finally:
+        reminder_lock_path = reminder_path.with_suffix(".lock")
+        for path in (
+            job_record_path,
+            reminder_path,
+            reminder_lock_path,
+            reservation_dir / "metadata.json",
+        ):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+        for directory in (job_record_path.parent, reservation_dir, registry):
+            try:
+                directory.rmdir()
+            except OSError:
+                pass

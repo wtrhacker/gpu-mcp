@@ -13,6 +13,7 @@ Expected future API:
 - `gpu_mcp_doctor.run_checks(config_path, codex_project_dir, ...) -> dict`
 - `gpu_mcp_doctor.check_timeout_alignment(mcp_tool_timeout_sec, sync_timeout_sec)`
 - `gpu_mcp_doctor.validate_repo_local_codex_config(repo, config_path)`
+- `gpu_mcp_doctor.validate_codex_execpolicy_rules(rules_text)`
 - `gpu_mcp_doctor.run_codex_mcp_probe(repo, tool_name, expected_repo_root, ...)`
 """
 
@@ -267,6 +268,20 @@ def test_doctor_requires_prompt_mode_for_policy_reload_and_approve_mode_for_kill
 
     with pytest.raises(doctor_module.DoctorError, match="kill_gpu_process approval_mode"):
         doctor_module.validate_repo_local_codex_config(repo_fixture, config)
+
+
+def test_doctor_requires_codex_spawn_prompt_rule(doctor_module):
+    rules_text = "\n".join(
+        [
+            'prefix_rule(pattern=["ssh"], decision="prompt")',
+            'prefix_rule(pattern=["scp"], decision="prompt")',
+            'prefix_rule(pattern=["sftp"], decision="prompt")',
+            'prefix_rule(pattern=["rsync"], decision="prompt")',
+        ]
+    )
+
+    with pytest.raises(doctor_module.DoctorError, match="codex"):
+        doctor_module.validate_codex_execpolicy_rules(rules_text)
 
 
 def test_doctor_rejects_non_integer_tool_timeout(doctor_module, repo_fixture):

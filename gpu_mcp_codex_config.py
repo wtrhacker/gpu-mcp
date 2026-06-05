@@ -9,6 +9,7 @@ class CodexConfigError(ValueError):
 
 
 REMOTE_COMMANDS = ("ssh", "scp", "sftp", "rsync")
+PROMPT_REQUIRED_COMMANDS = REMOTE_COMMANDS + ("codex",)
 
 
 def required_remote_command_ban_probes() -> tuple[str, ...]:
@@ -18,7 +19,7 @@ def required_remote_command_ban_probes() -> tuple[str, ...]:
 def required_remote_command_prompt_rules() -> dict[str, str]:
     return {
         command: f'prefix_rule(pattern=["{command}"], decision="prompt")'
-        for command in REMOTE_COMMANDS
+        for command in PROMPT_REQUIRED_COMMANDS
     }
 
 
@@ -43,13 +44,13 @@ def validate_remote_command_prompt_rules(rules_text: str) -> dict:
         elif decision == "allow":
             allow_commands.add(pattern)
 
-    conflicts = prompt_commands & allow_commands & set(REMOTE_COMMANDS)
+    conflicts = prompt_commands & allow_commands & set(PROMPT_REQUIRED_COMMANDS)
     if conflicts:
         raise CodexConfigError(
             f"conflicting allow rule for raw remote command: {', '.join(sorted(conflicts))}"
         )
 
-    missing = set(REMOTE_COMMANDS) - prompt_commands
+    missing = set(PROMPT_REQUIRED_COMMANDS) - prompt_commands
     if missing:
         reason = "global prompt rule missing"
         if host_specific:
