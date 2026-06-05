@@ -1306,8 +1306,9 @@ def test_phase6_codex_exec_pretooluse_due_reminder_dedup_and_policy_precedence(
         "phase6_due_reminder_status_ack.txt",
     )
     assert "GPU MCP: 1 managed job is due for status." in status_ack_text
-    status_payload = _first_payload(status_ack_text, status="running")
+    status_payload = _first_payload(status_ack_text, status="ok")
     assert status_payload["job_id"] == launch["job_id"]
+    assert status_payload["job_lifecycle"] == "running"
     acknowledged_record = json.loads(job_record_path.read_text())
     assert acknowledged_record["last_status_checked_at"] is not None
 
