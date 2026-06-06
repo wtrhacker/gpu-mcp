@@ -852,6 +852,11 @@ authority. Phase 7 also provides poll discipline: accidental early status checks
 should be compact and cheap, while intentional early checks remain possible with
 an explicit reason.
 
+Detailed agentic polling test design lives in
+`0004r-phase7-agentic-polling-tests.md`. This phase uses deterministic
+server/hook tests for contract facts, plus Codex battlefield traces and an LLM
+judge for behavior that cannot be made fully deterministic.
+
 Agentic battlefield first:
 
 - [ ] Live Codex prompt: Repo A asks the agent to launch a likely main/long job
@@ -944,6 +949,25 @@ Agentic battlefield first:
   unrelated tools, cross-repo jobs, ambiguous/malformed targets, due jobs,
   terminal jobs, lifecycle actions, status calls with `early_poll_reason`, or
   `PostToolUse`.
+- [ ] Battlefield trace harness: each Codex polling-discipline scenario records
+  JSONL events for prompt, hook context, tool calls, compact tool-result
+  summaries, fake-time advances, final answer, machine checks, and optional
+  judge result. The trace is the primary artifact for reviewing agent behavior.
+- [ ] Battlefield machine checks run before any judge call and hard-fail server
+  or hook facts: no raw GPU access, no full inspection/log tail on compact early
+  status, no cross-repo reminder leakage, due status performs full status, and
+  outputs are not structurally used before terminal status when the trace can
+  prove that.
+- [ ] Battlefield judge review receives only the scenario prompt, trace/final
+  answer, and machine-check summary. The judge evaluates agent behavior such as
+  premature polling, handling of `not_due_yet`, use of `early_poll_reason`,
+  output-dependency discipline, and due-reminder handling. Judge verdicts are
+  advisory until repeated runs show stability.
+- [ ] Battlefield scenarios cover at least: early poll compact response and
+  stop, user-requested early override, due reminder triggers status,
+  terminal-before-due smoke result, and cross-repo/broad-tool silence.
+  These are the minimum Codex polling-behavior scenarios, not the full Phase 7
+  acceptance suite.
 
 Invariants and implementation pressure:
 
@@ -1094,12 +1118,20 @@ Supporting tests:
   boundaries when no direct hint or expected duration is present.
 - [ ] `next_poll_after` is derived from the same timestamp as the heartbeat
   write and equals `now + heartbeat_interval_sec` for nonterminal jobs.
+- [ ] Malformed nonterminal `next_poll_after` values take the full status path
+  instead of `not_due_yet`: missing field, null, empty string, invalid
+  timestamp, timestamp without trailing `Z`, and timestamp with garbage suffix.
+  Terminal jobs may still omit or null `next_poll_after`.
+- [ ] Multi-job cadence is per task. Jobs with different `next_poll_after`
+  values are reminded, early-warned, and status-gated independently.
 - [ ] Early status before `next_poll_after` with no `early_poll_reason` returns
   compact `polling_state="not_due_yet"`, performs no remote inspection, includes
   no log tail, and does not mutate `last_status_checked_at`, `next_poll_after`,
   heartbeat, cadence, or process-inspection state.
 - [ ] Compact `polling_state="not_due_yet"` does not acknowledge or silence a
   Phase 6 due reminder.
+- [ ] Hook reminder de-duplication and advisory-state retirement are covered by
+  deterministic tests per ADR 0004q; Phase 7 must not regress them.
 - [ ] Early status with non-empty `early_poll_reason` performs full status and
   records or reports the override.
 - [ ] Due status without `early_poll_reason` performs full status.
@@ -1114,6 +1146,25 @@ Supporting tests:
   ambiguous targets, status calls with `early_poll_reason`, and `PostToolUse`.
 - [ ] Battlefield: an agent that tries to poll early receives compact guidance
   and no log/inspection output unless it supplies `early_poll_reason`.
+- [ ] Battlefield trace JSONL follows ADR 0004r's schema and excludes raw script
+  arguments, sensitive paths outside the test repo, unbounded stdout/stderr, and
+  full log tails.
+- [ ] Battlefield machine checks are deterministic and run before the LLM judge;
+  a machine-check failure is a hard test failure.
+- [ ] LLM judge output follows ADR 0004r's strict JSON shape with
+  `verdict`, five 0-3 behavior scores, trace-based `evidence`, and
+  `failure_reason`.
+- [ ] LLM judge prompt uses ADR 0004r's strict trace-based rubric: no credit for
+  unsupported rationalizations, repeated polling after `not_due_yet` is a hard
+  fail, missing `early_poll_reason` for a user-requested early check is a
+  failure, and one corrected accidental early poll may be pass or soft-fail
+  depending on trace impact.
+- [ ] LLM judge verdicts are not CI-gating until calibrated: at least five runs
+  per candidate scenario, at least four of five matching verdicts, no
+  pass/hard-fail oscillation, and applicable score dimensions vary by no more
+  than one point.
+- [ ] Codex battlefield scenarios use fake time and simulated jobs; they must
+  not sleep for real heartbeat intervals or require live GPUs.
 - [ ] `job_role` defaulting from `async_mode`.
 - [ ] Soft refusal for main launch without positive smoke viability evidence or
   skip reason, even when cadence evidence is present.
@@ -1135,6 +1186,11 @@ Supporting tests:
 - [ ] `smoke_cadence_representative=true` allows smoke runtime to contribute to
   cadence basis after successful smoke validation.
 - [ ] Interval revision with fresh heartbeat.
+- [ ] `update_cadence` owner-state writes are deterministic under interleaving:
+  heartbeat versus cadence update, full status versus cadence update when status
+  mutates overlapping repo-local cadence fields, rapid consecutive cadence
+  updates, and no partial `heartbeat_interval_sec`/`last_heartbeat_at` metadata
+  write.
 - [ ] `update_cadence` refuses for non-owned reservations, stale policy,
   unhealthy heartbeat manager, missing cadence input, missing/blank reason, and
   failed metadata writes without partially updating interval or heartbeat.
