@@ -857,6 +857,51 @@ Detailed agentic polling test design lives in
 server/hook tests for contract facts, plus Codex battlefield traces and an LLM
 judge for behavior that cannot be made fully deterministic.
 
+Phase 6 baseline behavior tests before Phase 7 implementation. These are
+expected-red contrast tests when the current agent still babysits jobs; a
+preserved hard-fail report is a useful result, not an implementation surprise:
+they are the A side of the A/B test. If a baseline passes, inspect the trace
+before trusting it; the agent may have genuinely behaved well, or the prompt and
+oracle may have been too weak to expose the missing Phase 7 harness.
+The pytest control cases may pass by detecting this hard-fail verdict; the
+future Phase 7 acceptance cases are the B side that must pass by showing the
+agent follows the new cadence guidance.
+
+- [ ] Live Codex baseline: final-result wait. The prompt uses only current Phase
+  6 MCP arguments and asks Codex to run a finite slow job and report the final
+  metric. The test records whether Codex repeatedly checks status while the job
+  is still running, blocks in shell `sleep`, uses broad GPU checks as polling,
+  or treats started/progress files as final output before terminal MCP status.
+- [ ] Live Codex baseline: final-result wait plus independent local work. The
+  prompt uses only current Phase 6 MCP arguments, asks for a final GPU metric,
+  and gives a concrete local note/prep task to do while the GPU job runs. The
+  test requires a local proof file and records whether Codex still spends the
+  wait polling.
+- [ ] Live Codex baseline: smoke opportunity without Phase 7 fields. The script
+  has a quick mode and a finite real mode. The prompt asks for the real final
+  metric and mentions the quick check mode. The test watches whether Codex runs
+  and checks the quick mode before launching the long mode, then whether it
+  repeatedly status-checks the real run while waiting.
+- [ ] Live Codex baseline: two final-result jobs through current MCP. The test
+  watches whether Codex keeps both job ids and final metrics separate without
+  multiplying repeated running-status checks across jobs.
+- [ ] Live Codex baseline: current Phase 6 due reminder and cross-repo silence.
+  The due repo should act on its own reminder; another repo should not see or
+  act on that reminder. The other repo may still see the shared reservation in
+  broad `check_gpus` output; that is not a failure unless due-reminder context
+  or targeted status handling leaks across repos.
+- [ ] Baseline tests must not fake Phase 7 API replies or pass Phase 7-only
+  arguments such as `job_role`, `smoke_job_id`, `smoke_skip_reason`,
+  `expected_duration_sec`, `cadence_hint_sec`, `early_poll_reason`, or
+  `update_cadence`.
+- [ ] Baseline behavior verdicts must first prove a real managed launch with
+  `job_id` and `next_poll_after`; an empty trace or missing final-answer JSON is
+  inconclusive or failing, never a pass.
+- [ ] Baseline behavior verdicts compare the captured Codex stream against the
+  reported final MCP history. Final metrics must be reported separately from raw
+  MCP results, so a metric number embedded in tool JSON does not count as the
+  agent reporting the result.
+
 Agentic battlefield first:
 
 - [ ] Live Codex prompt: Repo A asks the agent to launch a likely main/long job
@@ -950,24 +995,23 @@ Agentic battlefield first:
   terminal jobs, lifecycle actions, status calls with `early_poll_reason`, or
   `PostToolUse`.
 - [ ] Battlefield trace harness: each Codex polling-discipline scenario records
-  JSONL events for prompt, hook context, tool calls, compact tool-result
-  summaries, fake-time advances, final answer, machine checks, and optional
-  judge result. The trace is the primary artifact for reviewing agent behavior.
-- [ ] Battlefield machine checks run before any judge call and hard-fail server
-  or hook facts: no raw GPU access, no full inspection/log tail on compact early
-  status, no cross-repo reminder leakage, due status performs full status, and
-  outputs are not structurally used before terminal status when the trace can
-  prove that.
+  JSONL events for prompt, tool calls, compact tool-result summaries, final
+  answer, machine checks, and optional judge result. The trace is the primary
+  artifact for reviewing agent behavior.
+- [ ] Battlefield machine checks run before any judge call and hard-fail clear
+  facts: no raw GPU access, no repeated early polling, no output claims before
+  terminal status, smoke job attempted when a small mode is offered, and
+  independent work performed when the prompt gives useful independent work.
 - [ ] Battlefield judge review receives only the scenario prompt, trace/final
   answer, and machine-check summary. The judge evaluates agent behavior such as
   premature polling, handling of `not_due_yet`, use of `early_poll_reason`,
   output-dependency discipline, and due-reminder handling. Judge verdicts are
   advisory until repeated runs show stability.
-- [ ] Battlefield scenarios cover at least: early poll compact response and
-  stop, user-requested early override, due reminder triggers status,
-  terminal-before-due smoke result, and cross-repo/broad-tool silence.
-  These are the minimum Codex polling-behavior scenarios, not the full Phase 7
-  acceptance suite.
+- [ ] Battlefield scenarios implement ADR 0004r's first behavior contrast group:
+  final-result wait, final-result wait plus independent local work, smoke
+  opportunity followed by a real finite main run, two final-result jobs, and
+  due-reminder/cross-repo silence. A no-obvious-smoke-path prompt may start as a
+  manual copied-prompt test before it becomes stable under `codex exec`.
 
 Invariants and implementation pressure:
 

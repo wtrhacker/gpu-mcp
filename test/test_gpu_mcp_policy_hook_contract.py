@@ -1291,3 +1291,105 @@ def test_phase6_main_emits_pretooluse_additional_context(tmp_path, monkeypatch):
     assert result["hookSpecificOutput"]["hookEventName"] == "PreToolUse"
     assert "additionalContext" in result["hookSpecificOutput"]
     assert "manage_gpu_job" in result["hookSpecificOutput"]["additionalContext"]
+
+
+def test_phase7_early_status_hook_warns_only_for_targeted_current_repo_job(
+    tmp_path,
+    monkeypatch,
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_config(repo)
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    job_record = _seed_hook_job(
+        repo,
+        registry,
+        next_poll_after="2026-05-30T13:00:00Z",
+    )
+    hook = importlib.import_module("gpu_mcp_policy_hook")
+    now = datetime(2026, 5, 30, 12, 5, tzinfo=timezone.utc)
+
+    try:
+        result = hook.check_phase7_pretooluse_guidance(
+            repo,
+            tool_name="repo_managed_gpu/manage_gpu_job",
+            tool_input={"action": "status", "job_id": job_record["job_id"]},
+            now=now,
+        )
+    except AttributeError as exc:
+        pytest.fail(f"hook must expose Phase 7 pretool guidance: {exc}")
+    broad = hook.check_phase7_pretooluse_guidance(
+        repo,
+        tool_name="repo_managed_gpu/check_gpus",
+        tool_input={"samples": 1},
+        now=now,
+    )
+    with_reason = hook.check_phase7_pretooluse_guidance(
+        repo,
+        tool_name="repo_managed_gpu/manage_gpu_job",
+        tool_input={
+            "action": "status",
+            "job_id": job_record["job_id"],
+            "early_poll_reason": "user asked",
+        },
+        now=now,
+    )
+
+    assert result is not None
+    context = result["hookSpecificOutput"]["additionalContext"]
+    assert "not due" in context
+    assert "early_poll_reason" in context
+    assert job_record["job_id"] in context
+    assert broad is None
+    assert with_reason is None
+
+
+def test_phase7_main_launch_hook_nudges_smoke_or_skip_without_blocking(
+    tmp_path,
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_config(repo)
+    hook = importlib.import_module("gpu_mcp_policy_hook")
+
+    result = hook.check_phase7_pretooluse_guidance(
+        repo,
+        tool_name="repo_managed_gpu/run_python_on_gpu",
+        tool_input={
+            "host": "gpu-a",
+            "gpu_index": 0,
+            "script_path": "jobs/train.py",
+            "async_mode": True,
+            "expected_duration_sec": 3600,
+        },
+    )
+    one_off = hook.check_phase7_pretooluse_guidance(
+        repo,
+        tool_name="repo_managed_gpu/run_python_on_gpu",
+        tool_input={
+            "host": "gpu-a",
+            "gpu_index": 0,
+            "script_path": "jobs/train.py",
+            "async_mode": False,
+        },
+    )
+    with_skip = hook.check_phase7_pretooluse_guidance(
+        repo,
+        tool_name="repo_managed_gpu/run_python_on_gpu",
+        tool_input={
+            "host": "gpu-a",
+            "gpu_index": 0,
+            "script_path": "jobs/train.py",
+            "async_mode": True,
+            "smoke_skip_reason": "user asked to skip smoke for this run",
+        },
+    )
+
+    assert result is not None
+    context = result["hookSpecificOutput"]["additionalContext"]
+    assert "job_role=\"smoke\"" in context
+    assert "smoke_skip_reason" in context
+    assert "expected_duration_sec" in context
+    assert one_off is None
+    assert with_skip is None

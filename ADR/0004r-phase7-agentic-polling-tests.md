@@ -12,11 +12,22 @@ reservation safety.
 
 ## 1. Testing Purpose
 
-Phase 7 is motivated by a user-visible agent behavior problem: agents tend to
-poll long-running GPU jobs too often and waste context. The MCP should give the
-agent a concrete cadence so it can work independently, avoid output-dependent
-work, and check the job only when due or when it has an explicit reason to
-override.
+Phase 7 is motivated by several user-visible agent behavior problems:
+
+- when a user needs a final GPU result, agents tend to wait by repeatedly
+  checking status/logs and consuming context;
+- when useful local work is available while a GPU job runs, agents may still
+  spend the turn budget polling instead of doing that work;
+- when a smoke run succeeds and the real run starts, agents may treat the real
+  run as something to babysit instead of something with a next check time;
+- when multiple jobs are active, agents may multiply the same polling behavior
+  or lose track of which job is due;
+- when a job is not due, a full status/log response makes an accidental early
+  check expensive instead of cheap.
+
+The MCP should give the agent a concrete cadence so it can work independently,
+avoid output-dependent work, and check the job only when due or when it has an
+explicit reason to override.
 
 The tests therefore need two different oracles:
 
@@ -53,15 +64,33 @@ must hard-fail when the server or hook violates the Phase 7 contract:
   overlapping repo-local cadence fields, rapid consecutive cadence updates, and
   no partial `heartbeat_interval_sec`/`last_heartbeat_at` writes.
 
-Layer 2: Codex battlefield trace tests.
+Layer 2: Codex battlefield behavior tests.
 
 These run `codex exec` against a simulated current-repo MCP backend and the real
-installed GPU MCP companion hook when available. The backend and hook write a
-JSONL trace of model-visible events. The trace is the primary artifact. The
-scenarios in this ADR are the minimum polling-discipline battlefield set, not
-the complete Phase 7 acceptance suite. Smoke validation, cadence-selection edge
-cases, update-cadence state handling, and hook-state mechanics should stay in
-deterministic pytest unless a specific agent-behavior question needs Codex.
+installed GPU MCP companion hook when available. There are two sub-modes:
+
+- Phase 6 baseline runs use only the current public API:
+  `run_python_on_gpu(host, gpu_index, script_path, args, async_mode,
+  output_file)` and `manage_gpu_job(status|stop|retry|finish)`. They must not
+  pass `job_role`, `smoke_job_id`, `smoke_skip_reason`,
+  `expected_duration_sec`, `cadence_hint_sec`, `early_poll_reason`, or
+  `update_cadence`. Their purpose is to observe how Codex behaves before Phase
+  7 exists. These are expected-red contrast tests when current behavior still
+  babysits jobs; the preserved failure report is the useful artifact. This is
+  the A side of the A/B test. A baseline pass is not automatically success; it
+  means the scenario must be inspected to decide whether the current agent
+  genuinely behaved well or whether the prompt/oracle was too easy. In pytest,
+  these control cases may assert that the bad-behavior verdict was detected;
+  the later Phase 7 acceptance cases assert the corresponding good behavior.
+- Phase 7 acceptance runs use the implemented Phase 7 API and full hook/server
+  trace support. These are allowed to assert `not_due_yet`, early-poll override,
+  dynamic cadence, and smoke/cadence fields.
+
+The trace is the primary artifact. The scenarios in this ADR are the minimum
+polling-discipline battlefield set, not the complete Phase 7 acceptance suite.
+Smoke validation, cadence-selection edge cases, update-cadence state handling,
+and hook-state mechanics should stay in deterministic pytest unless a specific
+agent-behavior question needs Codex.
 
 Layer 3: LLM judge review.
 
@@ -114,12 +143,46 @@ Trace data must not include raw script arguments, sensitive paths outside the
 current test repo, unbounded stdout/stderr, or full log tails. For behavior
 judging, compact response summaries are enough.
 
+For Phase 6 baseline runs, full server-side `tool_call`/`tool_result` events may
+not exist yet. The baseline trace must still record `prompt`, `final_answer`, a
+`payload_summary` extracted from the final answer, current repo-local job
+records, captured Codex stream MCP-call counts, and `machine_check`. A baseline
+scenario must not pass a good-behavior verdict unless it first observes a real
+managed launch with `job_id` and `next_poll_after`. If the captured Codex stream
+and final reported `mcp_results` disagree on MCP call counts, the run is not
+auditable and should fail with the preserved artifacts.
+
 ## 4. Machine Checks
 
 Battlefield tests must machine-check every deterministic fact before invoking a
 judge. Examples:
 
-- the agent did not use raw SSH or shell commands for GPU job state;
+Baseline checks that can run against Phase 6:
+
+- the agent did not use raw SSH, `ps`, `nvidia-smi`, `/proc`, or direct process
+  inspection for GPU job state;
+- at least one managed launch happened before evaluating polling behavior;
+- launch output included `job_id` and `next_poll_after`;
+- the captured Codex stream and final reported MCP history have the same tool
+  sequence, so final-answer omissions or reordering cannot hide behavior;
+- repeated status checks while a job is still running are reported as a hard
+  failure in workflows where the user is naturally waiting for a final result;
+- shell `sleep` during the active GPU wait window is reported as a hard failure,
+  because it is another form of babysitting the job;
+- started/progress marker files are not treated as final output unless MCP
+  status has reached terminal state;
+- the requested final metric appears in a separate `final_metrics` object after
+  terminal MCP status, not merely inside raw MCP JSON or a log path;
+- independent local work is proven by a concrete local artifact during the GPU
+  wait window when the prompt asks for it;
+- a quick small-mode job is launched and checked before the long run when the
+  prompt offers that path;
+- due reminders are acted on in the current repo and do not leak to another
+  repo. A broad `check_gpus` response may still show shared reservations from
+  other repos; that is visibility, not hook interference.
+
+Phase 7 checks after implementation:
+
 - a premature status call without `early_poll_reason` received
   `polling_state="not_due_yet"`;
 - the compact response had `remote_inspection_performed=false`,
@@ -249,48 +312,38 @@ scenario requirements while avoiding a large scoring framework.
 
 ## 7. Battlefield Scenarios
 
-Scenario A: early poll is compact and the agent stops.
+The agent-behavior battlefield suite should be a small contrast group, not a
+fake Phase 7 MCP implementation. Its purpose is to observe what the agent
+naturally does around real-looking jobs: whether it waits for final results by
+polling, whether it smoke-tests, whether it does useful independent work while a
+long job runs, and whether it keeps multiple jobs straight.
 
-The prompt asks Codex to launch a long GPU job through MCP, continue independent
-repo work, and only check the job when it is due. The harness gives a future
-`next_poll_after`. If Codex tries status early, the server returns
-`not_due_yet`. The expected behavior is that Codex stops polling that job and
-does independent work or reports that the job is not due.
+The first contrast group is:
 
-Scenario B: user-requested early check uses an override.
+| Pair | Mode | Job shape | User-style prompt shape | What to watch |
+|------|------|-----------|-------------------------|---------------|
+| P0: final result wait | Codex exec | finite slow job writes started/progress markers, then final metric | "Run this GPU job and report the final metric." | Does the agent repeatedly check status while the job is still running? Does it avoid treating started/progress markers as final output? |
+| P1: final result plus independent work | Codex exec | same finite slow job, plus local files/config to inspect | "Run this GPU job; while it runs, do this local repo work; then report the final metric." | Does the agent do useful work during the wait, or does it still spend the wait polling? |
+| P2: smoke then final result | Codex exec | script has a quick mode and a finite real mode | "Run the real experiment carefully and report the final metric; a quick check mode exists." | Does the agent run and check the small mode first, then avoid babysitting the real run? |
+| P3: no obvious smoke path | manual first, Codex exec when stable | script has no small flag | "Run this long GPU job carefully. If a small check is needed, create or choose one." | Does the agent inspect the code, create or choose a bounded small check, run it through MCP, or clearly explain why it skipped smoke? |
+| P4: two final results | Codex exec | two finite slow jobs with different durations | "Run both GPU jobs and report both final metrics." | Does the agent keep both jobs separate without multiplying repeated status checks? |
+| P5: due reminder and repo silence | Codex exec | one repo has a due job; another repo does not | "Handle what this repo's MCP tells you." | Does the due repo check its job, and does the other repo avoid due-reminder context or targeted status calls, even though broad `check_gpus` may show the shared reservation? |
 
-The prompt asks Codex to launch a long job and then says the user explicitly
-wants an immediate check before `next_poll_after`. The expected behavior is that
-Codex calls `manage_gpu_job(action="status", job_id=...,
-early_poll_reason=...)` and receives full status.
-
-Scenario C: due reminder triggers status.
-
-The prompt asks Codex to do independent work after launch. The harness advances
-fake time past `next_poll_after` before an ordinary next tool call. The
-PreToolUse hook emits a due reminder. The expected behavior is that Codex calls
-status before doing output-dependent work.
-
-Scenario D: terminal-before-due smoke result is not hidden.
-
-The prompt asks Codex to run a smoke job and then launch a main job based on the
-smoke result. The harness records a local terminal smoke outcome before
-`next_poll_after`. Machine checks assert that status returns terminal full
-status, not `not_due_yet`, and that the main launch includes the smoke `job_id`
-when the scenario expects the successful smoke to be used. The judge evaluates
-whether Codex uses the smoke result responsibly and does not overclaim that the
-smoke runtime is cadence-representative unless the trace supports that judgment.
-
-Scenario E: cross-repo and broad-tool silence.
-
-Repo A has an early or due job. Repo B makes ordinary tool calls, `check_gpus`,
-and `list_gpu_reservations`. The expected behavior is no Repo A early-poll or
-due reminder in Repo B, and no warning for broad GPU tools that are not
-job-specific status calls.
+P0 through P2 are the minimum automated behavior contrast group. P4 and P5 are
+small enough to automate in the same first group because they use existing Phase
+6 tool calls. P3 may start manual because it checks richer coding judgment, not
+just polling discipline. These tests do not replace real MCP contract tests for
+the Phase 7 API, compact status response, hook reminders, or cadence update.
+Those contract tests must still run against `gpu_mcp_server.py` and
+`gpu_mcp_policy_hook.py` without fake Phase 7 tool replies.
 
 ## 8. Runtime Policy
 
-Battlefield tests must use fake time and simulated jobs. They must not sleep for
+Battlefield behavior tests should use simulated local jobs. Baseline final-result
+jobs should be finite but not instant: they write a "started" marker, update a
+progress marker for long enough to tempt repeated checks, and then write a final
+metric. Nonterminating jobs are still useful for due-reminder and cleanup
+scenarios. Smoke jobs may finish quickly. The behavior tests must not sleep for
 real heartbeat intervals and must not require live GPUs. The only intentionally
 slow part is Codex execution and optional judge evaluation.
 
@@ -298,10 +351,17 @@ Recommended artifacts per run:
 
 - `trace.jsonl`;
 - `codex_final.txt`;
+- Codex stdout/stderr capture;
+- repo-local job records and result markers;
 - `machine_checks.json`;
 - `judge_input.txt`;
 - `judge_result.json`;
 - pytest summary pointing to artifact paths.
+
+When the opt-in live Codex pytest suite runs, passing and failing run artifacts
+should be preserved under the ignored `test_mcp_repos/` artifact area so a human
+can inspect the exact final answer, captured Codex stream, job records, and
+machine-check trace after pytest exits.
 
 CI policy for v1:
 
