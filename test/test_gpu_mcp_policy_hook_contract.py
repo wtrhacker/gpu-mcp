@@ -1367,6 +1367,17 @@ def test_phase7_main_launch_hook_nudges_smoke_or_skip_without_blocking(
             "expected_duration_sec": 3600,
         },
     )
+    with_cadence_hint = hook.check_phase7_pretooluse_guidance(
+        repo,
+        tool_name="repo_managed_gpu/run_python_on_gpu",
+        tool_input={
+            "host": "gpu-a",
+            "gpu_index": 0,
+            "script_path": "jobs/train.py",
+            "async_mode": True,
+            "cadence_hint_sec": 600,
+        },
+    )
     one_off = hook.check_phase7_pretooluse_guidance(
         repo,
         tool_name="repo_managed_gpu/run_python_on_gpu",
@@ -1388,14 +1399,32 @@ def test_phase7_main_launch_hook_nudges_smoke_or_skip_without_blocking(
             "smoke_skip_reason": "user asked to skip smoke for this run",
         },
     )
+    with_smoke = hook.check_phase7_pretooluse_guidance(
+        repo,
+        tool_name="repo_managed_gpu/run_python_on_gpu",
+        tool_input={
+            "host": "gpu-a",
+            "gpu_index": 0,
+            "script_path": "jobs/train.py",
+            "async_mode": True,
+            "smoke_job_id": "job-20260530T123456Z-smokeok",
+        },
+    )
 
     assert result is not None
     context = result["hookSpecificOutput"]["additionalContext"]
     assert "job_role=\"smoke\"" in context
     assert "smoke_skip_reason" in context
     assert "expected_duration_sec" in context
+    assert "decision" not in result
+    assert with_cadence_hint is not None
+    hint_context = with_cadence_hint["hookSpecificOutput"]["additionalContext"]
+    assert "smoke_skip_reason" in hint_context
+    assert "cadence_hint_sec" in hint_context
+    assert "decision" not in with_cadence_hint
     assert one_off is None
     assert with_skip is None
+    assert with_smoke is None
 
 
 def test_phase7_early_status_hook_silent_for_non_targeted_or_intentional_checks(
@@ -1551,6 +1580,53 @@ def test_phase7_early_status_hook_silent_for_due_terminal_or_cross_repo_jobs(
     assert cross_repo_result is None
 
 
+@pytest.mark.parametrize(
+    ("stored_value", "remove_field"),
+    [
+        (None, True),
+        (None, False),
+        ("", False),
+        ("not-a-date", False),
+        ("2099-01-01T00:00:00+00:00", False),
+        ("2099-01-01T00:00:00Z garbage", False),
+    ],
+)
+def test_phase7_early_status_hook_silent_for_missing_or_malformed_next_poll_after(
+    tmp_path,
+    monkeypatch,
+    stored_value,
+    remove_field,
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_config(repo)
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    job_record = _seed_hook_job(
+        repo,
+        registry,
+        next_poll_after="2026-05-30T13:00:00Z",
+    )
+    reservations = importlib.import_module("gpu_mcp_reservations")
+    record_path = reservations.job_record_path(repo, job_record["job_id"])
+    record = json.loads(record_path.read_text())
+    if remove_field:
+        record.pop("next_poll_after", None)
+    else:
+        record["next_poll_after"] = stored_value
+    reservations.atomic_write_json(record_path, record)
+    hook = importlib.import_module("gpu_mcp_policy_hook")
+
+    result = hook.check_phase7_pretooluse_guidance(
+        repo,
+        tool_name="repo_managed_gpu/manage_gpu_job",
+        tool_input={"action": "status", "job_id": job_record["job_id"]},
+        now=datetime(2026, 5, 30, 12, 5, tzinfo=timezone.utc),
+    )
+
+    assert result is None
+
+
 def test_phase7_main_launch_hook_respects_explicit_role_and_skip_inputs(
     tmp_path,
 ):
@@ -1645,6 +1721,49 @@ def test_phase7_main_launch_hook_emits_compact_additional_context_shape(
     assert "jobs/train.py" not in context
 
 
+def test_phase7_early_status_hook_wires_pretooluse_guidance_through_main(
+    tmp_path,
+    monkeypatch,
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    config = _write_config(repo)
+    store = tmp_path / "approved-policies.json"
+    _approve_policy(config, store)
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    monkeypatch.setenv("GPU_MCP_TEST_NOW", "2026-05-30T12:05:00Z")
+    job_record = _seed_hook_job(
+        repo,
+        registry,
+        next_poll_after="2026-05-30T13:00:00Z",
+    )
+
+    completed = subprocess.run(
+        [sys.executable, str(HOOK), "--store", str(store)],
+        input=json.dumps({
+            "hook_event_name": "PreToolUse",
+            "cwd": str(repo),
+            "tool_name": "repo_managed_gpu/manage_gpu_job",
+            "tool_input": {"action": "status", "job_id": job_record["job_id"]},
+        }),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+    assert completed.returncode == 0
+    assert completed.stdout, "early status guidance must be emitted through hook main"
+    result = json.loads(completed.stdout)
+    assert "decision" not in result
+    context = result["hookSpecificOutput"]["additionalContext"]
+    assert "not due" in context
+    assert "early_poll_reason" in context
+    assert job_record["job_id"] in context
+    assert "hook_job.py" not in context
+
+
 def test_phase7_main_hook_wires_pretooluse_guidance_through_main(
     tmp_path,
 ):
@@ -1681,6 +1800,38 @@ def test_phase7_main_hook_wires_pretooluse_guidance_through_main(
     assert "job_role=\"smoke\"" in context
     assert "smoke_skip_reason" in context
     assert "jobs/train.py" not in context
+
+
+def test_phase7_pretooluse_guidance_is_silent_for_posttooluse(
+    tmp_path,
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    config = _write_config(repo)
+    store = tmp_path / "approved-policies.json"
+    _approve_policy(config, store)
+
+    completed = subprocess.run(
+        [sys.executable, str(HOOK), "--store", str(store)],
+        input=json.dumps({
+            "hook_event_name": "PostToolUse",
+            "cwd": str(repo),
+            "tool_name": "repo_managed_gpu/run_python_on_gpu",
+            "tool_input": {
+                "host": "gpu-a",
+                "gpu_index": 0,
+                "script_path": "jobs/train.py",
+                "async_mode": True,
+            },
+        }),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+    assert completed.returncode == 0
+    assert completed.stdout == ""
 
 
 def test_phase7_main_hook_keeps_stale_policy_block_ahead_of_guidance(
