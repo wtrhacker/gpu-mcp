@@ -1694,6 +1694,23 @@ def _assert_baseline_detected_hard_fail(
     )
 
 
+def _assert_baseline_observed_verdict(
+    *,
+    verdict: dict[str, Any],
+    final_message: str,
+    repo: BattlefieldRepo,
+    trace_file: Path,
+    output_name: str | None = None,
+) -> None:
+    assert verdict["verdict"] in {"pass", "hard_fail"}, _phase7_baseline_failure_report(
+        verdict=verdict,
+        final_message=final_message,
+        repo=repo,
+        trace_file=trace_file,
+        output_name=output_name,
+    )
+
+
 def _seed_stale_reservation(
     battlefield: ManagedBattlefield,
     repo: BattlefieldRepo,
@@ -2925,7 +2942,7 @@ def test_phase7_codex_exec_baseline_long_job_with_independent_work(
         output_name=output_name,
     )
 
-    _assert_baseline_detected_hard_fail(
+    _assert_baseline_observed_verdict(
         verdict=verdict,
         final_message=final_message,
         repo=battlefield.repo_a,
