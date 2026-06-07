@@ -28,8 +28,9 @@ live_codex_exec = pytest.mark.skipif(
     os.environ.get("GPU_MCP_RUN_CODEX_EXEC_TESTS") != "1",
     reason="set GPU_MCP_RUN_CODEX_EXEC_TESTS=1 to run live codex exec battlefield probes",
 )
-future_phase7_codex_api = pytest.mark.skip(
-    reason="future Phase 7 API acceptance; Phase 6 live baseline tests use existing API only"
+future_phase7_codex_api = pytest.mark.skipif(
+    os.environ.get("GPU_MCP_RUN_PHASE7_CODEX_API_TESTS") != "1",
+    reason="set GPU_MCP_RUN_PHASE7_CODEX_API_TESTS=1 to run future Phase 7 API battlefield probes",
 )
 
 

@@ -12,6 +12,7 @@ import sys
 import textwrap
 import time
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -86,6 +87,115 @@ def _wait_for_path(path: Path, *, timeout: float = 5.0) -> None:
             return
         time.sleep(0.01)
     raise AssertionError(f"timed out waiting for {path}")
+
+
+def _rfc3339(value: datetime) -> str:
+    return value.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _seed_phase7_smoke_record(
+    server,
+    repo: Path,
+    *,
+    job_role: str = "smoke",
+    terminal_status: str | None = "success",
+    runtime_sec: int = 120,
+) -> dict:
+    script = repo / "jobs" / f"smoke_{uuid.uuid4().hex[:8]}.py"
+    script.write_text("print('smoke')\n")
+    job_id = server.reservations.generate_job_id(suffix=f"smoke-{uuid.uuid4().hex[:8]}")
+    attempt_id = server.reservations.generate_attempt_id(suffix=f"smoke-{uuid.uuid4().hex[:8]}")
+    reservation_key = server.reservations.reservation_key("gpu-a", 0)
+    started = datetime(2026, 5, 30, 12, 0, tzinfo=timezone.utc)
+    ended = started + timedelta(seconds=runtime_sec)
+    record = server.reservations.build_job_record(
+        job_id=job_id,
+        attempt_id=attempt_id,
+        reservation_key_value=reservation_key,
+        host="gpu-a",
+        gpu_index=0,
+        script_path=script,
+        args=["--small"],
+        output_file=repo / ".gpu_mcp_logs" / f"{job_id}.log",
+        server_instance_id=server.SERVER_INSTANCE_ID,
+        next_poll_after=_rfc3339(ended + timedelta(seconds=60)),
+        created_at=_rfc3339(started),
+    )
+    record.update(
+        {
+            "job_role": job_role,
+            "job_role_defaulted": False,
+            "heartbeat_interval_sec": 60,
+            "job_lifecycle": (
+                "running"
+                if terminal_status is None
+                else "succeeded" if terminal_status == "success" else "failed"
+            ),
+            "cadence_basis": {
+                "source": "conservative_no_evidence",
+                "selected_interval_sec": 60,
+            },
+        }
+    )
+    server.reservations.atomic_write_json(server.reservations.job_record_path(repo, job_id), record)
+    if terminal_status is not None:
+        outcome = server.reservations.build_outcome_record(
+            job_id=job_id,
+            attempt_id=attempt_id,
+            reservation_key_value=reservation_key,
+            host="gpu-a",
+            gpu_index=0,
+            terminal_status=terminal_status,
+            started_at=_rfc3339(started),
+            ended_at=_rfc3339(ended),
+            remote_pid=12345,
+            exit_code=0 if terminal_status == "success" else 1,
+        )
+        server.reservations.atomic_write_json(
+            server.reservations.outcome_record_path(repo, job_id, attempt_id),
+            outcome,
+        )
+    return record
+
+
+def _assert_phase7_private_fields_not_shared(metadata: dict) -> None:
+    private_fields = {
+        "job_role",
+        "job_role_defaulted",
+        "smoke_job_id",
+        "smoke_cadence_representative",
+        "smoke_skip_reason",
+        "expected_duration_sec",
+        "cadence_hint_sec",
+        "cadence_basis",
+        "cadence_update_reason",
+        "last_early_poll_reason",
+        "last_early_poll_at",
+    }
+    leaked = private_fields.intersection(metadata)
+    assert leaked == set()
+
+
+def _launch_phase7_setup_job(
+    server,
+    *,
+    host: str,
+    gpu_index: int,
+    script_path: str,
+    output_file: str,
+) -> dict:
+    kwargs = {
+        "host": host,
+        "gpu_index": gpu_index,
+        "script_path": script_path,
+        "output_file": output_file,
+    }
+    try:
+        return json.loads(server.run_python_on_gpu(**kwargs, job_role="one_off"))
+    except TypeError as exc:
+        if "job_role" not in str(exc):
+            raise
+        return json.loads(server.run_python_on_gpu(**kwargs))
 
 
 def test_server_refuses_to_start_without_explicit_config():
@@ -2144,12 +2254,14 @@ def test_phase7_status_before_next_poll_is_compact_and_local_only(
     server = _import_server_with_config(monkeypatch, config)
     monkeypatch.setattr(server, "_is_local_host", lambda host: False)
     monkeypatch.setattr(server, "_ssh_run", lambda host, cmd: "12345\n")
-    launched = json.loads(server.run_python_on_gpu(
+    launched = _launch_phase7_setup_job(
+        server,
         host="gpu-a",
         gpu_index=0,
         script_path="jobs/hold.py",
         output_file=".gpu_mcp_logs/hold.log",
-    ))
+    )
+    metadata_before = json.loads((registry / "gpu-a.gpu0" / "metadata.json").read_text())
     record_path = server.reservations.job_record_path(repo_fixture, launched["job_id"])
     original = json.loads(record_path.read_text())
     original["next_poll_after"] = "2099-01-01T00:00:00Z"
@@ -2173,12 +2285,13 @@ def test_phase7_status_before_next_poll_is_compact_and_local_only(
     assert status["log_tail_included"] is False
     assert status["job_id"] == launched["job_id"]
     assert status["reservation_key"] == launched["reservation_key"]
-    assert status["heartbeat_interval_sec"] == 600
+    assert status["heartbeat_interval_sec"] == 60
     assert status["next_poll_after"] == "2099-01-01T00:00:00Z"
     assert status["seconds_until_due"] > 0
     assert inspections == []
     assert reread["next_poll_after"] == "2099-01-01T00:00:00Z"
     assert reread["last_status_checked_at"] is None
+    assert json.loads((registry / "gpu-a.gpu0" / "metadata.json").read_text()) == metadata_before
 
 
 def test_phase7_expected_duration_selects_short_cadence_for_main_launch(
@@ -2209,9 +2322,10 @@ def test_phase7_expected_duration_selects_short_cadence_for_main_launch(
     assert launched["status"] == "launched"
     assert launched["job_role"] == "main"
     assert launched["heartbeat_interval_sec"] == 60
-    assert launched["cadence_basis"]["source"] == "expected_duration_sec"
+    assert launched["cadence_basis"]["source"] == "expected_duration"
     assert launched["cadence_basis"]["expected_duration_sec"] == 120
     assert metadata["heartbeat_interval_sec"] == 60
+    _assert_phase7_private_fields_not_shared(metadata)
 
 
 def test_phase7_early_poll_reason_forces_full_status_and_records_override(
@@ -2227,12 +2341,13 @@ def test_phase7_early_poll_reason_forces_full_status_and_records_override(
     server = _import_server_with_config(monkeypatch, config)
     monkeypatch.setattr(server, "_is_local_host", lambda host: False)
     monkeypatch.setattr(server, "_ssh_run", lambda host, cmd: "12345\n")
-    launched = json.loads(server.run_python_on_gpu(
+    launched = _launch_phase7_setup_job(
+        server,
         host="gpu-a",
         gpu_index=0,
         script_path="jobs/hold.py",
         output_file=".gpu_mcp_logs/hold.log",
-    ))
+    )
     record_path = server.reservations.job_record_path(repo_fixture, launched["job_id"])
     record = json.loads(record_path.read_text())
     record["next_poll_after"] = "2099-01-01T00:00:00Z"
@@ -2275,12 +2390,13 @@ def test_phase7_update_cadence_clamps_hint_and_updates_heartbeat_metadata(
     server = _import_server_with_config(monkeypatch, config)
     monkeypatch.setattr(server, "_is_local_host", lambda host: False)
     monkeypatch.setattr(server, "_ssh_run", lambda host, cmd: "12345\n")
-    launched = json.loads(server.run_python_on_gpu(
+    launched = _launch_phase7_setup_job(
+        server,
         host="gpu-a",
         gpu_index=0,
         script_path="jobs/hold.py",
         output_file=".gpu_mcp_logs/hold.log",
-    ))
+    )
     record_path = server.reservations.job_record_path(repo_fixture, launched["job_id"])
 
     try:
@@ -2298,12 +2414,592 @@ def test_phase7_update_cadence_clamps_hint_and_updates_heartbeat_metadata(
     assert updated["status"] == "ok"
     assert updated["action"] == "update_cadence"
     assert updated["heartbeat_interval_sec"] == 60
-    assert updated["cadence_basis"]["source"] == "cadence_hint_sec"
+    assert updated["cadence_basis"]["source"] == "cadence_hint"
     assert updated["cadence_basis"]["cadence_hint_sec"] == 45
     assert updated["next_poll_after"] == record["next_poll_after"]
     assert metadata["heartbeat_interval_sec"] == 60
     assert metadata["last_heartbeat_at"] == record["last_heartbeat_at"]
+    _assert_phase7_private_fields_not_shared(metadata)
     assert record["cadence_update_reason"] == "initial smoke estimate was too aggressive"
+
+
+def test_phase7_async_false_defaults_one_off_and_reports_role(
+    repo_fixture,
+    tmp_path,
+    monkeypatch,
+):
+    config = _write_config(repo_fixture)
+    script = repo_fixture / "jobs" / "probe.py"
+    script.write_text("print('probe')\n")
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    server = _import_server_with_config(monkeypatch, config)
+    monkeypatch.setattr(server, "_is_local_host", lambda host: False)
+    monkeypatch.setattr(server, "_ssh_run", lambda host, cmd: "12345\n")
+
+    launched = json.loads(server.run_python_on_gpu(
+        host="gpu-a",
+        gpu_index=0,
+        script_path="jobs/probe.py",
+        async_mode=False,
+        output_file=".gpu_mcp_logs/probe.log",
+    ))
+
+    assert launched["status"] == "launched"
+    assert launched["job_role"] == "one_off"
+    assert launched["job_role_defaulted"] is True
+    assert launched["heartbeat_interval_sec"] == 60
+    assert launched["cadence_basis"]["source"] == "conservative_no_evidence"
+    assert launched["cadence_basis"]["selected_interval_sec"] == 60
+
+
+def test_phase7_cadence_hint_clamps_and_wins_over_expected_duration(
+    repo_fixture,
+    tmp_path,
+    monkeypatch,
+):
+    config = _write_config(repo_fixture)
+    script = repo_fixture / "jobs" / "train.py"
+    script.write_text("print('training')\n")
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    server = _import_server_with_config(monkeypatch, config)
+    monkeypatch.setattr(server, "_is_local_host", lambda host: False)
+    monkeypatch.setattr(server, "_ssh_run", lambda host, cmd: "12345\n")
+
+    launched = json.loads(server.run_python_on_gpu(
+        host="gpu-a",
+        gpu_index=0,
+        script_path="jobs/train.py",
+        async_mode=True,
+        output_file=".gpu_mcp_logs/train.log",
+        smoke_skip_reason="user approved skipping smoke for this contract test",
+        expected_duration_sec=7201,
+        cadence_hint_sec=5000,
+    ))
+    metadata = json.loads((registry / "gpu-a.gpu0" / "metadata.json").read_text())
+
+    assert launched["status"] == "launched"
+    assert launched["heartbeat_interval_sec"] == 3600
+    assert launched["cadence_basis"]["source"] == "cadence_hint"
+    assert launched["cadence_basis"]["cadence_hint_sec"] == 5000
+    assert launched["cadence_basis"]["expected_duration_sec"] == 7201
+    assert launched["cadence_basis"]["selected_interval_sec"] == 3600
+    assert metadata["heartbeat_interval_sec"] == 3600
+    _assert_phase7_private_fields_not_shared(metadata)
+
+
+def test_phase7_expected_duration_uses_pinned_coarse_bands(
+    repo_fixture,
+    tmp_path,
+    monkeypatch,
+):
+    config = _write_config(repo_fixture)
+    script = repo_fixture / "jobs" / "train.py"
+    script.write_text("print('training')\n")
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    server = _import_server_with_config(monkeypatch, config)
+    monkeypatch.setattr(server, "_is_local_host", lambda host: False)
+    monkeypatch.setattr(server, "_ssh_run", lambda host, cmd: "12345\n")
+    cases = [
+        (300, 60),
+        (301, 180),
+        (1800, 180),
+        (1801, 600),
+        (7200, 600),
+        (7201, 1800),
+    ]
+
+    for gpu_index, (expected_duration, selected_interval) in enumerate(cases):
+        launched = json.loads(server.run_python_on_gpu(
+            host="gpu-a",
+            gpu_index=gpu_index,
+            script_path="jobs/train.py",
+            async_mode=True,
+            output_file=f".gpu_mcp_logs/train-{gpu_index}.log",
+            smoke_skip_reason="user approved skipping smoke for this contract test",
+            expected_duration_sec=expected_duration,
+        ))
+
+        assert launched["status"] == "launched"
+        assert launched["heartbeat_interval_sec"] == selected_interval
+        assert launched["cadence_basis"]["source"] == "expected_duration"
+        assert launched["cadence_basis"]["expected_duration_sec"] == expected_duration
+        assert launched["cadence_basis"]["selected_interval_sec"] == selected_interval
+
+
+def test_phase7_invalid_cadence_inputs_are_refused_without_reservation(
+    repo_fixture,
+    tmp_path,
+    monkeypatch,
+):
+    config = _write_config(repo_fixture)
+    script = repo_fixture / "jobs" / "train.py"
+    script.write_text("print('training')\n")
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    server = _import_server_with_config(monkeypatch, config)
+    cases = [
+        {"cadence_hint_sec": True},
+        {"cadence_hint_sec": "60"},
+        {"cadence_hint_sec": 0},
+        {"cadence_hint_sec": -1},
+        {"cadence_hint_sec": float("inf")},
+        {"expected_duration_sec": False},
+        {"expected_duration_sec": "300"},
+        {"expected_duration_sec": 0},
+    ]
+
+    for kwargs in cases:
+        result = json.loads(server.run_python_on_gpu(
+            host="gpu-a",
+            gpu_index=0,
+            script_path="jobs/train.py",
+            async_mode=True,
+            output_file=".gpu_mcp_logs/train.log",
+            smoke_skip_reason="user approved skipping smoke for this contract test",
+            **kwargs,
+        ))
+
+        assert result["status"] == "refused"
+        assert "cadence" in result["reason"] or "duration" in result["reason"]
+    assert not registry.exists() or not any(registry.iterdir())
+
+
+def test_phase7_main_with_skip_but_no_cadence_uses_conservative_basis(
+    repo_fixture,
+    tmp_path,
+    monkeypatch,
+):
+    config = _write_config(repo_fixture)
+    script = repo_fixture / "jobs" / "train.py"
+    script.write_text("print('training')\n")
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    server = _import_server_with_config(monkeypatch, config)
+    monkeypatch.setattr(server, "_is_local_host", lambda host: False)
+    monkeypatch.setattr(server, "_ssh_run", lambda host, cmd: "12345\n")
+
+    launched = json.loads(server.run_python_on_gpu(
+        host="gpu-a",
+        gpu_index=0,
+        script_path="jobs/train.py",
+        async_mode=True,
+        output_file=".gpu_mcp_logs/train.log",
+        smoke_skip_reason="user says this short run is itself the smoke check",
+    ))
+    metadata = json.loads((registry / "gpu-a.gpu0" / "metadata.json").read_text())
+
+    assert launched["status"] == "launched"
+    assert launched["job_role"] == "main"
+    assert launched["heartbeat_interval_sec"] == 60
+    assert launched["cadence_basis"]["source"] == "conservative_no_evidence"
+    assert launched["cadence_basis"]["conservative_reason"] == "smoke_skipped"
+    assert launched["cadence_basis"]["skip_reason_recorded"] is True
+    assert launched["cadence_basis"]["selected_interval_sec"] == 60
+    assert metadata["heartbeat_interval_sec"] == 60
+    _assert_phase7_private_fields_not_shared(metadata)
+
+
+def test_phase7_smoke_launch_is_managed_and_uses_minimum_first_check_without_hint(
+    repo_fixture,
+    tmp_path,
+    monkeypatch,
+):
+    config = _write_config(repo_fixture)
+    script = repo_fixture / "jobs" / "smoke.py"
+    script.write_text("print('smoke')\n")
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    server = _import_server_with_config(monkeypatch, config)
+    monkeypatch.setattr(server, "_is_local_host", lambda host: False)
+    monkeypatch.setattr(server, "_ssh_run", lambda host, cmd: "12345\n")
+
+    launched = json.loads(server.run_python_on_gpu(
+        host="gpu-a",
+        gpu_index=0,
+        script_path="jobs/smoke.py",
+        async_mode=True,
+        output_file=".gpu_mcp_logs/smoke.log",
+        job_role="smoke",
+    ))
+    record = json.loads(server.reservations.job_record_path(repo_fixture, launched["job_id"]).read_text())
+    metadata = json.loads((registry / "gpu-a.gpu0" / "metadata.json").read_text())
+
+    assert launched["status"] == "launched"
+    assert launched["job_role"] == "smoke"
+    assert launched["job_role_defaulted"] is False
+    assert launched["heartbeat_interval_sec"] == 60
+    assert launched["cadence_basis"]["source"] == "conservative_no_evidence"
+    assert launched["cadence_basis"]["conservative_reason"] == "missing_cadence_evidence"
+    assert record["job_role"] == "smoke"
+    assert metadata["heartbeat_interval_sec"] == 60
+    _assert_phase7_private_fields_not_shared(metadata)
+
+
+def test_phase7_successful_smoke_job_is_viability_only_without_cadence_signal(
+    repo_fixture,
+    tmp_path,
+    monkeypatch,
+):
+    config = _write_config(repo_fixture)
+    script = repo_fixture / "jobs" / "train.py"
+    script.write_text("print('training')\n")
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    server = _import_server_with_config(monkeypatch, config)
+    smoke = _seed_phase7_smoke_record(server, repo_fixture, runtime_sec=1801)
+    monkeypatch.setattr(server, "_is_local_host", lambda host: False)
+    monkeypatch.setattr(server, "_ssh_run", lambda host, cmd: "12345\n")
+
+    launched = json.loads(server.run_python_on_gpu(
+        host="gpu-a",
+        gpu_index=0,
+        script_path="jobs/train.py",
+        async_mode=True,
+        output_file=".gpu_mcp_logs/train.log",
+        smoke_job_id=smoke["job_id"],
+    ))
+
+    assert launched["status"] == "launched"
+    assert launched["heartbeat_interval_sec"] == 60
+    assert launched["cadence_basis"]["source"] == "smoke_job"
+    assert launched["cadence_basis"]["smoke_job_id"] == smoke["job_id"]
+    assert launched["cadence_basis"]["smoke_lifecycle"] == "succeeded"
+    assert launched["cadence_basis"]["positive_viability_evidence"] is True
+    assert launched["cadence_basis"]["cadence_evidence_used"] is False
+    assert launched["cadence_basis"]["conservative_reason"] == "smoke_observation_only"
+    assert launched["cadence_basis"]["selected_interval_sec"] == 60
+
+
+def test_phase7_representative_smoke_runtime_can_drive_cadence_band(
+    repo_fixture,
+    tmp_path,
+    monkeypatch,
+):
+    config = _write_config(repo_fixture)
+    script = repo_fixture / "jobs" / "train.py"
+    script.write_text("print('training')\n")
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    server = _import_server_with_config(monkeypatch, config)
+    smoke = _seed_phase7_smoke_record(server, repo_fixture, runtime_sec=1801)
+    monkeypatch.setattr(server, "_is_local_host", lambda host: False)
+    monkeypatch.setattr(server, "_ssh_run", lambda host, cmd: "12345\n")
+
+    launched = json.loads(server.run_python_on_gpu(
+        host="gpu-a",
+        gpu_index=0,
+        script_path="jobs/train.py",
+        async_mode=True,
+        output_file=".gpu_mcp_logs/train.log",
+        smoke_job_id=smoke["job_id"],
+        smoke_cadence_representative=True,
+    ))
+
+    assert launched["status"] == "launched"
+    assert launched["heartbeat_interval_sec"] == 600
+    assert launched["cadence_basis"]["source"] == "smoke_job"
+    assert launched["cadence_basis"]["smoke_job_id"] == smoke["job_id"]
+    assert launched["cadence_basis"]["smoke_runtime_sec"] == 1801
+    assert launched["cadence_basis"]["smoke_cadence_representative"] is True
+    assert launched["cadence_basis"]["cadence_evidence_used"] is True
+    assert launched["cadence_basis"]["selected_interval_sec"] == 600
+
+
+def test_phase7_main_launch_refuses_unusable_smoke_references(
+    repo_fixture,
+    tmp_path,
+    monkeypatch,
+):
+    config = _write_config(repo_fixture)
+    script = repo_fixture / "jobs" / "train.py"
+    script.write_text("print('training')\n")
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    server = _import_server_with_config(monkeypatch, config)
+    failed_smoke = _seed_phase7_smoke_record(server, repo_fixture, terminal_status="failure")
+    wrong_role = _seed_phase7_smoke_record(server, repo_fixture, job_role="main")
+    cases = [
+        ("job-20260530T120000Z-missing", None),
+        (failed_smoke["job_id"], "failed"),
+        (wrong_role["job_id"], None),
+    ]
+
+    for smoke_job_id, smoke_lifecycle in cases:
+        result = json.loads(server.run_python_on_gpu(
+            host="gpu-a",
+            gpu_index=0,
+            script_path="jobs/train.py",
+            async_mode=True,
+            output_file=".gpu_mcp_logs/train.log",
+            smoke_job_id=smoke_job_id,
+        ))
+
+        assert result["status"] == "refused"
+        assert result["cadence_basis"]["smoke_job_id"] == smoke_job_id
+        assert result["cadence_basis"]["positive_viability_evidence"] is False
+        if smoke_lifecycle is not None:
+            assert result["cadence_basis"]["smoke_lifecycle"] == smoke_lifecycle
+    assert not registry.exists() or not any(registry.iterdir())
+
+
+@pytest.mark.parametrize(
+    ("stored_value", "remove_field"),
+    [
+        (None, True),
+        (None, False),
+        ("", False),
+        ("not-a-date", False),
+        ("2099-01-01T00:00:00+00:00", False),
+        ("2099-01-01T00:00:00Z garbage", False),
+    ],
+)
+def test_phase7_malformed_next_poll_after_takes_full_status_path(
+    repo_fixture,
+    tmp_path,
+    monkeypatch,
+    stored_value,
+    remove_field,
+):
+    config = _write_config(repo_fixture)
+    script = repo_fixture / "jobs" / "hold.py"
+    script.write_text("print('still running')\n")
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    server = _import_server_with_config(monkeypatch, config)
+    monkeypatch.setattr(server, "_is_local_host", lambda host: False)
+    monkeypatch.setattr(server, "_ssh_run", lambda host, cmd: "12345\n")
+    launched = _launch_phase7_setup_job(
+        server,
+        host="gpu-a",
+        gpu_index=0,
+        script_path="jobs/hold.py",
+        output_file=".gpu_mcp_logs/hold.log",
+    )
+    record_path = server.reservations.job_record_path(repo_fixture, launched["job_id"])
+    record = json.loads(record_path.read_text())
+    if remove_field:
+        record.pop("next_poll_after", None)
+    else:
+        record["next_poll_after"] = stored_value
+    server.reservations.atomic_write_json(record_path, record)
+    inspections = []
+    monkeypatch.setattr(
+        server,
+        "_inspect_reservation_process",
+        lambda metadata: inspections.append(metadata)
+        or {"status": "alive", "reason": "still running", "remote_pid": 12345},
+    )
+
+    status = json.loads(server.manage_gpu_job(action="status", job_id=launched["job_id"]))
+    reread = json.loads(record_path.read_text())
+
+    assert status["status"] == "ok"
+    assert status.get("polling_state") != "not_due_yet"
+    assert status["full_status_performed"] is True
+    assert status["remote_inspection_performed"] is True
+    assert inspections
+    assert reread["last_status_checked_at"] is not None
+
+
+def test_phase7_local_terminal_outcome_before_due_returns_full_terminal_status(
+    repo_fixture,
+    tmp_path,
+    monkeypatch,
+):
+    config = _write_config(repo_fixture)
+    script = repo_fixture / "jobs" / "quick.py"
+    script.write_text("print('done')\n")
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    server = _import_server_with_config(monkeypatch, config)
+    monkeypatch.setattr(server, "_is_local_host", lambda host: False)
+    monkeypatch.setattr(server, "_ssh_run", lambda host, cmd: "12345\n")
+    launched = _launch_phase7_setup_job(
+        server,
+        host="gpu-a",
+        gpu_index=0,
+        script_path="jobs/quick.py",
+        output_file=".gpu_mcp_logs/quick.log",
+    )
+    record_path = server.reservations.job_record_path(repo_fixture, launched["job_id"])
+    record = json.loads(record_path.read_text())
+    record["next_poll_after"] = "2099-01-01T00:00:00Z"
+    server.reservations.atomic_write_json(record_path, record)
+    attempt_id = record["active_attempt_id"]
+    server.reservations.atomic_write_json(
+        server.reservations.outcome_record_path(repo_fixture, launched["job_id"], attempt_id),
+        server.reservations.build_outcome_record(
+            job_id=launched["job_id"],
+            attempt_id=attempt_id,
+            reservation_key_value=launched["reservation_key"],
+            host="gpu-a",
+            gpu_index=0,
+            terminal_status="success",
+            started_at="2026-05-30T12:00:00Z",
+            ended_at="2026-05-30T12:00:05Z",
+            remote_pid=record["remote_pid"],
+            exit_code=0,
+        ),
+    )
+    monkeypatch.setattr(
+        server,
+        "_inspect_reservation_process",
+        lambda metadata: {"status": "gone", "reason": "process exited", "remote_pid": record["remote_pid"]},
+    )
+
+    status = json.loads(server.manage_gpu_job(action="status", job_id=launched["job_id"]))
+
+    assert status["status"] == "ok"
+    assert status.get("polling_state") != "not_due_yet"
+    assert status["full_status_performed"] is True
+    assert status["job_lifecycle"] == "succeeded"
+    assert status["outcome"]["terminal_status"] == "success"
+    assert status["next_poll_after"] is None
+
+
+def test_phase7_multi_job_status_gating_is_per_job(
+    repo_fixture,
+    tmp_path,
+    monkeypatch,
+):
+    config = _write_config(repo_fixture)
+    script = repo_fixture / "jobs" / "hold.py"
+    script.write_text("print('still running')\n")
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    server = _import_server_with_config(monkeypatch, config)
+    monkeypatch.setattr(server, "_is_local_host", lambda host: False)
+    monkeypatch.setattr(server, "_ssh_run", lambda host, cmd: "12345\n")
+    future = _launch_phase7_setup_job(
+        server,
+        host="gpu-a",
+        gpu_index=0,
+        script_path="jobs/hold.py",
+        output_file=".gpu_mcp_logs/future.log",
+    )
+    due = _launch_phase7_setup_job(
+        server,
+        host="gpu-a",
+        gpu_index=1,
+        script_path="jobs/hold.py",
+        output_file=".gpu_mcp_logs/due.log",
+    )
+    future_record_path = server.reservations.job_record_path(repo_fixture, future["job_id"])
+    due_record_path = server.reservations.job_record_path(repo_fixture, due["job_id"])
+    future_record = json.loads(future_record_path.read_text())
+    future_record["next_poll_after"] = "2099-01-01T00:00:00Z"
+    due_record = json.loads(due_record_path.read_text())
+    due_record["next_poll_after"] = "2000-01-01T00:00:00Z"
+    server.reservations.atomic_write_json(future_record_path, future_record)
+    server.reservations.atomic_write_json(due_record_path, due_record)
+    inspected_keys = []
+    monkeypatch.setattr(
+        server,
+        "_inspect_reservation_process",
+        lambda metadata: inspected_keys.append(metadata["reservation_key"])
+        or {"status": "alive", "reason": "still running", "remote_pid": metadata["remote_pid"]},
+    )
+
+    future_status = json.loads(server.manage_gpu_job(action="status", job_id=future["job_id"]))
+    due_status = json.loads(server.manage_gpu_job(action="status", job_id=due["job_id"]))
+
+    assert future_status["polling_state"] == "not_due_yet"
+    assert future_status["remote_inspection_performed"] is False
+    assert due_status.get("polling_state") != "not_due_yet"
+    assert due_status["full_status_performed"] is True
+    assert due_status["remote_inspection_performed"] is True
+    assert inspected_keys == [due["reservation_key"]]
+
+
+def test_phase7_update_cadence_refuses_missing_reason_or_cadence_input(
+    repo_fixture,
+    tmp_path,
+    monkeypatch,
+):
+    config = _write_config(repo_fixture)
+    script = repo_fixture / "jobs" / "hold.py"
+    script.write_text("print('still running')\n")
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    server = _import_server_with_config(monkeypatch, config)
+    monkeypatch.setattr(server, "_is_local_host", lambda host: False)
+    monkeypatch.setattr(server, "_ssh_run", lambda host, cmd: "12345\n")
+    launched = _launch_phase7_setup_job(
+        server,
+        host="gpu-a",
+        gpu_index=0,
+        script_path="jobs/hold.py",
+        output_file=".gpu_mcp_logs/hold.log",
+    )
+    metadata_before = json.loads((registry / "gpu-a.gpu0" / "metadata.json").read_text())
+    cases = [
+        {"cadence_hint_sec": 300},
+        {"cadence_hint_sec": 300, "reason": ""},
+        {"cadence_hint_sec": 300, "reason": "   "},
+        {"reason": "need a different cadence"},
+    ]
+
+    for kwargs in cases:
+        result = json.loads(server.manage_gpu_job(
+            action="update_cadence",
+            job_id=launched["job_id"],
+            **kwargs,
+        ))
+
+        assert result["status"] == "refused"
+        assert result["action"] == "update_cadence"
+    metadata_after = json.loads((registry / "gpu-a.gpu0" / "metadata.json").read_text())
+    assert metadata_after["heartbeat_interval_sec"] == metadata_before["heartbeat_interval_sec"]
+    assert metadata_after["last_heartbeat_at"] == metadata_before["last_heartbeat_at"]
+
+
+def test_phase7_update_cadence_refuses_non_owner_without_mutating_reservation(
+    repo_fixture,
+    tmp_path,
+    monkeypatch,
+):
+    config = _write_config(repo_fixture)
+    script = repo_fixture / "jobs" / "hold.py"
+    script.write_text("print('still running')\n")
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    server = _import_server_with_config(monkeypatch, config)
+    monkeypatch.setattr(server, "_is_local_host", lambda host: False)
+    monkeypatch.setattr(server, "_ssh_run", lambda host, cmd: "12345\n")
+    launched = _launch_phase7_setup_job(
+        server,
+        host="gpu-a",
+        gpu_index=0,
+        script_path="jobs/hold.py",
+        output_file=".gpu_mcp_logs/hold.log",
+    )
+    record_path = server.reservations.job_record_path(repo_fixture, launched["job_id"])
+    record_before = json.loads(record_path.read_text())
+    metadata_path = registry / "gpu-a.gpu0" / "metadata.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata["server_instance_id"] = "server-gpu-a-9999-other"
+    server.reservations.atomic_write_json(metadata_path, metadata)
+
+    result = json.loads(server.manage_gpu_job(
+        action="update_cadence",
+        job_id=launched["job_id"],
+        cadence_hint_sec=300,
+        reason="agent learned the run will take longer",
+    ))
+    reread = json.loads(metadata_path.read_text())
+    record_after = json.loads(record_path.read_text())
+
+    assert result["status"] == "refused"
+    assert "owner" in result["reason"] or "owned" in result["reason"]
+    assert reread["server_instance_id"] == "server-gpu-a-9999-other"
+    assert reread["heartbeat_interval_sec"] == metadata["heartbeat_interval_sec"]
+    assert reread["last_heartbeat_at"] == metadata["last_heartbeat_at"]
+    assert record_after.get("next_poll_after") == record_before.get("next_poll_after")
+    assert record_after.get("last_heartbeat_at") == record_before.get("last_heartbeat_at")
+    assert record_after.get("cadence_update_reason") == record_before.get("cadence_update_reason")
 
 
 def test_phase5_finish_alive_refuses_and_keeps_heartbeat(
