@@ -331,6 +331,110 @@ def _reminder_output(records: list[tuple[dict, datetime]], *, now: datetime) -> 
     }
 
 
+def _parse_next_poll_after(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value.endswith("Z") or " " in value:
+        return None
+    return _parse_hook_time(value)
+
+
+def _phase7_output(context: str) -> dict:
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "additionalContext": context,
+        },
+    }
+
+
+def _tool_suffix(tool_name: str) -> str:
+    return tool_name.rsplit("/", 1)[-1]
+
+
+def _nonempty_text(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    return text or None
+
+
+def _phase7_role(tool_input: dict) -> str:
+    raw_role = tool_input.get("job_role")
+    if isinstance(raw_role, str) and raw_role.strip().lower() in {"smoke", "main", "one_off"}:
+        return raw_role.strip().lower()
+    return "main" if tool_input.get("async_mode") is True else "one_off"
+
+
+def _phase7_launch_guidance(tool_input: object) -> dict | None:
+    if not isinstance(tool_input, dict):
+        return None
+    if _phase7_role(tool_input) != "main":
+        return None
+    if reservations.is_job_id(tool_input.get("smoke_job_id")):
+        return None
+    if _nonempty_text(tool_input.get("smoke_skip_reason")) is not None:
+        return None
+    context = (
+        "GPU MCP: you are about to launch a main/background GPU job without smoke evidence. "
+        "Before proceeding, either run run_python_on_gpu(job_role=\"smoke\", ...) with small "
+        "representative inputs, or retry the main launch with smoke_skip_reason explaining why "
+        "a smoke check is not useful. Cadence hints such as expected_duration_sec or "
+        "cadence_hint_sec help schedule checks, but do not replace smoke evidence or a skip reason."
+    )
+    return _phase7_output(context)
+
+
+def _phase7_status_guidance(
+    repo_root: Path,
+    tool_input: object,
+    *,
+    now: datetime,
+) -> dict | None:
+    if not isinstance(tool_input, dict):
+        return None
+    if str(tool_input.get("action") or "").strip().lower() != "status":
+        return None
+    if _nonempty_text(tool_input.get("early_poll_reason")) is not None:
+        return None
+    job_id = tool_input.get("job_id")
+    if not reservations.is_job_id(job_id):
+        return None
+    record = _read_json_quiet(reservations.job_record_path(repo_root, str(job_id)))
+    if not isinstance(record, dict):
+        return None
+    if record.get("job_lifecycle") in {"succeeded", "failed", "finished"}:
+        return None
+    next_poll_after = record.get("next_poll_after")
+    due_at = _parse_next_poll_after(next_poll_after)
+    if due_at is None or due_at <= now:
+        return None
+    context = (
+        f"GPU MCP: job {job_id} is not due for status until {next_poll_after}. "
+        "Do independent work or wait; do not use this job's outputs yet. "
+        f"If a full check is justified now, call manage_gpu_job(action=\"status\", "
+        f"job_id=\"{job_id}\", early_poll_reason=\"...\")."
+    )
+    return _phase7_output(context)
+
+
+def check_phase7_pretooluse_guidance(
+    cwd: str | Path,
+    *,
+    tool_name: str,
+    tool_input: object,
+    now: datetime | None = None,
+) -> dict | None:
+    policy_path = find_policy_file(cwd)
+    if policy_path is None:
+        return None
+    repo_root = policy_path.parent.resolve()
+    suffix = _tool_suffix(str(tool_name or ""))
+    if suffix == "run_python_on_gpu":
+        return _phase7_launch_guidance(tool_input)
+    if suffix == "manage_gpu_job":
+        return _phase7_status_guidance(repo_root, tool_input, now=now or _hook_now())
+    return None
+
+
 def check_test_hook_capability_nonce(*, env: dict[str, str] | None = None) -> dict | None:
     source = os.environ if env is None else env
     nonce = source.get(TEST_HOOK_CAPABILITY_NONCE_ENV, "").strip()
@@ -421,7 +525,22 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     if result is None and event.get("hook_event_name") == "PreToolUse":
-        result = check_test_hook_capability_nonce() or check_gpu_job_reminders(cwd)
+        tool_name = str(event.get("tool_name") or "")
+        tool_input = (
+            event.get("tool_input")
+            or event.get("toolInput")
+            or event.get("arguments")
+            or {"cmd": event.get("command")}
+        )
+        result = (
+            check_test_hook_capability_nonce()
+            or check_phase7_pretooluse_guidance(
+                cwd,
+                tool_name=tool_name,
+                tool_input=tool_input,
+            )
+            or check_gpu_job_reminders(cwd)
+        )
     if result is not None:
         print(json.dumps(result, sort_keys=True))
     return 0
