@@ -8,6 +8,9 @@ The AI-native installer entry point is
 overview and should not be treated as a replacement for the installer
 checklist.
 
+For the shortest practical path to enable the already-installed MCP in another
+repo, start with `INSTALL.md`.
+
 The install must prove two things:
 
 1. Repo-local Codex config can load the MCP with this repo's `gpu-mcp.toml`.

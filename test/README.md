@@ -105,6 +105,10 @@ behavior.
 - `test/test_gpu_mcp_doctor_contract.py`: AI-facing install doctor CLI,
   repo-local Codex config validation, policy approval records, timeout
   alignment, and Codex/MCP probe construction.
+- `test/test_installation_test_contract.py`: focused installer-facing readiness
+  command for a target repo, including static setup, mandatory Codex exec probe
+  construction, and explicit live GPU probe construction without running live
+  resources by default.
 - `test/test_gpu_mcp_policy_contract.py`: repo-local policy parsing and
   deterministic host, script-root, write-root, output-root, timeout, and
   Python-only guard behavior.
