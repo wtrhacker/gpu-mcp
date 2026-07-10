@@ -277,7 +277,12 @@ def _canonical_policy_host(host: str) -> str:
 
 
 def _host_run_error(host: str, cmd: str) -> str:
-    return HOST_RUN_ERRORS.get((host, cmd), "")
+    reason = HOST_RUN_ERRORS.get((host, cmd), "")
+    if reason:
+        return reason
+    if _is_local_host(host):
+        return HOST_RUN_ERRORS.get(("local", cmd), "")
+    return ""
 
 
 def _record_host_run_error(host: str, cmd: str, message: str) -> None:
@@ -1681,7 +1686,10 @@ def _inspect_reservation_process(metadata: dict) -> dict:
     ps_cmd = f"ps -p {pid} -o pid= -o user= -o stat= -o lstart="
     ps_raw = _host_run(host, ps_cmd, timeout=2)
     if ps_raw is None:
-        reason = _host_run_error(host, ps_cmd) or "process inspection failed"
+        reason = _host_run_error(host, ps_cmd)
+        if not reason and _is_local_host(host):
+            reason = HOST_RUN_ERRORS.get(("local", ps_cmd), "")
+        reason = reason or "process inspection failed"
         if _ps_exit_indicates_process_missing(reason):
             return {"status": "gone", "reason": "process not found", "remote_pid": pid}
         return {"status": "unknown", "reason": reason, "remote_pid": pid}
@@ -1923,6 +1931,15 @@ def _read_outcome_record(job_record: dict) -> dict | None:
     if outcome.get("terminal_status") not in {"success", "failure", "signaled", "launcher_error"}:
         return None
     return outcome
+
+
+def _job_lifecycle_from_outcome(outcome: dict | None) -> str | None:
+    if not isinstance(outcome, dict):
+        return None
+    terminal = outcome.get("terminal_status")
+    if terminal not in {"success", "failure", "signaled", "launcher_error"}:
+        return None
+    return "succeeded" if terminal == "success" else "failed"
 
 
 def _job_record_from_reservation_key(
@@ -2828,12 +2845,13 @@ def _job_status_response(
     remote_inspection_performed = False
     job_lifecycle = "running"
     outcome = local_outcome
+    terminal_lifecycle = _job_lifecycle_from_outcome(outcome)
+    metadata = None
     if not active_reservation:
-        if outcome is None:
+        if terminal_lifecycle is None:
             job_lifecycle = "process_gone_unknown_outcome"
         else:
-            terminal = outcome["terminal_status"]
-            job_lifecycle = "succeeded" if terminal == "success" else "failed"
+            job_lifecycle = terminal_lifecycle
     if reservation is not None:
         metadata = _read_reservation_metadata(str(reservation_key_value))
         if metadata is not None and isinstance(metadata.get("remote_pid"), int):
@@ -2842,11 +2860,41 @@ def _job_status_response(
             process.update(inspection)
             if inspection["status"] == "gone":
                 outcome = _read_outcome_record(job_record)
-                if outcome is None:
+                terminal_lifecycle = _job_lifecycle_from_outcome(outcome)
+                if terminal_lifecycle is None:
                     job_lifecycle = "process_gone_unknown_outcome"
                 else:
-                    terminal = outcome["terminal_status"]
-                    job_lifecycle = "succeeded" if terminal == "success" else "failed"
+                    job_lifecycle = terminal_lifecycle
+    if (
+        terminal_lifecycle is not None
+        and active_reservation
+        and owned
+        and healthy
+        and metadata is not None
+    ):
+        reservation_key_text = str(metadata["reservation_key"])
+        HEARTBEAT_MANAGER.unregister(reservation_key_text)
+        removed, _remove_reason = _remove_owned_finished_reservation(job_record, metadata)
+        if removed:
+            now = reservations.iso_timestamp()
+            updated = dict(job_record)
+            updated["active_reservation"] = False
+            updated["job_lifecycle"] = terminal_lifecycle
+            updated["last_status_checked_at"] = now
+            updated["next_poll_after"] = None
+            if early_reason is not None:
+                updated["last_early_poll_reason"] = early_reason
+                updated["last_early_poll_at"] = now
+            try:
+                _write_repo_job_record(updated)
+            except Exception:
+                pass
+            job_record = updated
+            active_reservation = False
+            reservation = None
+            owned = False
+            allowed_actions = ["status"]
+            job_lifecycle = terminal_lifecycle
     return_next_poll_after = job_record.get("next_poll_after")
     if (
         job_lifecycle == "running"

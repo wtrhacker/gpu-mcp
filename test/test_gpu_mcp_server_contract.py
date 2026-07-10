@@ -11,6 +11,7 @@ import subprocess
 import sys
 import textwrap
 import time
+import types
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -1157,6 +1158,30 @@ def test_phase3_process_inspection_treats_ps_exit_1_as_process_gone(
     assert inspection["remote_pid"] == 12345
 
 
+def test_phase3_local_process_inspection_uses_local_ps_exit_1_error(
+    repo_fixture,
+    tmp_path,
+    monkeypatch,
+):
+    config = _write_config(repo_fixture)
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(tmp_path / "reservations"))
+    server = _import_server_with_config(monkeypatch, config)
+    metadata = _seed_reservation(tmp_path / "reservations", repo_fixture)
+    monkeypatch.setattr(server, "_is_local_host", lambda host: True)
+
+    def fake_run(argv, check, capture_output, text, timeout, cwd):
+        assert argv[:3] == ["ps", "-p", "12345"]
+        return types.SimpleNamespace(returncode=1, stdout="", stderr="")
+
+    monkeypatch.setattr(server.subprocess, "run", fake_run)
+
+    inspection = server._inspect_reservation_process(metadata)
+
+    assert inspection["status"] == "gone"
+    assert inspection["reason"] == "process not found"
+    assert inspection["remote_pid"] == 12345
+
+
 def test_phase3_process_inspection_positive_identity_path(repo_fixture, tmp_path, monkeypatch):
     config = _write_config(repo_fixture)
     monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(tmp_path / "reservations"))
@@ -1559,6 +1584,65 @@ def test_phase4_status_maps_terminal_outcome(repo_fixture, tmp_path, monkeypatch
     assert status["job_lifecycle"] == "succeeded"
     assert status["outcome"]["terminal_status"] == "success"
     assert status["next_poll_after"] is None
+
+
+def test_phase4_status_auto_finishes_failed_terminal_outcome(
+    repo_fixture,
+    tmp_path,
+    monkeypatch,
+):
+    config = _write_config(repo_fixture)
+    script = repo_fixture / "jobs" / "fail.py"
+    script.write_text("raise SystemExit(1)\n")
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    server = _import_server_with_config(monkeypatch, config)
+    monkeypatch.setattr(server, "_is_local_host", lambda host: False)
+    monkeypatch.setattr(server, "_ssh_run", lambda host, cmd: "12345\n")
+    launched = json.loads(server.run_python_on_gpu(
+        host="gpu-a",
+        gpu_index=0,
+        script_path="jobs/fail.py",
+        output_file=".gpu_mcp_logs/fail.log",
+    ))
+    outcome_path = server.reservations.outcome_record_path(
+        repo_fixture,
+        launched["job_id"],
+        launched["attempt_id"],
+    )
+    server.reservations.atomic_write_json(outcome_path, server.reservations.build_outcome_record(
+        job_id=launched["job_id"],
+        attempt_id=launched["attempt_id"],
+        reservation_key_value="gpu-a.gpu0",
+        host="gpu-a",
+        gpu_index=0,
+        terminal_status="failure",
+        remote_pid=12345,
+        exit_code=1,
+        ended_at="2026-05-30T13:00:00Z",
+    ))
+    monkeypatch.setattr(
+        server,
+        "_inspect_reservation_process",
+        lambda metadata: {"status": "gone", "reason": "process exited", "remote_pid": 12345},
+    )
+
+    status = json.loads(server.manage_gpu_job(action="status", job_id=launched["job_id"]))
+    reread = json.loads(
+        server.reservations.job_record_path(repo_fixture, launched["job_id"]).read_text()
+    )
+
+    assert status["status"] == "ok"
+    assert status["job_lifecycle"] == "failed"
+    assert status["active_reservation"] is False
+    assert status["reservation_state"] is None
+    assert status["owned_by_current_server"] is False
+    assert status["allowed_actions"] == ["status"]
+    assert status["next_poll_after"] is None
+    assert not (registry / "gpu-a.gpu0").exists()
+    assert server.HEARTBEAT_MANAGER.owned_keys() == []
+    assert reread["active_reservation"] is False
+    assert reread["job_lifecycle"] == "failed"
 
 
 def test_phase4_managed_local_launch_writes_outcome_record(repo_fixture, tmp_path, monkeypatch):
