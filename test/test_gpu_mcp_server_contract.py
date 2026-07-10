@@ -561,6 +561,54 @@ def test_phase0_run_python_returns_managed_handle_for_sync_compat(
     assert reservation_metadata["job_id"] == result["job_id"]
 
 
+def test_phase0_initial_remote_launch_uses_pid_ack_when_stdout_is_empty(
+    repo_fixture,
+    tmp_path,
+    monkeypatch,
+):
+    config = _write_config(repo_fixture)
+    script = repo_fixture / "jobs" / "ok.py"
+    script.write_text("print('ok')\n")
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    server = _import_server_with_config(monkeypatch, config)
+    monkeypatch.setattr(server, "_is_local_host", lambda host: False)
+    original_launch_command = server._remote_async_launch_command
+    captured = {}
+
+    def fake_remote_launch_command(*args, **kwargs):
+        pid_ack_path = kwargs.get("pid_ack_path")
+        captured["pid_ack_path"] = pid_ack_path
+        if pid_ack_path is not None:
+            pid_ack_path.parent.mkdir(parents=True, exist_ok=True)
+            pid_ack_path.write_text(json.dumps({
+                "schema_version": 1,
+                "remote_pid": 12345,
+            }))
+        return original_launch_command(*args, **kwargs)
+
+    monkeypatch.setattr(server, "_remote_async_launch_command", fake_remote_launch_command)
+    monkeypatch.setattr(server, "_ssh_run", lambda host, cmd: "")
+
+    result = json.loads(server.run_python_on_gpu(
+        host="gpu-a",
+        gpu_index=0,
+        script_path="jobs/ok.py",
+        async_mode=True,
+        output_file=".gpu_mcp_logs/job.log",
+    ))
+
+    assert captured["pid_ack_path"] is not None
+    assert result["status"] == "launched"
+    assert result["process"]["remote_pid"] == 12345
+    reservation_metadata = json.loads((registry / "gpu-a.gpu0" / "metadata.json").read_text())
+    assert reservation_metadata["remote_pid"] == 12345
+    job_record = json.loads(
+        (repo_fixture / ".gpu_mcp_state" / "jobs" / result["job_id"] / "job.json").read_text()
+    )
+    assert job_record["remote_pid"] == 12345
+
+
 def test_phase0_two_repos_share_registry_but_not_job_state(tmp_path, monkeypatch):
     repo_a = tmp_path / "repo_a"
     repo_b = tmp_path / "repo_b"
@@ -1073,6 +1121,40 @@ def test_phase3_process_inspection_treats_start_boot_and_fingerprint_mismatch_as
         server._inspect_reservation_process(metadata_no_boot)["reason"]
         == "process fingerprint mismatch"
     )
+
+
+def test_phase3_process_inspection_treats_ps_exit_1_as_process_gone(
+    repo_fixture,
+    tmp_path,
+    monkeypatch,
+):
+    config = _write_config(repo_fixture)
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(tmp_path / "reservations"))
+    server = _import_server_with_config(monkeypatch, config)
+    metadata = _seed_reservation(tmp_path / "reservations", repo_fixture)
+
+    def fake_host_run(host, cmd, user=server.GPU_MCP_USER, timeout=15):
+        if cmd.startswith("ps -p 12345"):
+            return None
+        raise AssertionError(cmd)
+
+    def fake_host_run_error(host, cmd):
+        if cmd.startswith("ps -p 12345"):
+            return (
+                "Encountered a bad command exit code!\n\n"
+                "Command: 'ps -p 12345 -o pid= -o user= -o stat= -o lstart='\n\n"
+                "Exit code: 1\n\nStdout:\n\n\n\nStderr:"
+            )
+        return ""
+
+    monkeypatch.setattr(server, "_host_run", fake_host_run)
+    monkeypatch.setattr(server, "_host_run_error", fake_host_run_error)
+
+    inspection = server._inspect_reservation_process(metadata)
+
+    assert inspection["status"] == "gone"
+    assert inspection["reason"] == "process not found"
+    assert inspection["remote_pid"] == 12345
 
 
 def test_phase3_process_inspection_positive_identity_path(repo_fixture, tmp_path, monkeypatch):

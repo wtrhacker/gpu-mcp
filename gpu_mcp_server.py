@@ -1652,6 +1652,11 @@ def _process_start_time(host: str, pid: int) -> str | None:
     return None
 
 
+def _ps_exit_indicates_process_missing(reason: str) -> bool:
+    lowered = reason.lower()
+    return "exit code: 1" in lowered or "exit 1:" in lowered
+
+
 def _inspect_reservation_process(metadata: dict) -> dict:
     """Return whether the original process is alive, gone, or unknown.
 
@@ -1677,6 +1682,8 @@ def _inspect_reservation_process(metadata: dict) -> dict:
     ps_raw = _host_run(host, ps_cmd, timeout=2)
     if ps_raw is None:
         reason = _host_run_error(host, ps_cmd) or "process inspection failed"
+        if _ps_exit_indicates_process_missing(reason):
+            return {"status": "gone", "reason": "process not found", "remote_pid": pid}
         return {"status": "unknown", "reason": reason, "remote_pid": pid}
     if not ps_raw.strip():
         return {"status": "gone", "reason": "process not found", "remote_pid": pid}
@@ -3884,32 +3891,26 @@ def _run_python_on_gpu_impl(
         launch_mode = "local"
         remote_start_time = _process_start_time(host, int(pid_value))
     else:
-        launch_cmd = _remote_async_launch_command(argv, out_path, job_env, outcome_path, outcome_base)
+        pid_ack_path = outcome_path.parent / "launcher_pid.json"
+        launch_cmd = _remote_async_launch_command(
+            argv,
+            out_path,
+            job_env,
+            outcome_path,
+            outcome_base,
+            pid_ack_path=pid_ack_path,
+        )
         bg_cmd = _remote_repo_command(launch_cmd)
         pid_str = _ssh_run(host, bg_cmd)
-        if pid_str is None:
-            return _launch_handle_response(
-                status="launch_outcome_unknown",
-                reason=f"SSH launch did not return a PID from {host}; reservation kept fail-closed",
-                job_id=job_id,
-                attempt_id=attempt_id,
-                reservation_key_value=reservation_key_value,
-                host=canonical_host,
-                gpu_index=gpu_index,
-                output_path=out_path,
-                next_poll_after=next_poll_after,
-                job_lifecycle="launch_outcome_unknown",
-                launch="ssh",
-                async_mode_requested=async_mode_requested,
-                **phase7_response_fields,
-            )
-        pid_value = pid_str.strip()
-        if not pid_value.isdigit() or int(pid_value) <= 0:
+        acknowledged_pid = _positive_pid_from_text(pid_str)
+        if acknowledged_pid is None:
+            acknowledged_pid = _read_retry_pid_ack(pid_ack_path)
+        if acknowledged_pid is None and pid_str is None:
             return _launch_handle_response(
                 status="launch_outcome_unknown",
                 reason=(
-                    f"invalid async pid returned from {host}: {pid_value!r}; "
-                    "reservation kept fail-closed"
+                    f"SSH launch did not return a PID acknowledgement from {host}; "
+                    "reservation kept fail-closed because the launch outcome is unknown"
                 ),
                 job_id=job_id,
                 attempt_id=attempt_id,
@@ -3923,6 +3924,33 @@ def _run_python_on_gpu_impl(
                 async_mode_requested=async_mode_requested,
                 **phase7_response_fields,
             )
+        if acknowledged_pid is None:
+            if pid_ack_path.exists():
+                reason = (
+                    f"SSH launch did not return a usable PID from {host}, "
+                    "but the launcher acknowledgement file exists; reservation kept fail-closed"
+                )
+            else:
+                reason = (
+                    f"invalid async pid returned from {host}: {pid_str!r}; "
+                    "reservation kept fail-closed"
+                )
+            return _launch_handle_response(
+                status="launch_outcome_unknown",
+                reason=reason,
+                job_id=job_id,
+                attempt_id=attempt_id,
+                reservation_key_value=reservation_key_value,
+                host=canonical_host,
+                gpu_index=gpu_index,
+                output_path=out_path,
+                next_poll_after=next_poll_after,
+                job_lifecycle="launch_outcome_unknown",
+                launch="ssh",
+                async_mode_requested=async_mode_requested,
+                **phase7_response_fields,
+            )
+        pid_value = str(acknowledged_pid)
         launch_mode = "ssh"
         remote_start_time = None
 
