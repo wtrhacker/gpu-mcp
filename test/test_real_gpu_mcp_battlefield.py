@@ -23,11 +23,14 @@ from pathlib import Path
 
 import pytest
 
+from gpu_mcp_config import load_policy
+from gpu_mcp_policy_approval import approve_policy
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SERVER = REPO_ROOT / "gpu_mcp_server.py"
 DEFAULT_INSTALLED_SERVER = Path.home() / "gpu-mcp" / "gpu_mcp_server.py"
-DEFAULT_BATTLEFIELD_ROOT = Path("/net/levsha/scratch2/tingran/gpu-mcp-battlefield-pytest")
+DEFAULT_BATTLEFIELD_ROOT = Path("/net/levsha/scratch2/tingran/github/gpu-mcp/gpu-mcp-battlefield-pytest")
 BOOTSTRAP_INVENTORY = Path.home() / ".cache" / "gpu-mcp" / "bootstrap_hosts.json"
 MCP_NAME = "gpu-cluster-mcp"
 DEFAULT_PYTHON = "/home/tingran/miniconda3/bin/python"
@@ -85,6 +88,24 @@ def _python_command() -> str:
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _policy_approval_store(repo: Path) -> Path:
+    return repo / ".gpu_mcp_state" / "approved-policies.json"
+
+
+def _reservation_root(repo: Path) -> Path:
+    return repo.parent / ".gpu_mcp_reservations"
+
+
+def _approve_test_policy(repo: Path) -> None:
+    policy = load_policy(repo / "gpu-mcp.toml")
+    approve_policy(
+        policy,
+        store_path=_policy_approval_store(repo),
+        diff_summary=["real battlefield fixture approval"],
+        approved_by="pytest",
+    )
 
 
 def _snapshot(paths: list[Path]) -> dict[Path, str | None]:
@@ -166,6 +187,7 @@ def _write_policy(
             ]
         )
     )
+    _approve_test_policy(repo)
 
 
 def _write_codex_config(repo: Path, *, server_path: Path = SERVER) -> None:
@@ -179,6 +201,11 @@ def _write_codex_config(repo: Path, *, server_path: Path = SERVER) -> None:
                 "startup_timeout_sec = 20",
                 "tool_timeout_sec = 120",
                 "",
+                f"[mcp_servers.{MCP_NAME}.env]",
+                f"GPU_MCP_TEST_POLICY_APPROVAL_STORE = {str(_policy_approval_store(repo))!r}",
+                f"GPU_MCP_TEST_RESERVATION_ROOT = {str(_reservation_root(repo))!r}",
+                'PYTEST_CURRENT_TEST = "real-gpu-mcp-battlefield"',
+                "",
                 f"[mcp_servers.{MCP_NAME}.tools.run_python_on_gpu]",
                 'approval_mode = "approve"',
                 "",
@@ -191,6 +218,28 @@ def _write_codex_config(repo: Path, *, server_path: Path = SERVER) -> None:
             ]
         )
     )
+
+
+def test_real_battlefield_codex_config_uses_test_policy_approval_store(tmp_path):
+    repo = tmp_path / "repo"
+    (repo / ".codex").mkdir(parents=True)
+    _write_policy(repo, nodes=["localhost"])
+
+    _write_codex_config(repo)
+
+    text = (repo / ".codex" / "config.toml").read_text()
+    assert f"[mcp_servers.{MCP_NAME}.env]" in text
+    assert f"GPU_MCP_TEST_POLICY_APPROVAL_STORE = {str(_policy_approval_store(repo))!r}" in text
+    assert f"GPU_MCP_TEST_RESERVATION_ROOT = {str(_reservation_root(repo))!r}" in text
+    assert 'PYTEST_CURRENT_TEST = "real-gpu-mcp-battlefield"' in text
+
+
+def _codex_env(repo: Path) -> dict[str, str]:
+    child_env = os.environ.copy()
+    child_env.setdefault("PYTEST_CURRENT_TEST", os.environ.get("PYTEST_CURRENT_TEST", "real-gpu-mcp-battlefield"))
+    child_env.setdefault("GPU_MCP_TEST_POLICY_APPROVAL_STORE", str(_policy_approval_store(repo)))
+    child_env.setdefault("GPU_MCP_TEST_RESERVATION_ROOT", str(_reservation_root(repo)))
+    return child_env
 
 
 def _write_job(repo: Path, name: str, source: str) -> Path:
@@ -363,27 +412,27 @@ def _write_repo(repo: Path, host: str, marker: str) -> None:
     _write_job(
         repo,
         "subprocess_job.py",
-        "from pathlib import Path\nPath('results/subprocess_success.txt').write_text('started\\n')\nimport subprocess\nsubprocess.run(['python', '--version'])\nprint('subprocess ran')\n",
+        "from pathlib import Path\nimport subprocess\nsubprocess.run(['python', '--version'])\nPath('results/subprocess_success.txt').write_text('started\\n')\nprint('subprocess ran')\n",
     )
     _write_job(
         repo,
         "os_system_job.py",
-        "from pathlib import Path\nPath('results/os_system_success.txt').write_text('started\\n')\nimport os\nos.system('true')\nprint('os.system ran')\n",
+        "from pathlib import Path\nimport os\nos.system('true')\nPath('results/os_system_success.txt').write_text('started\\n')\nprint('os.system ran')\n",
     )
     _write_job(
         repo,
         "dynamic_import_job.py",
-        "from pathlib import Path\nPath('results/dynamic_import_success.txt').write_text('started\\n')\n__import__('subprocess')\nprint('dynamic import ran')\n",
+        "from pathlib import Path\n__import__('subprocess')\nPath('results/dynamic_import_success.txt').write_text('started\\n')\nprint('dynamic import ran')\n",
     )
     _write_job(
         repo,
         "socket_job.py",
-        "from pathlib import Path\nPath('results/socket_success.txt').write_text('started\\n')\nimport socket\nsocket.create_connection(('127.0.0.1', 9), timeout=0.1)\nprint('socket connected')\n",
+        "from pathlib import Path\nimport socket\nsocket.create_connection(('127.0.0.1', 9), timeout=0.1)\nPath('results/socket_success.txt').write_text('started\\n')\nprint('socket connected')\n",
     )
     _write_job(
         repo,
         "ctypes_job.py",
-        "from pathlib import Path\nPath('results/ctypes_success.txt').write_text('started\\n')\nimport ctypes\nprint('ctypes ran')\n",
+        "from pathlib import Path\nimport ctypes\nPath('results/ctypes_success.txt').write_text('started\\n')\nprint('ctypes ran')\n",
     )
     _write_job(
         repo,
@@ -495,6 +544,7 @@ def _run_codex(repo: Path, prompt: str, output_name: str, *, timeout: int = 180,
         text=True,
         timeout=timeout,
         check=False,
+        env=_codex_env(repo),
     )
     assert completed.returncode == 0, completed.stdout
     return output_path.read_text()
@@ -526,6 +576,7 @@ def _run_raw_codex(repo: Path, prompt: str, output_name: str) -> subprocess.Comp
         text=True,
         timeout=120,
         check=False,
+        env=_codex_env(repo),
     )
 
 
@@ -568,8 +619,48 @@ def _extract_mcp_json_result(final_message: str) -> dict:
     raise AssertionError(f"no structured MCP JSON result found in final message:\n{final_message}")
 
 
+def _cleanup_test_reservation(repo: Path, result: dict) -> None:
+    reservation_key = result.get("reservation_key")
+    if isinstance(reservation_key, str):
+        shutil.rmtree(_reservation_root(repo) / reservation_key, ignore_errors=True)
+
+
+def _wait_for_managed_output(repo: Path, final_message: str, *, timeout: int = 120) -> str:
+    try:
+        result = _extract_mcp_json_result(final_message)
+    except AssertionError:
+        return final_message
+    if result.get("status") not in {"launched", "launched_with_warning"}:
+        return final_message
+    if result.get("async_mode_requested") is True:
+        return final_message
+    job_id = result.get("job_id")
+    attempt_id = result.get("attempt_id")
+    output = result.get("output")
+    output_path = output.get("path") if isinstance(output, dict) else None
+    if not isinstance(job_id, str) or not isinstance(attempt_id, str) or not isinstance(output_path, str):
+        return final_message
+    outcome_path = repo / ".gpu_mcp_state" / "jobs" / job_id / "attempts" / attempt_id / "outcome.json"
+    outcome = {}
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if outcome_path.exists():
+            try:
+                outcome = json.loads(outcome_path.read_text())
+            except json.JSONDecodeError:
+                outcome = {}
+            if outcome.get("terminal_status") in {"success", "failure", "signaled", "launcher_error"}:
+                path = Path(output_path)
+                _cleanup_test_reservation(repo, result)
+                if path.exists():
+                    return final_message + "\n" + path.read_text(errors="replace")
+                return final_message
+        time.sleep(0.25)
+    raise AssertionError(f"managed job did not finish before timeout: {outcome_path}")
+
+
 def _run_mcp_prompt(repo: Path, host: str, script_path: str, output_name: str, *, args: list[str] | None = None, async_mode: bool = False, output_file: str | None = None, gpu_index: int = 0, prefix: str = "", timeout: int = 180) -> str:
-    return _run_codex(
+    final = _run_codex(
         repo,
         (
             "Do not run shell commands. Do not use SSH, Python, or direct file execution. "
@@ -585,6 +676,7 @@ def _run_mcp_prompt(repo: Path, host: str, script_path: str, output_name: str, *
         output_name,
         timeout=timeout,
     )
+    return _wait_for_managed_output(repo, final, timeout=timeout)
 
 
 def _reset_repo_policy(repo: Path, host: str) -> None:
@@ -958,6 +1050,7 @@ def test_real_server_async_success_and_output_rejections(battlefield: Battlefiel
         time.sleep(0.5)
     assert log.exists()
     assert "async done" in log.read_text(errors="replace")
+    _cleanup_test_reservation(battlefield.repo_a, _extract_mcp_json_result(ok_final))
     assert "output_file must be under approved roots" in bad_final
     assert "output_file must be under approved roots" in symlink_final
     assert not (outside_log_dir / "escaped.log").exists()
@@ -999,7 +1092,7 @@ def test_real_server_rejects_python_remote_control_apis(battlefield: Battlefield
 @pytest.mark.codex_exec
 @pytest.mark.real_battlefield
 @real_battlefield
-def test_real_server_uses_server_timeout_boundary(battlefield: Battlefield):
+def test_real_server_sync_compat_returns_managed_handle_and_captured_output(battlefield: Battlefield):
     _write_policy(battlefield.repo_a, nodes=[battlefield.allowed_host], sync_timeout_sec=2)
 
     final = _run_codex(
@@ -1014,8 +1107,12 @@ def test_real_server_uses_server_timeout_boundary(battlefield: Battlefield):
         "codex_exec_real_timeout.txt",
         timeout=180,
     )
+    final = _wait_for_managed_output(battlefield.repo_a, final, timeout=60)
+    result = _extract_mcp_json_result(final)
 
-    assert "timed out" in final.lower() or "timeout" in final.lower() or "did not complete within" in final.lower()
+    assert result["status"] == "launched"
+    assert result["async_mode_requested"] is False
+    assert "sleep finished" in final
 
 
 @pytest.mark.codex_exec
@@ -1089,7 +1186,13 @@ def test_real_server_kill_safety_uses_harmless_owned_fixture_process(battlefield
         async_mode=True,
         output_file=".gpu_mcp_logs/kill_fixture.log",
     )
-    pid = str(_extract_mcp_json_result(launch_final)["pid"])
+    launch_result = _extract_mcp_json_result(launch_final)
+    process = launch_result.get("process")
+    pid_value = launch_result.get("pid")
+    if pid_value is None and isinstance(process, dict):
+        pid_value = process.get("remote_pid")
+    assert isinstance(pid_value, int)
+    pid = str(pid_value)
     try:
         started = _ssh_capture(
             battlefield.allowed_host,

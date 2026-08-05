@@ -16,6 +16,7 @@ __pycache__/
 test/**/__pycache__/
 *.py[cod]
 test_mcp_repos/
+gpu-mcp-battlefield-pytest/
 
 # Common local environment files
 .env

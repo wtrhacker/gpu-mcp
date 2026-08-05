@@ -81,6 +81,26 @@ def _server_subprocess_env(registry: Path) -> dict[str, str]:
     return env
 
 
+def test_server_startup_accepts_pytest_policy_approval_store(monkeypatch, repo_fixture, tmp_path):
+    config = _write_config(repo_fixture)
+    store = tmp_path / "approved-policies.json"
+    approval = importlib.import_module("gpu_mcp_policy_approval")
+    policy = importlib.import_module("gpu_mcp_config").load_policy(config)
+    approval.approve_policy(policy, store_path=store, diff_summary=["pytest approval"])
+    monkeypatch.delenv("GPU_MCP_TEST_DISABLE_POLICY_APPROVAL", raising=False)
+    monkeypatch.setenv("GPU_MCP_TEST_POLICY_APPROVAL_STORE", str(store))
+    monkeypatch.setenv("PYTEST_CURRENT_TEST", "server approval store contract")
+    monkeypatch.setattr(sys, "argv", [str(SERVER), "--config", str(config)])
+    old_server = sys.modules.get("gpu_mcp_server")
+    if old_server is not None and hasattr(old_server, "HEARTBEAT_MANAGER"):
+        old_server.HEARTBEAT_MANAGER.stop()
+    sys.modules.pop("gpu_mcp_server", None)
+
+    server = importlib.import_module("gpu_mcp_server")
+
+    assert server.CONFIG_POLICY.config_path == config.resolve()
+
+
 def _wait_for_path(path: Path, *, timeout: float = 5.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:

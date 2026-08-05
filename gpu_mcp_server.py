@@ -49,6 +49,7 @@ def _pop_config_arg(argv: list[str]) -> str:
 
 
 GPU_MCP_CONFIG_PATH = _pop_config_arg(sys.argv)
+TEST_POLICY_APPROVAL_STORE_ENV = "GPU_MCP_TEST_POLICY_APPROVAL_STORE"
 GPU_MCP_TEST_DISABLE_POLICY_APPROVAL = (
     os.environ.get("GPU_MCP_TEST_DISABLE_POLICY_APPROVAL", "").strip().lower()
     in {"1", "true", "yes"}
@@ -62,10 +63,22 @@ GPU_MCP_TEST_ENABLE_HARNESS_CONTROLS = (
     and "PYTEST_CURRENT_TEST" in os.environ
 )
 CONFIG_POLICY: GpuMcpPolicy | None = None
+
+
+def _test_policy_approval_store() -> Path | None:
+    raw = os.environ.get(TEST_POLICY_APPROVAL_STORE_ENV, "").strip()
+    if raw and "PYTEST_CURRENT_TEST" in os.environ:
+        return Path(raw).expanduser()
+    return None
+
+
 try:
     CONFIG_POLICY = load_policy(Path(GPU_MCP_CONFIG_PATH).expanduser())
     if not GPU_MCP_TEST_DISABLE_POLICY_APPROVAL:
-        verify_policy_approved(CONFIG_POLICY.config_path)
+        verify_policy_approved(
+            CONFIG_POLICY.config_path,
+            store_path=_test_policy_approval_store(),
+        )
 except ConfigError as exc:
     print(f"ERROR: invalid GPU MCP config: {exc}", file=sys.stderr)
     raise SystemExit(2)

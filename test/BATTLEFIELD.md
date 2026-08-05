@@ -84,7 +84,9 @@ Useful environment variables:
 - `GPU_MCP_RUN_REAL_BATTLEFIELD_TESTS=1`: opt in to the live suite.
 - `GPU_MCP_BOOTSTRAP_INVENTORY`: override the bootstrap inventory path.
 - `GPU_MCP_BATTLEFIELD_ROOT`: override the test-owned fixture root. The path is
-  safety-checked and must clearly contain `gpu-mcp-battlefield`.
+  safety-checked and must clearly contain `gpu-mcp-battlefield`. By default,
+  fixtures are created under
+  `/net/levsha/scratch2/tingran/github/gpu-mcp/gpu-mcp-battlefield-pytest`.
 - `GPU_MCP_PYTHON`: Python used by repo-local Codex MCP config.
 - `GPU_MCP_INSTALLED_SERVER`: installed control-side server path for the staged
   runner test. Defaults to `~/gpu-mcp/gpu_mcp_server.py`.
@@ -98,6 +100,14 @@ The pytest fixture writes two temporary repos under the battlefield root:
 `repo_a` and `repo_b`. Each repo gets its own `gpu-mcp.toml`,
 `.codex/config.toml`, job scripts, `results`, and `.gpu_mcp_logs`. The root also
 contains `outside_sentinels` used to prove that rejected writes did not escape.
+Each generated `gpu-mcp.toml` is approved into that repo's
+`.gpu_mcp_state/approved-policies.json`, and the generated Codex config points
+the hook and server at that pytest-only approval store. This avoids manual
+approval of transient fixture policies on every machine while still requiring
+the active policy hash to match an approval record.
+The generated configs also set `GPU_MCP_TEST_RESERVATION_ROOT` under the
+battlefield root, so live acceptance runs do not consume or mutate the user's
+real `~/gpu-mcp/state/reservations` registry.
 
 The fixture removes the battlefield root at setup time. Do not point
 `GPU_MCP_BATTLEFIELD_ROOT` at a human-owned directory.
