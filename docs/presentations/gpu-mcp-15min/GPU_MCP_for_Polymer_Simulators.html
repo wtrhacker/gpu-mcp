@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GPU MCP for Polymer Simulators</title>
+<style>
+html,body{margin:0;width:100%;height:100%;background:#020b12;color:white;overflow:hidden;font-family:system-ui,sans-serif}
+.slide{display:none;width:100%;height:100%;align-items:center;justify-content:center}
+.slide.active{display:flex}
+.slide img{width:min(100vw,177.78vh);height:min(56.25vw,100vh);object-fit:contain;box-shadow:0 0 40px #000}
+#counter{position:fixed;right:16px;bottom:10px;color:#a9bdc8;font-size:14px}
+</style>
+</head>
+<body>
+<section class="slide"><img src="slides/slide-01.png" alt="Slide 1"></section>
+<section class="slide"><img src="slides/slide-02.png" alt="Slide 2"></section>
+<section class="slide"><img src="slides/slide-03.png" alt="Slide 3"></section>
+<section class="slide"><img src="slides/slide-04.png" alt="Slide 4"></section>
+<section class="slide"><img src="slides/slide-05.png" alt="Slide 5"></section>
+<section class="slide"><img src="slides/slide-06.png" alt="Slide 6"></section>
+<section class="slide"><img src="slides/slide-07.png" alt="Slide 7"></section>
+<section class="slide"><img src="slides/slide-08.png" alt="Slide 8"></section>
+<section class="slide"><img src="slides/slide-09.png" alt="Slide 9"></section>
+<section class="slide"><img src="slides/slide-10.png" alt="Slide 10"></section>
+<div id="counter"></div>
+<script>
+const slides=[...document.querySelectorAll('.slide')];let i=0;
+function show(n){i=Math.max(0,Math.min(slides.length-1,n));slides.forEach((s,j)=>s.classList.toggle('active',j===i));document.querySelector('#counter').textContent=`${i+1} / ${slides.length}`;}
+addEventListener('keydown',e=>{if(['ArrowRight','PageDown',' '].includes(e.key))show(i+1);if(['ArrowLeft','PageUp'].includes(e.key))show(i-1);if(e.key==='Home')show(0);if(e.key==='End')show(slides.length-1);});
+addEventListener('click',()=>show(i+1));show(0);
+</script>
+</body>
+</html>

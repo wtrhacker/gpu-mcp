@@ -112,6 +112,11 @@ race tests, malformed-state tests, or failure-injection tests.
   job store, heartbeat manager, `manage_gpu_job`, and
   `list_gpu_reservations`; remaining work should treat those as implemented
   surfaces rather than greenfield gaps.
+- Tentative deployment gap: sessions on different control machines coordinate
+  only if `~/gpu-mcp/state/reservations/` is the same underlying shared
+  filesystem. A machine-local home may split the registry and permit duplicate
+  reservations; confirm with a cross-host acceptance test before claiming
+  multi-control-host support. No implementation change is planned yet.
 
 ## Non-Negotiable Review Constraints
 
