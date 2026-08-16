@@ -349,13 +349,14 @@ def _ssh_run(
     cmd: str,
     user: str = GPU_MCP_USER,
     hide: bool = True,
-    timeout: int = 15,
+    timeout: int | None = None,
 ) -> Optional[str]:
     """Run a command on a remote host. Returns stdout or None on failure."""
     HOST_RUN_ERRORS.pop((host, cmd), None)
     try:
         c = _conn(host, user)
-        result = c.run(cmd, hide=hide, timeout=timeout)
+        command_timeout = SYNC_TIMEOUT_SEC if timeout is None else timeout
+        result = c.run(cmd, hide=hide, timeout=command_timeout)
         return result.stdout.strip()
     except Exception as e:
         _record_host_run_error(host, cmd, _classify_run_exception(e))
@@ -832,7 +833,7 @@ def _launch_handle_response(
     async_mode_requested: bool,
     process: dict | None = None,
     reason: str = "",
-    heartbeat_interval_sec: int = reservations.DEFAULT_HEARTBEAT_INTERVAL_SEC,
+    poll_interval_sec: int = reservations.DEFAULT_POLL_INTERVAL_SEC,
     job_role: str | None = None,
     job_role_defaulted: bool | None = None,
     cadence_basis: dict | None = None,
@@ -856,7 +857,7 @@ def _launch_handle_response(
             "path": str(output_path),
         },
         "next_poll_after": next_poll_after,
-        "heartbeat_interval_sec": heartbeat_interval_sec,
+        "poll_interval_sec": poll_interval_sec,
         "job_lifecycle": job_lifecycle,
         "launch": launch,
         "async_mode_requested": async_mode_requested,
@@ -956,7 +957,7 @@ class HeartbeatManager:
         self._thread.start()
 
     def _run(self) -> None:
-        while not self._stop_event.wait(timeout=1.0):
+        while not self._stop_event.wait(timeout=reservations.HEARTBEAT_MANAGER_TICK_SEC):
             with self._lock:
                 keys = list(self._owned)
             for key in keys:
@@ -966,7 +967,11 @@ class HeartbeatManager:
                         continue
                     interval = int(item["interval_sec"])
                     last_attempt = float(item["last_attempt_monotonic"])
-                    if time.monotonic() - last_attempt < max(1, min(interval, 60)):
+                    write_interval = max(
+                        reservations.HEARTBEAT_MANAGER_TICK_SEC,
+                        min(interval, reservations.HEARTBEAT_WRITE_INTERVAL_CAP_SEC),
+                    )
+                    if time.monotonic() - last_attempt < write_interval:
                         continue
                 self.heartbeat_once(key)
 
@@ -1232,7 +1237,7 @@ def _phase7_trace_response_summary(raw_response: str) -> dict[str, object]:
         "job_role",
         "job_role_defaulted",
         "job_lifecycle",
-        "heartbeat_interval_sec",
+        "poll_interval_sec",
         "next_poll_after",
         "polling_state",
         "full_status_performed",
@@ -1318,11 +1323,8 @@ def _parse_iso_timestamp(value: object) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
-def _next_poll_after(interval_sec: int = reservations.DEFAULT_HEARTBEAT_INTERVAL_SEC) -> str:
-    interval = max(
-        reservations.MIN_HEARTBEAT_INTERVAL_SEC,
-        min(reservations.MAX_HEARTBEAT_INTERVAL_SEC, int(interval_sec)),
-    )
+def _next_poll_after(interval_sec: int = reservations.DEFAULT_POLL_INTERVAL_SEC) -> str:
+    interval = max(reservations.MIN_POLL_INTERVAL_SEC, int(interval_sec))
     return (
         datetime.now(timezone.utc).replace(microsecond=0)
         + timedelta(seconds=interval)
@@ -1330,10 +1332,7 @@ def _next_poll_after(interval_sec: int = reservations.DEFAULT_HEARTBEAT_INTERVAL
 
 
 def _next_poll_after_from(now: datetime, interval_sec: int) -> str:
-    interval = max(
-        reservations.MIN_HEARTBEAT_INTERVAL_SEC,
-        min(reservations.MAX_HEARTBEAT_INTERVAL_SEC, int(interval_sec)),
-    )
+    interval = max(reservations.MIN_POLL_INTERVAL_SEC, int(interval_sec))
     return (
         now.astimezone(timezone.utc).replace(microsecond=0)
         + timedelta(seconds=interval)
@@ -1361,21 +1360,25 @@ def _validate_positive_int(value: object, *, name: str) -> tuple[int | None, str
     return value, ""
 
 
-def _clamp_cadence_interval(value: int) -> int:
-    return max(
-        reservations.MIN_HEARTBEAT_INTERVAL_SEC,
-        min(reservations.MAX_HEARTBEAT_INTERVAL_SEC, int(value)),
-    )
+CADENCE_TIMESTAMP_ERROR = (
+    "cadence_hint_sec must produce a representable UTC next_poll_after; "
+    "this is a datetime limit, not a polling-policy cap"
+)
 
 
-def _coarse_cadence_for_duration(duration_sec: int) -> int:
-    if duration_sec <= 300:
-        return 60
-    if duration_sec <= 1800:
-        return 180
-    if duration_sec <= 7200:
-        return 600
-    return 1800
+def _validate_cadence_hint(value: object) -> tuple[int | None, str]:
+    interval, error = _validate_positive_int(value, name="cadence_hint_sec")
+    if error or interval is None:
+        return interval, error
+    try:
+        _next_poll_after_from(datetime.now(timezone.utc), interval)
+    except (OverflowError, ValueError):
+        return None, CADENCE_TIMESTAMP_ERROR
+    return interval, ""
+
+
+def _poll_interval(value: int) -> int:
+    return max(reservations.MIN_POLL_INTERVAL_SEC, int(value))
 
 
 def _outcome_runtime_sec(outcome: dict | None) -> int | None:
@@ -1443,11 +1446,16 @@ def _phase7_cadence_basis(
     smoke_cadence_representative: bool,
     smoke_skip_reason: str | None,
 ) -> tuple[int, dict, bool]:
-    smoke, smoke_basis = _smoke_evidence(smoke_job_id)
+    _smoke, smoke_basis = _smoke_evidence(smoke_job_id)
     positive_smoke = bool(smoke_basis.get("positive_viability_evidence"))
     smoke_fields = {key: value for key, value in smoke_basis.items() if key != "source"}
+    no_evidence_interval = (
+        reservations.DEFAULT_SMOKE_POLL_INTERVAL_SEC
+        if job_role == "smoke"
+        else reservations.DEFAULT_POLL_INTERVAL_SEC
+    )
     if cadence_hint_sec is not None:
-        selected = _clamp_cadence_interval(cadence_hint_sec)
+        selected = _poll_interval(cadence_hint_sec)
         basis: dict[str, object] = {
             "source": "cadence_hint",
             "cadence_hint_sec": cadence_hint_sec,
@@ -1456,43 +1464,32 @@ def _phase7_cadence_basis(
         }
         if expected_duration_sec is not None:
             basis["expected_duration_sec"] = expected_duration_sec
-        if smoke_job_id is not None:
-            basis.update(smoke_fields)
-        return selected, basis, positive_smoke
-    if expected_duration_sec is not None:
-        selected = _clamp_cadence_interval(_coarse_cadence_for_duration(expected_duration_sec))
-        basis = {
-            "source": "expected_duration",
-            "expected_duration_sec": expected_duration_sec,
-            "selected_interval_sec": selected,
-            "positive_viability_evidence": positive_smoke,
-        }
+            basis["expected_duration_is_descriptive"] = True
         if smoke_job_id is not None:
             basis.update(smoke_fields)
         return selected, basis, positive_smoke
     if smoke_job_id is not None:
         basis = dict(smoke_basis)
         basis["smoke_cadence_representative"] = bool(smoke_cadence_representative)
-        if positive_smoke and smoke_cadence_representative and smoke and smoke.get("runtime_sec") is not None:
-            selected = _clamp_cadence_interval(_coarse_cadence_for_duration(int(smoke["runtime_sec"])))
-            basis["cadence_evidence_used"] = True
-            basis["selected_interval_sec"] = selected
-            return selected, basis, positive_smoke
+        if expected_duration_sec is not None:
+            basis["expected_duration_sec"] = expected_duration_sec
+            basis["expected_duration_is_descriptive"] = True
         basis["cadence_evidence_used"] = False
-        basis["conservative_reason"] = "smoke_observation_only"
-        basis["selected_interval_sec"] = reservations.MIN_HEARTBEAT_INTERVAL_SEC
-        return reservations.MIN_HEARTBEAT_INTERVAL_SEC, basis, positive_smoke
+        basis["conservative_reason"] = "missing_cadence_hint"
+        basis["selected_interval_sec"] = no_evidence_interval
+        return no_evidence_interval, basis, positive_smoke
     basis = {
         "source": "conservative_no_evidence",
-        "selected_interval_sec": reservations.MIN_HEARTBEAT_INTERVAL_SEC,
+        "selected_interval_sec": no_evidence_interval,
         "positive_viability_evidence": False,
     }
+    if expected_duration_sec is not None:
+        basis["expected_duration_sec"] = expected_duration_sec
+        basis["expected_duration_is_descriptive"] = True
+    basis["conservative_reason"] = "missing_cadence_hint"
     if smoke_skip_reason is not None:
-        basis["conservative_reason"] = "smoke_skipped"
         basis["skip_reason_recorded"] = True
-    else:
-        basis["conservative_reason"] = "missing_cadence_evidence"
-    return reservations.MIN_HEARTBEAT_INTERVAL_SEC, basis, False
+    return no_evidence_interval, basis, False
 
 
 def _reservation_age_fields(metadata: dict, *, now: datetime | None = None) -> dict:
@@ -2308,6 +2305,7 @@ def _start_managed_attempt(
     async_mode_requested: bool,
 ) -> str:
     job_id = str(job_record["job_id"])
+    poll_interval_sec = _job_poll_interval(job_record)
     reservation_key_value = str(metadata["reservation_key"])
     host = str(metadata["host"])
     gpu_index = int(metadata["gpu_index"])
@@ -2359,6 +2357,7 @@ def _start_managed_attempt(
             job_lifecycle="retry_not_started",
             launch="none",
             async_mode_requested=async_mode_requested,
+            poll_interval_sec=poll_interval_sec,
         )
 
     if _is_local_host(host):
@@ -2399,6 +2398,7 @@ def _start_managed_attempt(
                 job_lifecycle="retry_launch_failed",
                 launch="local",
                 async_mode_requested=async_mode_requested,
+                poll_interval_sec=poll_interval_sec,
             )
         pid_value = str(proc.pid)
         launch_mode = "local"
@@ -2436,6 +2436,7 @@ def _start_managed_attempt(
                     job_lifecycle="launch_outcome_unknown",
                     launch="ssh",
                     async_mode_requested=async_mode_requested,
+                    poll_interval_sec=poll_interval_sec,
                 )
             return _launch_handle_response(
                 status="launch_outcome_unknown",
@@ -2453,6 +2454,7 @@ def _start_managed_attempt(
                 job_lifecycle="launch_outcome_unknown",
                 launch="ssh",
                 async_mode_requested=async_mode_requested,
+                poll_interval_sec=poll_interval_sec,
             )
         pid_value = str(acknowledged_pid)
         launch_mode = "ssh"
@@ -2481,6 +2483,7 @@ def _start_managed_attempt(
             job_lifecycle="running",
             launch=launch_mode,
             async_mode_requested=async_mode_requested,
+            poll_interval_sec=poll_interval_sec,
             process={
                 "remote_pid": int(pid_value),
                 "remote_start_time": remote_start_time,
@@ -2501,6 +2504,7 @@ def _start_managed_attempt(
         job_lifecycle="running",
         launch=launch_mode,
         async_mode_requested=async_mode_requested,
+        poll_interval_sec=poll_interval_sec,
         process={
             "remote_pid": int(pid_value),
             "remote_start_time": remote_start_time,
@@ -2614,7 +2618,7 @@ def _retry_owned_job(job_record: dict) -> str:
     except ValueError as exc:
         return _owned_lifecycle_refusal("retry", job_record, str(exc), process=inspection)
     attempt_id = reservations.generate_attempt_id()
-    next_poll_after = _next_poll_after(reservations.DEFAULT_HEARTBEAT_INTERVAL_SEC)
+    next_poll_after = _next_poll_after(_job_poll_interval(job_record))
     return _start_managed_attempt(
         job_record=job_record,
         metadata=metadata,
@@ -2688,11 +2692,14 @@ def _update_owned_job_cadence(
             "reservation_key": job_record.get("reservation_key"),
             "server_instance_id": SERVER_INSTANCE_ID,
         })
-    if expected_duration_sec is None and cadence_hint_sec is None:
+    if cadence_hint_sec is None:
         return _json_tool_response({
             "status": "refused",
             "action": "update_cadence",
-            "reason": "update_cadence requires expected_duration_sec or cadence_hint_sec",
+            "reason": (
+                "update_cadence requires cadence_hint_sec; expected_duration_sec is "
+                "descriptive and does not schedule polling"
+            ),
             "job_id": job_record.get("job_id"),
             "reservation_key": job_record.get("reservation_key"),
             "server_instance_id": SERVER_INSTANCE_ID,
@@ -2710,7 +2717,7 @@ def _update_owned_job_cadence(
             "reservation_key": job_record.get("reservation_key"),
             "server_instance_id": SERVER_INSTANCE_ID,
         })
-    cadence_hint, cadence_error = _validate_positive_int(cadence_hint_sec, name="cadence_hint_sec")
+    cadence_hint, cadence_error = _validate_cadence_hint(cadence_hint_sec)
     if cadence_error:
         return _json_tool_response({
             "status": "refused",
@@ -2723,7 +2730,7 @@ def _update_owned_job_cadence(
     metadata, metadata_reason = _owned_lifecycle_metadata(job_record)
     if metadata is None:
         return _owned_lifecycle_refusal("update_cadence", job_record, metadata_reason)
-    interval_sec, cadence_basis, _positive_smoke = _phase7_cadence_basis(
+    poll_interval_sec, cadence_basis, _positive_smoke = _phase7_cadence_basis(
         job_role=str(job_record.get("job_role") or "one_off"),
         expected_duration_sec=expected_duration,
         cadence_hint_sec=cadence_hint,
@@ -2733,17 +2740,29 @@ def _update_owned_job_cadence(
     )
     now = datetime.now(timezone.utc).replace(microsecond=0)
     now_text = reservations.iso_timestamp(now)
-    next_poll_after = _next_poll_after_from(now, interval_sec)
+    try:
+        next_poll_after = _next_poll_after_from(now, poll_interval_sec)
+    except (OverflowError, ValueError):
+        return _json_tool_response({
+            "status": "refused",
+            "action": "update_cadence",
+            "reason": CADENCE_TIMESTAMP_ERROR,
+            "job_id": job_record.get("job_id"),
+            "reservation_key": job_record.get("reservation_key"),
+            "server_instance_id": SERVER_INSTANCE_ID,
+        })
     updated = dict(job_record)
     updated.update({
-        "heartbeat_interval_sec": interval_sec,
+        "poll_interval_sec": poll_interval_sec,
         "cadence_basis": cadence_basis,
         "cadence_update_reason": reason_text,
         "last_heartbeat_at": now_text,
         "next_poll_after": next_poll_after,
     })
+    if expected_duration is not None:
+        updated["expected_duration_sec"] = expected_duration
+    updated["cadence_hint_sec"] = cadence_hint
     HEARTBEAT_MANAGER.update_owned_metadata(str(metadata["reservation_key"]), {
-        "heartbeat_interval_sec": interval_sec,
         "last_heartbeat_at": now_text,
     })
     _write_repo_job_record(updated)
@@ -2754,21 +2773,29 @@ def _update_owned_job_cadence(
         "job_id": updated.get("job_id"),
         "attempt_id": updated.get("active_attempt_id"),
         "reservation_key": updated.get("reservation_key"),
-        "heartbeat_interval_sec": interval_sec,
+        "poll_interval_sec": poll_interval_sec,
         "cadence_basis": cadence_basis,
         "next_poll_after": next_poll_after,
         "server_instance_id": SERVER_INSTANCE_ID,
     })
 
 
-def _job_heartbeat_interval(job_record: dict) -> int:
-    raw = job_record.get("heartbeat_interval_sec")
+def _job_poll_interval(job_record: dict) -> int:
+    raw = job_record.get("poll_interval_sec")
     if isinstance(raw, bool):
-        return reservations.DEFAULT_HEARTBEAT_INTERVAL_SEC
+        return reservations.DEFAULT_POLL_INTERVAL_SEC
     try:
-        return _clamp_cadence_interval(int(raw))
+        interval = int(raw)
     except (TypeError, ValueError):
-        return reservations.DEFAULT_HEARTBEAT_INTERVAL_SEC
+        return reservations.DEFAULT_POLL_INTERVAL_SEC
+    if interval < reservations.MIN_POLL_INTERVAL_SEC:
+        return reservations.DEFAULT_POLL_INTERVAL_SEC
+    validated, error = _validate_cadence_hint(interval)
+    return (
+        reservations.DEFAULT_POLL_INTERVAL_SEC
+        if error or validated is None
+        else validated
+    )
 
 
 def _compact_not_due_response(*, action: str, job_record: dict, due_at: datetime) -> str:
@@ -2787,30 +2814,28 @@ def _compact_not_due_response(*, action: str, job_record: dict, due_at: datetime
         "reservation_key": job_record.get("reservation_key"),
         "job_role": job_record.get("job_role"),
         "job_lifecycle": "running",
-        "heartbeat_interval_sec": _job_heartbeat_interval(job_record),
+        "poll_interval_sec": _job_poll_interval(job_record),
         "next_poll_after": job_record.get("next_poll_after"),
         "seconds_until_due": seconds_until_due,
         "output": {
             "path": job_record.get("output_file"),
         },
         "agent_guidance": (
-            "This job is not due yet. Do independent work or wait until next_poll_after; "
-            "retry with early_poll_reason for an immediate full check."
+            "No remote check was performed because this job is not due. Closed or "
+            "atomically published outputs may be inspected read-only as provisional "
+            "evidence; final claims require terminal status. Repeat status with "
+            "early_poll_reason only when immediate inspection is justified."
         ),
         "server_instance_id": SERVER_INSTANCE_ID,
     })
 
 
-def _smoke_status_recommendation(job_record: dict, job_lifecycle: str) -> dict | None:
+def _successful_smoke_evidence(job_record: dict, job_lifecycle: str) -> dict | None:
     if job_record.get("job_role") != "smoke" or job_lifecycle != "succeeded":
         return None
     return {
-        "tool": "run_python_on_gpu",
-        "kwargs": {
-            "job_role": "main",
-            "smoke_job_id": job_record.get("job_id"),
-            "smoke_cadence_representative": False,
-        },
+        "smoke_job_id": job_record.get("job_id"),
+        "positive_viability_evidence": True,
     }
 
 
@@ -2915,7 +2940,7 @@ def _job_status_response(
         and job_record.get("repo_local_record", True)
         and reservations.is_job_id(job_record.get("job_id"))
     ):
-        return_next_poll_after = _next_poll_after(_job_heartbeat_interval(job_record))
+        return_next_poll_after = _next_poll_after(_job_poll_interval(job_record))
         updated = dict(job_record)
         updated["next_poll_after"] = return_next_poll_after
         updated["last_status_checked_at"] = reservations.iso_timestamp()
@@ -2954,22 +2979,33 @@ def _job_status_response(
         "allowed_actions": allowed_actions,
         "job_role": job_record.get("job_role"),
         "job_role_defaulted": job_record.get("job_role_defaulted"),
-        "heartbeat_interval_sec": _job_heartbeat_interval(job_record),
+        "poll_interval_sec": _job_poll_interval(job_record),
         "cadence_basis": job_record.get("cadence_basis"),
         "output": {
             "path": job_record.get("output_file"),
         },
         "next_poll_after": None if job_lifecycle in {"succeeded", "failed"} else return_next_poll_after,
         "agent_guidance": (
-            "Do not use output-dependent results until status is terminal; independent work may continue."
+            "Running. Closed or atomically published outputs may be inspected read-only "
+            "as provisional evidence; final claims require terminal status."
             if job_lifecycle == "running"
-            else "Terminal status reached; outputs may be inspected."
+            else (
+                "Terminal status reached; outputs may be inspected."
+                if job_lifecycle in {"succeeded", "failed", "finished"}
+                else (
+                    "Terminal status is not established. First investigate why the outcome "
+                    "metadata is delayed, missing, or invalid, using logs and read-only "
+                    "inspection of available outputs as part of that diagnosis. Those outputs "
+                    "may also be treated as provisional scientific evidence, but preserve "
+                    "provenance and do not make final-result claims."
+                )
+            )
         ),
         "server_instance_id": SERVER_INSTANCE_ID,
     }
-    recommendation = _smoke_status_recommendation(job_record, job_lifecycle)
-    if recommendation is not None:
-        response["recommended_next_call"] = recommendation
+    smoke_evidence = _successful_smoke_evidence(job_record, job_lifecycle)
+    if smoke_evidence is not None:
+        response["smoke_evidence"] = smoke_evidence
     return _json_tool_response(response)
 
 
@@ -3581,7 +3617,15 @@ def manage_gpu_job(
     reason: Optional[str] = None,
     early_poll_reason: Optional[str] = None,
 ):
-    """Inspect or change a managed GPU job."""
+    """Inspect or change a managed GPU job.
+
+    Use action="status" for lifecycle inspection. Before next_poll_after it
+    returns a compact local response unless early_poll_reason explains why a
+    full check is needed now. action="update_cadence" requires a non-empty
+    reason and a positive cadence_hint_sec, which is used exactly when its UTC
+    poll time is representable; there is no policy cap. expected_duration_sec is
+    optional descriptive metadata only.
+    """
     kwargs = {
         "action": action,
         "job_id": job_id,
@@ -3666,10 +3710,12 @@ def _run_python_on_gpu_impl(
         async_mode: Compatibility input. Both true and false return a managed handle.
         output_file: Approved path for stdout/stderr capture.
         job_role: Optional Phase 7 role: smoke, main, or one_off.
-        expected_duration_sec: Optional runtime estimate for initial cadence.
-        cadence_hint_sec: Optional direct cadence hint, clamped to 60..3600.
+        expected_duration_sec: Optional descriptive runtime estimate; it does not schedule polling.
+        cadence_hint_sec: Optional direct polling cadence in seconds. Any positive integer
+            with a representable UTC next poll time is used exactly; there is no policy cap.
         smoke_job_id: Optional same-repo smoke job evidence for a main launch.
-        smoke_cadence_representative: Whether smoke runtime should drive cadence.
+        smoke_cadence_representative: Compatibility/provenance flag recorded with smoke
+            evidence. It does not select cadence; use cadence_hint_sec for that.
         smoke_skip_reason: Optional reason to launch a main job without smoke evidence.
 
     Returns:
@@ -3704,7 +3750,7 @@ def _run_python_on_gpu_impl(
     )
     if duration_error:
         return _launch_refusal(duration_error, host=host, gpu_index=gpu_index)
-    cadence_hint, cadence_error = _validate_positive_int(cadence_hint_sec, name="cadence_hint_sec")
+    cadence_hint, cadence_error = _validate_cadence_hint(cadence_hint_sec)
     if cadence_error:
         return _launch_refusal(cadence_error, host=host, gpu_index=gpu_index)
     if not isinstance(smoke_cadence_representative, bool):
@@ -3735,7 +3781,7 @@ def _run_python_on_gpu_impl(
             smoke_skip_reason,
         ]
     ) or smoke_cadence_representative
-    heartbeat_interval_sec, cadence_basis, positive_smoke = _phase7_cadence_basis(
+    poll_interval_sec, cadence_basis, positive_smoke = _phase7_cadence_basis(
         job_role=str(resolved_job_role),
         expected_duration_sec=expected_duration,
         cadence_hint_sec=cadence_hint,
@@ -3744,13 +3790,13 @@ def _run_python_on_gpu_impl(
         smoke_skip_reason=smoke_skip_text,
     )
     if not phase7_inputs_present:
-        heartbeat_interval_sec = reservations.DEFAULT_HEARTBEAT_INTERVAL_SEC
+        poll_interval_sec = reservations.DEFAULT_POLL_INTERVAL_SEC
         cadence_basis = {
-            "source": "legacy_fixed_cadence",
-            "selected_interval_sec": reservations.DEFAULT_HEARTBEAT_INTERVAL_SEC,
+            "source": "default",
+            "selected_interval_sec": reservations.DEFAULT_POLL_INTERVAL_SEC,
         }
     phase7_response_fields = {
-        "heartbeat_interval_sec": heartbeat_interval_sec,
+        "poll_interval_sec": poll_interval_sec,
         "job_role": resolved_job_role,
         "job_role_defaulted": job_role_defaulted,
         "cadence_basis": cadence_basis,
@@ -3791,7 +3837,15 @@ def _run_python_on_gpu_impl(
 
     job_id = reservations.generate_job_id()
     attempt_id = reservations.generate_attempt_id()
-    next_poll_after = _next_poll_after(heartbeat_interval_sec)
+    try:
+        next_poll_after = _next_poll_after(poll_interval_sec)
+    except (OverflowError, ValueError):
+        return _launch_refusal(
+            CADENCE_TIMESTAMP_ERROR,
+            host=canonical_host,
+            gpu_index=gpu_index,
+            reservation_key=reservation_key_value,
+        )
     job_env = _gpu_job_env(gpu_index)
     process_nonce = secrets.token_urlsafe(18)
     process_fingerprint = _managed_process_fingerprint(job_id, attempt_id, canonical_host, process_nonce)
@@ -3826,7 +3880,6 @@ def _run_python_on_gpu_impl(
         server_instance_id=SERVER_INSTANCE_ID,
         remote_pid=None,
         process_fingerprint=None,
-        heartbeat_interval_sec=heartbeat_interval_sec,
     )
     try:
         acquired, acquire_reason = reservations.acquire_reservation(
@@ -3884,7 +3937,7 @@ def _run_python_on_gpu_impl(
     job_record.update({
         "job_role": resolved_job_role,
         "job_role_defaulted": job_role_defaulted,
-        "heartbeat_interval_sec": heartbeat_interval_sec,
+        "poll_interval_sec": poll_interval_sec,
         "cadence_basis": cadence_basis,
         "phase7_poll_discipline": phase7_inputs_present,
     })
@@ -3913,7 +3966,7 @@ def _run_python_on_gpu_impl(
         )
     HEARTBEAT_MANAGER.register(
         reservation_key_value,
-        interval_sec=heartbeat_interval_sec,
+        interval_sec=reservations.DEFAULT_HEARTBEAT_INTERVAL_SEC,
     )
 
     if _is_local_host(host):
@@ -4099,7 +4152,18 @@ def run_python_on_gpu(
     smoke_cadence_representative: bool = False,
     smoke_skip_reason: Optional[str] = None,
 ):
-    """Launch an approved Python file as a managed GPU job."""
+    """Launch an approved Python file as a managed GPU job and return its handle.
+
+    For staged work, choose ``job_role=smoke``, ``main``, or ``one_off``. A main
+    launch using staged-work fields needs either a successful same-repo
+    ``smoke_job_id`` or a nonempty ``smoke_skip_reason``. Smoke establishes
+    viability only; neither its runtime nor ``smoke_cadence_representative``
+    sets polling.
+    ``cadence_hint_sec`` directly sets any representable positive status-check
+    interval with no policy cap; without it, smoke defaults to five minutes and
+    main or one-off to one hour. ``expected_duration_sec`` is descriptive only.
+    Either compatibility value of ``async_mode`` returns a managed handle.
+    """
     kwargs = {
         "host": host,
         "gpu_index": gpu_index,

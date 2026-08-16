@@ -44,16 +44,15 @@ If no hosts are verified, stop and tell the human.
 
 ### Codex integration
 - [ ] Wrote repo-local `.codex/config.toml`
-- [ ] Verified repo-local `.codex/config.toml` contains no `[[hooks.PreToolUse]]`
-  or `[[hooks.PostToolUse]]` blocks
+- [ ] Verified repo-local `.codex/config.toml` contains no GPU MCP hook blocks
 - [ ] Set `tool_timeout_sec` > `sync_timeout_sec`
 - [ ] Configured tool approval modes:
   - [ ] `run_python_on_gpu` = `"approve"`
   - [ ] `kill_gpu_process` = `"approve"`
   - [ ] `check_gpu_processes` = `"approve"`
   - [ ] `reload_policy` = `"prompt"`
-- [ ] Installed user-global GPU MCP companion hook (`PreToolUse` and `PostToolUse`
-  in Codex config)
+- [ ] Installed user-global GPU MCP companion hook (`PreToolUse`, `PostToolUse`,
+  and `Stop` in Codex config)
 - [ ] Human trusted the global GPU MCP hook in Codex (ran `/hooks` or equivalent)
 
 ### Verification

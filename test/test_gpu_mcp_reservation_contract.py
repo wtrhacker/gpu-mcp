@@ -41,10 +41,20 @@ def _acquire_worker(root: str, key: str, suffix: str, queue) -> None:
 
 
 def test_phase0_constants_are_materialized():
-    assert reservations.DEFAULT_HEARTBEAT_INTERVAL_SEC == 600
-    assert reservations.MIN_HEARTBEAT_INTERVAL_SEC == 60
-    assert reservations.MAX_HEARTBEAT_INTERVAL_SEC == 3600
+    minute = 60
+    hour = 60 * minute
+
+    assert reservations.SECONDS_PER_MINUTE == minute
+    assert reservations.SECONDS_PER_HOUR == hour
+    assert reservations.MIN_HEARTBEAT_INTERVAL_SEC == minute
+    assert reservations.DEFAULT_HEARTBEAT_INTERVAL_SEC == 10 * minute
+    assert reservations.MAX_HEARTBEAT_INTERVAL_SEC == hour
+    assert reservations.HEARTBEAT_MANAGER_TICK_SEC == 1
+    assert reservations.HEARTBEAT_WRITE_INTERVAL_CAP_SEC == minute
     assert reservations.STALE_MULTIPLIER == 3
+    assert reservations.MIN_POLL_INTERVAL_SEC == 1
+    assert reservations.DEFAULT_SMOKE_POLL_INTERVAL_SEC == 5 * minute
+    assert reservations.DEFAULT_POLL_INTERVAL_SEC == hour
     assert reservations.DEFAULT_RESERVATION_REGISTRY_ROOT == (
         Path.home() / "gpu-mcp" / "state" / "reservations"
     )

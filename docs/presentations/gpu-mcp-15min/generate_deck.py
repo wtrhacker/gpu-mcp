@@ -26,7 +26,7 @@ INK = "#071827"
 
 
 class Slide:
-    def __init__(self, number: int, title: str | None = None) -> None:
+    def __init__(self, number: int, title: str | None = None, *, title_size: float = 27) -> None:
         self.number = number
         self.fig = plt.figure(figsize=(13.333, 7.5), facecolor=BG)
         self.ax = self.fig.add_axes((0, 0, 1, 1))
@@ -35,7 +35,7 @@ class Slide:
         self.ax.axis("off")
         self.ax.set_facecolor(BG)
         if title:
-            self.text(0.72, 0.45, title, 27, WHITE, weight="bold")
+            self.text(0.72, 0.45, title, title_size, WHITE, weight="bold")
             self.rect(0.72, 1.13, 1.12, 0.045, TEAL, radius=0)
             self.text(0.72, 8.62, "GPU MCP  •  polymer simulation group", 8.5, MUTED)
             self.text(15.15, 8.61, str(number), 9, MUTED, ha="center")
@@ -132,8 +132,17 @@ class Slide:
         y2: float,
         color: str = MUTED,
         lw: float = 2,
+        *,
+        zorder: float = 2,
     ) -> None:
-        self.ax.plot([x1, x2], [y1, y2], color=color, linewidth=lw, solid_capstyle="round")
+        self.ax.plot(
+            [x1, x2],
+            [y1, y2],
+            color=color,
+            linewidth=lw,
+            solid_capstyle="round",
+            zorder=zorder,
+        )
 
     def pill(
         self,
@@ -167,9 +176,9 @@ def slide_1() -> Slide:
     s.rect(0, 0, 0.45, 9, TEAL, radius=0)
     s.text(1.0, 1.25, "GPU MCP", 18, TEAL, weight="bold")
     s.text(1.0, 2.0, "Let Codex operate\nthe GPU workflow", 38, WHITE, weight="bold", linespacing=1.04)
-    s.text(1.04, 4.25, "A short tour for polymer simulators", 18, MUTED)
-    s.pill(1.05, 5.35, 4.55, 0.48, "LESS SSH PLUMBING", PANEL_2, YELLOW, 10)
-    s.pill(5.82, 5.35, 5.15, 0.48, "MORE REPRODUCIBLE RUNS", PANEL_2, TEAL, 10)
+    s.text(1.04, 4.25, "Safe hands for prolonged polymer-simulation investigation", 17, MUTED)
+    s.pill(1.05, 5.35, 4.55, 0.48, "NOT JUST JOB SUBMISSION", PANEL_2, YELLOW, 10)
+    s.pill(5.82, 5.35, 5.15, 0.48, "AN ITERATIVE SCIENCE LOOP", PANEL_2, TEAL, 10)
 
     s.rect(12.1, 1.95, 2.65, 3.65, PANEL, edge=CYAN, lw=1.8, radius=0.24)
     s.text(13.42, 2.38, "CODEX", 13, CYAN, weight="bold", ha="center")
@@ -225,14 +234,14 @@ def slide_2() -> Slide:
     s.rect(1.65, 6.1, 12.7, 1.55, PANEL_2, edge=TEAL, lw=1.4, radius=0.22)
     s.text(2.2, 6.42, "MODEL CONTEXT PROTOCOL", 10.5, TEAL, weight="bold")
     s.text(2.2, 6.87, "Think “USB/API standard for AI tools” — not another model, and not magic autonomy.", 15, WHITE, weight="bold")
-    s.text(2.2, 7.38, "The tool schema says what Codex may ask for; the server decides what is actually allowed.", 9.5, MUTED)
+    s.text(2.2, 7.38, "MCP is the connection — the goal, reasoning, and scientific judgment remain separate.", 9.5, MUTED)
     return s
 
 
 def slide_3() -> Slide:
     s = Slide(3, "The workflow friction we are removing")
     s.pill(0.85, 1.55, 6.65, 0.42, "TODAY: COMMAND-AND-REMEMBER", "#3a2430", RED, 9.5)
-    s.pill(8.5, 1.55, 6.65, 0.42, "WITH GPU MCP: ASK-AND-MANAGE", "#153c3a", TEAL, 9.5)
+    s.pill(8.5, 1.55, 6.65, 0.42, "WITH GPU MCP: INVESTIGATE-AND-ITERATE", "#153c3a", TEAL, 9.5)
     manual = [
         "1   Check nvidia-smi on several hosts",
         "2   Pick a GPU from stale snapshots",
@@ -241,11 +250,11 @@ def slide_3() -> Slide:
         "5   Poll, interpret exit, clean up",
     ]
     managed = [
-        "1   Describe the simulation goal",
-        "2   Codex checks availability",
-        "3   MCP reserves + launches safely",
-        "4   One job_id tracks the lifecycle",
-        "5   Status reports outcome + outputs",
+        "1   Define a goal + stopping condition",
+        "2   Inspect code, inputs, GPUs, outputs",
+        "3   Run bounded smoke / main experiments",
+        "4   Analyze evidence; revise the setup",
+        "5   Repeat until criterion or real blocker",
     ]
     for index, label in enumerate(manual):
         y = 2.28 + index * 0.83
@@ -257,7 +266,7 @@ def slide_3() -> Slide:
         s.text(8.8, y + 0.31, label, 10.5, WHITE if index < 2 else MUTED, va="center")
     s.rect(0.85, 6.65, 14.3, 1.1, PANEL_2, radius=0.16)
     s.text(1.2, 6.94, "POLYMER-SIMULATION PAYOFF", 9.5, YELLOW, weight="bold")
-    s.text(4.25, 6.88, "Less run shepherding; clearer evidence about what ran, where, and whether it finished.", 13.5, WHITE, weight="bold")
+    s.text(4.25, 6.88, "Not just less shepherding: a sustained investigate → run → learn loop on our machines.", 12.9, WHITE, weight="bold")
     return s
 
 
@@ -291,7 +300,7 @@ def slide_4() -> Slide:
     s.line(12.95, 4.08, 12.95, 4.72, MUTED, 1)
 
     s.rect(1.55, 6.75, 12.9, 0.95, "#123346", edge=CYAN, lw=1.2, radius=0.18)
-    s.text(8, 7.225, "The MCP runs beside Codex — middleware under our control, not a hosted cloud service.", 13.5, WHITE, weight="bold", ha="center", va="center")
+    s.text(8, 7.225, "MCP gives Codex safe machine-facing hands; the repo remains our scientific workspace.", 13.2, WHITE, weight="bold", ha="center", va="center")
     return s
 
 
@@ -361,7 +370,7 @@ def slide_5() -> Slide:
     s.text(
         8,
         7.52,
-        "observe  →  claim  →  run  →  verify  →  intervene  →  evolve policy",
+        "The tools are the hands: observe  →  claim  →  run  →  verify  →  intervene  →  govern",
         13.2,
         WHITE,
         weight="bold",
@@ -418,7 +427,7 @@ def slide_6() -> Slide:
     s.text(
         8,
         7.66,
-        "The job_id is the thread that connects launch, status, recovery, and final outcome.",
+        "The job_id connects one experiment's launch to the evidence for the next decision.",
         12.5,
         YELLOW,
         weight="bold",
@@ -428,7 +437,141 @@ def slide_6() -> Slide:
 
 
 def slide_7() -> Slide:
-    s = Slide(7, "The supporting tools: see, recover, govern")
+    s = Slide(7, "Heartbeat = ownership lease, not process liveness")
+    s.text(
+        8,
+        1.4,
+        "It says “this MCP server still owns the reservation” — not “the Python process is alive.”",
+        15.5,
+        WHITE,
+        weight="bold",
+        ha="center",
+    )
+
+    boxes = [
+        (
+            0.72,
+            "OWNER MCP SERVER",
+            "One heartbeat per managed job\nBackground lease renewal\nOnly this server_instance_id writes",
+            CYAN,
+        ),
+        (
+            6.22,
+            "SHARED RESERVATION",
+            "server_instance_id\nlast_heartbeat_at\nheartbeat_interval_sec",
+            TEAL,
+        ),
+        (
+            11.72,
+            "OTHER SESSIONS",
+            "Read the lease\nNever adopt the old heartbeat\nInspect remotely only when stale",
+            PINK,
+        ),
+    ]
+    for x, title, body, color in boxes:
+        s.rect(x, 2.18, 3.56, 2.25, PANEL, edge=color, lw=1.5, radius=0.2)
+        s.text(x + 1.78, 2.58, title, 10.2, color, weight="bold", ha="center")
+        s.text(
+            x + 1.78,
+            3.13,
+            body,
+            9.2,
+            WHITE if title != "SHARED RESERVATION" else MUTED,
+            weight="bold" if title == "SHARED RESERVATION" else "normal",
+            family="DejaVu Sans Mono" if title == "SHARED RESERVATION" else "DejaVu Sans",
+            ha="center",
+            linespacing=1.38,
+        )
+    s.text(5.24, 3.13, "→", 24, TEAL, weight="bold", ha="center")
+    s.text(10.74, 3.13, "→", 24, TEAL, weight="bold", ha="center")
+
+    decisions = [
+        (0.72, "FRESH LEASE", "GPU stays reserved", GREEN),
+        (5.56, "STALE + ALIVE / UNKNOWN", "Still reserved; never guess", YELLOW),
+        (10.4, "STALE + PROCESS-GONE PROOF", "Cleanup may release GPU", CYAN),
+    ]
+    for x, title, body, color in decisions:
+        s.rect(x, 5.05, 4.32, 1.48, PANEL_2, edge=color, lw=1.25, radius=0.17)
+        s.text(x + 2.16, 5.42, title, 9.2, color, weight="bold", ha="center")
+        s.text(x + 2.16, 5.98, body, 11.2, WHITE, weight="bold", ha="center")
+
+    s.rect(1.25, 7.12, 13.5, 0.83, "#3a2932", edge=PINK, lw=1.2, radius=0.18)
+    s.text(
+        8,
+        7.535,
+        "A missed heartbeat triggers inspection. It never proves that the GPU is free.",
+        14.1,
+        WHITE,
+        weight="bold",
+        ha="center",
+        va="center",
+    )
+    return s
+
+
+def slide_8() -> Slide:
+    s = Slide(8, "Hooks are Codex’s attention layer")
+    flow = [
+        (0.72, 3.0, "LOCAL STATE", "outcome appears\nor check becomes due", PINK),
+        (4.32, 3.05, "COMPANION HOOK", "notice — do not interpret", TEAL),
+        (8.02, 2.55, "CODEX", "call status", CYAN),
+        (11.22, 3.95, "MCP STATUS", "interpret • report\nfinalize • release", YELLOW),
+    ]
+    for x, w, title, body, color in flow:
+        s.rect(x, 1.45, w, 1.52, PANEL, edge=color, lw=1.4, radius=0.17)
+        s.text(x + w / 2, 1.82, title, 10, color, weight="bold", ha="center")
+        s.text(x + w / 2, 2.35, body, 9.2, WHITE, weight="bold", ha="center")
+    for x in (3.99, 7.69, 10.89):
+        s.text(x, 2.05, "→", 21, TEAL, weight="bold", ha="center")
+
+    branches = [
+        (
+            0.72,
+            "POLICY GUARD",
+            "Pre • Post • Stop\n\nStale or symlinked policy\nblocks normal work.",
+            RED,
+        ),
+        (
+            4.52,
+            "PRETOOLUSE",
+            "Outcome / due reminder\nSmoke-before-main nudge\nEarly-poll warning",
+            CYAN,
+        ),
+        (
+            8.32,
+            "POSTTOOLUSE",
+            "Recheck policy drift\n\nJob-reminder branches\nstay silent.",
+            YELLOW,
+        ),
+        (
+            12.12,
+            "STOP",
+            "Wait locally for outcome / due\nContinue the same open turn\nNo model turns while waiting",
+            TEAL,
+        ),
+    ]
+    for x, title, body, color in branches:
+        s.rect(x, 3.52, 3.16, 2.85, PANEL, edge=color, lw=1.35, radius=0.18)
+        s.rect(x, 3.52, 3.16, 0.54, color, radius=0.18)
+        s.text(x + 1.58, 3.79, title, 9.3, INK, weight="bold", ha="center", va="center")
+        s.text(x + 0.28, 4.45, body, 9.2, WHITE, linespacing=1.38)
+
+    s.rect(1.08, 7.04, 13.84, 0.9, PANEL_2, edge=TEAL, lw=1.2, radius=0.18)
+    s.text(
+        8,
+        7.49,
+        "Hooks never SSH, parse outcomes, heartbeat, or release a GPU — status remains the authority.",
+        12.5,
+        WHITE,
+        weight="bold",
+        ha="center",
+        va="center",
+    )
+    return s
+
+
+def slide_9() -> Slide:
+    s = Slide(9, "The supporting tools: see, recover, govern")
     columns = [
         (
             0.62,
@@ -483,41 +626,61 @@ def slide_7() -> Slide:
     return s
 
 
-def slide_8() -> Slide:
-    s = Slide(8, "A polymer workflow, end to end")
-    s.rect(0.85, 1.45, 14.3, 1.33, PANEL_2, edge=PINK, lw=1.4, radius=0.2)
-    s.text(1.2, 1.79, "YOU", 10, PINK, weight="bold")
-    prompt = (
-        "“Smoke-test the bead–spring equilibration on an available GPU.\n"
-        "If it passes, launch production and tell me where outputs land.”"
+def slide_10() -> Slide:
+    s = Slide(10, "The real goal: sustained scientific investigation", title_size=25)
+    s.rect(0.72, 1.38, 14.56, 1.25, PANEL_2, edge=PINK, lw=1.35, radius=0.18)
+    s.text(1.05, 1.7, "/GOAL", 10.5, PINK, weight="bold")
+    s.text(
+        2.22,
+        1.59,
+        "Explain why this bead–spring melt misses [criterion]. Inspect, run bounded tests,\n"
+        "revise, and stop only at evidence or a genuine blocker.",
+        12.3,
+        WHITE,
+        weight="bold",
     )
-    s.text(2.35, 1.68, prompt, 14.5, WHITE, weight="bold")
 
-    y = 4.55
-    s.line(1.75, y, 14.25, y, PANEL_2, 4)
-    steps = [
-        (1.85, "1", "check_gpus", "GPU 3\navailable", CYAN),
-        (4.95, "2", "smoke launch", "managed\njob_id", PINK),
-        (8.0, "3", "status", "smoke\nsucceeded", GREEN),
-        (11.1, "4", "main launch", "reservation\n+ heartbeat", TEAL),
-        (14.15, "5", "event → status", "outcome\n+ path", YELLOW),
+    points = [(2.2, 4.5), (5.2, 3.48), (8.4, 3.48), (11.8, 4.5), (9.4, 6.0), (5.25, 6.0)]
+    for first, second in zip(points, points[1:] + points[:1]):
+        s.line(first[0], first[1], second[0], second[1], PANEL_2, 3, zorder=0.5)
+
+    nodes = [
+        (2.2, 4.5, "1", "INSPECT", "code • inputs • prior runs", CYAN),
+        (5.2, 3.48, "2", "HYPOTHESIZE", "physics • numerics", PINK),
+        (8.4, 3.48, "3", "MODIFY", "simulation • analysis", YELLOW),
+        (11.8, 4.5, "4", "SMOKE + RUN", "managed GPU experiment", TEAL),
+        (9.4, 6.0, "5", "STATUS + ANALYZE", "outcome • artifacts", GREEN),
+        (5.25, 6.0, "6", "DECIDE", "converged • revise • blocked", PINK),
     ]
-    for x, number, title, body, color in steps:
-        s.number_dot(x, y, number, color)
-        s.text(x, y + 0.62, title, 10.5, color, weight="bold", ha="center")
-        s.text(x, y + 1.08, body, 9.2, MUTED, ha="center")
+    for x, y, number, title, body, color in nodes:
+        s.rect(x - 1.3, y - 0.55, 2.6, 1.1, PANEL, edge=color, lw=1.25, radius=0.15)
+        s.circle(x - 1.02, y, 0.2, color)
+        s.text(x - 1.02, y, number, 10.5, INK, weight="bold", ha="center", va="center")
+        s.text(x - 0.72, y - 0.3, title, 8.8, color, weight="bold")
+        s.text(x - 0.72, y + 0.12, body, 7.8, MUTED)
 
-    s.rect(1.65, 6.75, 12.7, 1.05, PANEL, edge=TEAL, lw=1.2, radius=0.18)
-    s.text(8, 7.05, "Codex owns the plumbing — not the polymer physics.", 17, WHITE, weight="bold", ha="center")
-    s.text(8, 7.52, "We still choose the model, ensemble, equilibration criteria, and what counts as credible.", 9.5, MUTED, ha="center")
+    s.circle(7.15, 4.75, 0.77, TEAL, edge=BG, lw=2)
+    s.text(7.15, 4.75, "KEEP\nITERATING", 10.2, INK, weight="bold", ha="center", va="center")
+
+    s.rect(1.05, 7.3, 13.9, 0.63, PANEL_2, edge=TEAL, lw=1.1, radius=0.16)
+    s.text(
+        8,
+        7.615,
+        "/goal keeps the objective  •  heartbeat protects the run  •  Stop returns Codex to the next decision",
+        11.2,
+        WHITE,
+        weight="bold",
+        ha="center",
+        va="center",
+    )
     return s
 
 
-def slide_9() -> Slide:
-    s = Slide(9, "Bounded autonomy: the safety model")
+def slide_11() -> Slide:
+    s = Slide(11, "Bounded autonomy: the safety model")
     layers = [
         ("1", "REPO POLICY", "approved hosts and script / write roots", CYAN),
-        ("2", "GUARDED PYTHON", "no arbitrary remote shell; bounded writes", PINK),
+        ("2", "GUARDED PYTHON", "static scan + runtime audit hook; bounded writes", PINK),
         ("3", "GPU RESERVATION", "atomic claim prevents cooperative double-booking", TEAL),
         ("4", "MANAGED JOB", "heartbeat, outcome record, explicit job_id", GREEN),
         ("5", "FAIL CLOSED", "unknown process state stays reserved", YELLOW),
@@ -532,19 +695,19 @@ def slide_9() -> Slide:
 
     s.rect(9.95, 1.55, 5.2, 2.63, "#123b35", edge=GREEN, lw=1.4, radius=0.2)
     s.text(10.45, 1.92, "WHAT IT IS", 11, GREEN, weight="bold")
-    s.text(10.45, 2.55, "A cooperative guardrail\nfor trusted lab workflows\n\nA reproducible tool path\nCodex can reason about", 13, WHITE, weight="bold")
+    s.text(10.45, 2.55, "A cooperative guardrail\nfor trusted lab workflows\n\nA safe action surface\nfor sustained iteration", 13, WHITE, weight="bold")
     s.rect(9.95, 4.55, 5.2, 2.63, "#3a2630", edge=RED, lw=1.4, radius=0.2)
     s.text(10.45, 4.92, "WHAT IT IS NOT", 11, RED, weight="bold")
     s.text(10.45, 5.55, "Not Slurm or a queue\nNot a hostile-code sandbox\nNot a validator of force fields\nor equilibration", 12.5, WHITE, weight="bold")
     return s
 
 
-def slide_10() -> Slide:
-    s = Slide(10, "Three things to remember")
+def slide_12() -> Slide:
+    s = Slide(12, "Three things to remember")
     takeaways = [
-        (0.72, "1", "MCP is the bridge", "Codex gets typed tools;\nthe server keeps authority.", CYAN),
-        (5.54, "2", "The tools work as a system", "Discover → run → manage\n→ recover → govern.", TEAL),
-        (10.36, "3", "We keep scientific judgment", "The tool validates mechanics,\nnot the physics.", PINK),
+        (0.72, "1", "Hands, not just visibility", "Codex can act through typed tools;\nthe server keeps authority.", CYAN),
+        (5.54, "2", "A loop, not a launch", "Goal + tools + heartbeat + hooks\nkeep investigation moving.", TEAL),
+        (10.36, "3", "Evidence, not magic", "We define credible physics\nand the stopping condition.", PINK),
     ]
     for x, number, title, body, color in takeaways:
         s.rect(x, 1.72, 4.35, 3.2, PANEL, edge=color, lw=1.5, radius=0.22)
@@ -554,8 +717,16 @@ def slide_10() -> Slide:
         s.text(x + 0.45, 3.86, body, 11, MUTED)
 
     s.rect(1.9, 5.75, 12.2, 1.34, PANEL_2, edge=TEAL, lw=1.4, radius=0.23)
-    s.text(8, 6.08, "GOOD FIRST USE", 9.5, TEAL, weight="bold", ha="center")
-    s.text(8, 6.55, "Ask Codex to run one bounded smoke job and report job_id, outcome, and output path.", 14, WHITE, weight="bold", ha="center")
+    s.text(8, 6.08, "GOOD FIRST GOAL", 9.5, TEAL, weight="bold", ha="center")
+    s.text(
+        8,
+        6.48,
+        "Give Codex one simulation question, a bounded experiment path,\nand a verifiable stopping condition.",
+        13.2,
+        WHITE,
+        weight="bold",
+        ha="center",
+    )
     s.text(8, 7.7, "Questions?", 27, YELLOW, weight="bold", ha="center")
     return s
 
@@ -571,6 +742,8 @@ SLIDE_BUILDERS = [
     slide_8,
     slide_9,
     slide_10,
+    slide_11,
+    slide_12,
 ]
 
 

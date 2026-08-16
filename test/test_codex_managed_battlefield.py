@@ -906,7 +906,8 @@ def _phase7_smoke_skip_verdict(events: list[dict[str, Any]]) -> dict[str, Any]:
         event
         for event in main_results
         if event.get("response_summary", {}).get("job_role") == "main"
-        and event.get("response_summary", {}).get("heartbeat_interval_sec") == 60
+        and event.get("response_summary", {}).get("poll_interval_sec")
+        == reservations.DEFAULT_POLL_INTERVAL_SEC
     ]
     if skip_calls and conservative:
         return {
@@ -928,10 +929,7 @@ def _phase7_update_cadence_verdict(events: list[dict[str, Any]]) -> dict[str, An
         event
         for event in update_calls
         if event.get("args", {}).get("has_reason") is True
-        and (
-            event.get("args", {}).get("expected_duration_sec") is not None
-            or event.get("args", {}).get("cadence_hint_sec") is not None
-        )
+        and event.get("args", {}).get("cadence_hint_sec") is not None
     ]
     update_results = _phase7_tool_results(events, tool="manage_gpu_job", status="ok", action="update_cadence")
     if good_update_calls and update_results:
@@ -2024,7 +2022,9 @@ def test_phase4_codex_exec_status_outcomes_and_lost_context_recovery(
     )
     running_status = _first_payload(running_text, status="ok")
     assert running_status["job_lifecycle"] == "running"
-    assert "Do not use output-dependent results" in running_status["agent_guidance"]
+    assert "intermediate outputs may be analyzed" in running_status["agent_guidance"]
+    assert "provisional results" in running_status["agent_guidance"]
+    assert "Final-result claims" in running_status["agent_guidance"]
     assert running_status["output"]["path"]
     assert running_status["next_poll_after"]
 
@@ -2411,7 +2411,7 @@ def test_phase6_codex_exec_pretooluse_due_reminder_dedup_and_policy_precedence(
     assert "GPU MCP: 1 managed job is due for status." in reminder_text
     assert "manage_gpu_job(action=" in reminder_text
     assert "status" in reminder_text
-    assert "output-dependent work must wait for terminal status" in reminder_text
+    assert "outputs may be analyzed read-only as provisional results" in reminder_text
     assert launch["job_id"] in reminder_text
     reminder_state = json.loads(reminder_path.read_text())
     assert reminder_state["last_reminded_poll_after"] == job_record["next_poll_after"]
@@ -3232,6 +3232,7 @@ def test_phase7_codex_exec_missing_smoke_guard_leads_to_smoke_run(
             "on that first attempt. If the MCP refuses because smoke evidence is missing, "
             "recover by launching the small check for the same script with args "
             "['--mode', 'smoke', '--tag', 'p4'], job_role='smoke', expected_duration_sec=30, "
+            "cadence_hint_sec=30, "
             "and output_file='.gpu_mcp_logs/phase7_smoke_p4.log'. Report the parsed JSON results."
         ),
     )
@@ -3268,7 +3269,8 @@ def test_phase7_codex_exec_smoke_result_is_linked_to_main_launch(
         (
             "Run the small check for jobs/phase7_train.py on localhost GPU 0. Use "
             "args ['--mode', 'smoke', '--tag', 'p5'], job_role='smoke', "
-            "expected_duration_sec=30, and output_file='.gpu_mcp_logs/phase7_smoke_p5.log'. "
+            "expected_duration_sec=30, cadence_hint_sec=30, and "
+            "output_file='.gpu_mcp_logs/phase7_smoke_p5.log'. "
             "Only start the smoke job and report the parsed JSON result."
         ),
     )
@@ -3296,7 +3298,8 @@ def test_phase7_codex_exec_smoke_result_is_linked_to_main_launch(
             f"The smoke job id is {smoke_job_id}. Check that smoke job's status. If it "
             "succeeded, start jobs/phase7_train.py on localhost GPU 1 as the real background "
             "main run with args ['--mode', 'main', '--tag', 'p5'], job_role='main', "
-            f"smoke_job_id='{smoke_job_id}', expected_duration_sec=3600, and "
+            f"smoke_job_id='{smoke_job_id}', expected_duration_sec=3600, "
+            "cadence_hint_sec=3600, and "
             "output_file='.gpu_mcp_logs/phase7_main_p5.log'. Do not wait for the main run to finish."
         ),
     )
@@ -3332,7 +3335,7 @@ def test_phase7_codex_exec_update_cadence_when_wait_time_changes(
         battlefield.repo_a,
         (
             "Start jobs/hold_gpu.py on localhost GPU 0 as a background main job with "
-            "async_mode=True, expected_duration_sec=7200, and "
+            "async_mode=True, expected_duration_sec=7200, cadence_hint_sec=7200, and "
             "smoke_skip_reason='the user is testing cadence update'. "
             "After launch, the user says the run should actually be checked in about 15 minutes. "
             "Update the job's wait time through the MCP with a reason, then report the parsed JSON results."

@@ -243,15 +243,27 @@ type = "command"
 command = "/absolute/path/to/python /absolute/path/to/gpu_mcp_policy_hook.py"
 timeout = 5
 statusMessage = "Checking GPU MCP policy drift"
+
+[[hooks.Stop]]
+matcher = "*"
+
+[[hooks.Stop.hooks]]
+type = "command"
+command = "/absolute/path/to/python /absolute/path/to/gpu_mcp_policy_hook.py"
+timeout = 31536000
+statusMessage = "Waiting for a managed GPU job event"
 ```
 
 Restart Codex after editing config, then use `/hooks` to review and trust the
 global GPU MCP hook.
 
 **Why:** If the AI edits `gpu-mcp.toml` and forgets to ask the human, the
-stale-policy hook blocks further tool calls. The same global companion hook may
-also surface managed-job heartbeat reminders. It is scoped by the nearest
-current-repo policy, so one repo's reminders must not appear in another repo.
+stale-policy hook blocks further tool calls. During active work, the companion
+hook immediately surfaces a local job outcome or due status check. At turn end,
+it waits for either event and continues the turn so the AI can call `status`.
+The one-year timeout is an operational hook-runner watchdog, not a polling
+maximum; raise it if this deployment intentionally suspends turns longer than a
+year. The hook is scoped by the nearest current-repo policy.
 
 ### Step 10: Verify Raw Remote Command Blocking
 

@@ -139,14 +139,16 @@ def _seed_phase7_smoke_record(
         args=["--small"],
         output_file=repo / ".gpu_mcp_logs" / f"{job_id}.log",
         server_instance_id=server.SERVER_INSTANCE_ID,
-        next_poll_after=_rfc3339(ended + timedelta(seconds=60)),
+        next_poll_after=_rfc3339(
+            ended + timedelta(seconds=server.reservations.DEFAULT_SMOKE_POLL_INTERVAL_SEC)
+        ),
         created_at=_rfc3339(started),
     )
     record.update(
         {
             "job_role": job_role,
             "job_role_defaulted": False,
-            "heartbeat_interval_sec": 60,
+            "poll_interval_sec": server.reservations.DEFAULT_SMOKE_POLL_INTERVAL_SEC,
             "job_lifecycle": (
                 "running"
                 if terminal_status is None
@@ -154,7 +156,7 @@ def _seed_phase7_smoke_record(
             ),
             "cadence_basis": {
                 "source": "conservative_no_evidence",
-                "selected_interval_sec": 60,
+                "selected_interval_sec": server.reservations.DEFAULT_SMOKE_POLL_INTERVAL_SEC,
             },
         }
     )
@@ -188,6 +190,7 @@ def _assert_phase7_private_fields_not_shared(metadata: dict) -> None:
         "smoke_skip_reason",
         "expected_duration_sec",
         "cadence_hint_sec",
+        "poll_interval_sec",
         "cadence_basis",
         "cadence_update_reason",
         "last_early_poll_reason",
@@ -765,7 +768,7 @@ def test_phase2_heartbeat_once_updates_owned_metadata(repo_fixture, tmp_path, mo
 
     metadata = json.loads((registry / "gpu-a.gpu0" / "metadata.json").read_text())
     assert metadata["last_heartbeat_at"] == "2026-05-30T13:00:00Z"
-    assert metadata["heartbeat_interval_sec"] == 600
+    assert metadata["heartbeat_interval_sec"] == server.reservations.DEFAULT_HEARTBEAT_INTERVAL_SEC
 
 
 def test_phase2_status_works_while_heartbeat_unhealthy_and_mutations_refuse(
@@ -1724,6 +1727,10 @@ def test_phase4_missing_outcome_reports_unknown(repo_fixture, tmp_path, monkeypa
 
     assert status["job_lifecycle"] == "process_gone_unknown_outcome"
     assert status["outcome"] is None
+    assert "Terminal status is not established" in status["agent_guidance"]
+    assert "First investigate why the outcome metadata" in status["agent_guidance"]
+    assert "provisional scientific evidence" in status["agent_guidance"]
+    assert "do not make final-result claims" in status["agent_guidance"]
 
 
 def test_phase4_corrupt_outcome_reports_unknown(
@@ -2502,16 +2509,23 @@ def test_phase7_status_before_next_poll_is_compact_and_local_only(
     assert status["log_tail_included"] is False
     assert status["job_id"] == launched["job_id"]
     assert status["reservation_key"] == launched["reservation_key"]
-    assert status["heartbeat_interval_sec"] == 60
+    assert status["poll_interval_sec"] == server.reservations.DEFAULT_POLL_INTERVAL_SEC
+    assert "heartbeat_interval_sec" not in status
     assert status["next_poll_after"] == "2099-01-01T00:00:00Z"
     assert status["seconds_until_due"] > 0
+    assert status["agent_guidance"] == (
+        "No remote check was performed because this job is not due. Closed or atomically "
+        "published outputs may be inspected read-only as provisional evidence; final claims "
+        "require terminal status. Repeat status with early_poll_reason only when immediate "
+        "inspection is justified."
+    )
     assert inspections == []
     assert reread["next_poll_after"] == "2099-01-01T00:00:00Z"
     assert reread["last_status_checked_at"] is None
     assert json.loads((registry / "gpu-a.gpu0" / "metadata.json").read_text()) == metadata_before
 
 
-def test_phase7_expected_duration_selects_short_cadence_for_main_launch(
+def test_phase7_expected_duration_is_descriptive_for_main_launch(
     repo_fixture,
     tmp_path,
     monkeypatch,
@@ -2538,10 +2552,11 @@ def test_phase7_expected_duration_selects_short_cadence_for_main_launch(
 
     assert launched["status"] == "launched"
     assert launched["job_role"] == "main"
-    assert launched["heartbeat_interval_sec"] == 60
-    assert launched["cadence_basis"]["source"] == "expected_duration"
+    assert launched["poll_interval_sec"] == server.reservations.DEFAULT_POLL_INTERVAL_SEC
+    assert launched["cadence_basis"]["source"] == "conservative_no_evidence"
     assert launched["cadence_basis"]["expected_duration_sec"] == 120
-    assert metadata["heartbeat_interval_sec"] == 60
+    assert launched["cadence_basis"]["expected_duration_is_descriptive"] is True
+    assert metadata["heartbeat_interval_sec"] == server.reservations.DEFAULT_HEARTBEAT_INTERVAL_SEC
     _assert_phase7_private_fields_not_shared(metadata)
 
 
@@ -2589,6 +2604,10 @@ def test_phase7_early_poll_reason_forces_full_status_and_records_override(
     assert status["full_status_performed"] is True
     assert status["remote_inspection_performed"] is True
     assert status["early_poll_override_recorded"] is True
+    assert status["agent_guidance"] == (
+        "Running. Closed or atomically published outputs may be inspected read-only as "
+        "provisional evidence; final claims require terminal status."
+    )
     assert inspections
     assert reread["last_early_poll_reason"] == "user explicitly asked for an immediate check"
     assert reread["last_early_poll_at"] is not None
@@ -2644,7 +2663,7 @@ def test_phase7_blank_early_poll_reason_keeps_compact_status_path(
     assert reread.get("last_early_poll_at") is None
 
 
-def test_phase7_update_cadence_clamps_hint_and_updates_heartbeat_metadata(
+def test_phase7_update_cadence_accepts_fast_hint_without_changing_heartbeat_interval(
     repo_fixture,
     tmp_path,
     monkeypatch,
@@ -2680,11 +2699,12 @@ def test_phase7_update_cadence_clamps_hint_and_updates_heartbeat_metadata(
 
     assert updated["status"] == "ok"
     assert updated["action"] == "update_cadence"
-    assert updated["heartbeat_interval_sec"] == 60
+    assert updated["poll_interval_sec"] == 45
+    assert "heartbeat_interval_sec" not in updated
     assert updated["cadence_basis"]["source"] == "cadence_hint"
     assert updated["cadence_basis"]["cadence_hint_sec"] == 45
     assert updated["next_poll_after"] == record["next_poll_after"]
-    assert metadata["heartbeat_interval_sec"] == 60
+    assert metadata["heartbeat_interval_sec"] == server.reservations.DEFAULT_HEARTBEAT_INTERVAL_SEC
     assert metadata["last_heartbeat_at"] == record["last_heartbeat_at"]
     _assert_phase7_private_fields_not_shared(metadata)
     assert record["cadence_update_reason"] == "initial smoke estimate was too aggressive"
@@ -2715,12 +2735,15 @@ def test_phase7_async_false_defaults_one_off_and_reports_role(
     assert launched["status"] == "launched"
     assert launched["job_role"] == "one_off"
     assert launched["job_role_defaulted"] is True
-    assert launched["heartbeat_interval_sec"] == 60
+    assert launched["poll_interval_sec"] == server.reservations.DEFAULT_POLL_INTERVAL_SEC
     assert launched["cadence_basis"]["source"] == "conservative_no_evidence"
-    assert launched["cadence_basis"]["selected_interval_sec"] == 60
+    assert (
+        launched["cadence_basis"]["selected_interval_sec"]
+        == server.reservations.DEFAULT_POLL_INTERVAL_SEC
+    )
 
 
-def test_phase7_cadence_hint_clamps_and_wins_over_expected_duration(
+def test_phase7_cadence_hint_is_unbounded_and_wins_over_expected_duration(
     repo_fixture,
     tmp_path,
     monkeypatch,
@@ -2734,6 +2757,7 @@ def test_phase7_cadence_hint_clamps_and_wins_over_expected_duration(
     monkeypatch.setattr(server, "_is_local_host", lambda host: False)
     monkeypatch.setattr(server, "_ssh_run", lambda host, cmd: "12345\n")
 
+    three_hours = 3 * server.reservations.SECONDS_PER_HOUR
     launched = json.loads(server.run_python_on_gpu(
         host="gpu-a",
         gpu_index=0,
@@ -2741,22 +2765,27 @@ def test_phase7_cadence_hint_clamps_and_wins_over_expected_duration(
         async_mode=True,
         output_file=".gpu_mcp_logs/train.log",
         smoke_skip_reason="user approved skipping smoke for this contract test",
-        expected_duration_sec=7201,
-        cadence_hint_sec=5000,
+        expected_duration_sec=2 * server.reservations.SECONDS_PER_HOUR,
+        cadence_hint_sec=three_hours,
     ))
     metadata = json.loads((registry / "gpu-a.gpu0" / "metadata.json").read_text())
 
     assert launched["status"] == "launched"
-    assert launched["heartbeat_interval_sec"] == 3600
+    assert launched["poll_interval_sec"] == three_hours
+    assert "heartbeat_interval_sec" not in launched
     assert launched["cadence_basis"]["source"] == "cadence_hint"
-    assert launched["cadence_basis"]["cadence_hint_sec"] == 5000
-    assert launched["cadence_basis"]["expected_duration_sec"] == 7201
-    assert launched["cadence_basis"]["selected_interval_sec"] == 3600
-    assert metadata["heartbeat_interval_sec"] == 3600
+    assert launched["cadence_basis"]["cadence_hint_sec"] == three_hours
+    assert (
+        launched["cadence_basis"]["expected_duration_sec"]
+        == 2 * server.reservations.SECONDS_PER_HOUR
+    )
+    assert launched["cadence_basis"]["expected_duration_is_descriptive"] is True
+    assert launched["cadence_basis"]["selected_interval_sec"] == three_hours
+    assert metadata["heartbeat_interval_sec"] == server.reservations.DEFAULT_HEARTBEAT_INTERVAL_SEC
     _assert_phase7_private_fields_not_shared(metadata)
 
 
-def test_phase7_expected_duration_uses_pinned_coarse_bands(
+def test_phase7_expected_duration_never_overrides_default_polling(
     repo_fixture,
     tmp_path,
     monkeypatch,
@@ -2769,16 +2798,13 @@ def test_phase7_expected_duration_uses_pinned_coarse_bands(
     server = _import_server_with_config(monkeypatch, config)
     monkeypatch.setattr(server, "_is_local_host", lambda host: False)
     monkeypatch.setattr(server, "_ssh_run", lambda host, cmd: "12345\n")
-    cases = [
-        (300, 60),
-        (301, 180),
-        (1800, 180),
-        (1801, 600),
-        (7200, 600),
-        (7201, 1800),
-    ]
+    cases = (
+        5,
+        2 * server.reservations.SECONDS_PER_HOUR,
+        12 * server.reservations.SECONDS_PER_HOUR,
+    )
 
-    for gpu_index, (expected_duration, selected_interval) in enumerate(cases):
+    for gpu_index, expected_duration in enumerate(cases):
         launched = json.loads(server.run_python_on_gpu(
             host="gpu-a",
             gpu_index=gpu_index,
@@ -2790,10 +2816,14 @@ def test_phase7_expected_duration_uses_pinned_coarse_bands(
         ))
 
         assert launched["status"] == "launched"
-        assert launched["heartbeat_interval_sec"] == selected_interval
-        assert launched["cadence_basis"]["source"] == "expected_duration"
+        assert launched["poll_interval_sec"] == server.reservations.DEFAULT_POLL_INTERVAL_SEC
+        assert launched["cadence_basis"]["source"] == "conservative_no_evidence"
         assert launched["cadence_basis"]["expected_duration_sec"] == expected_duration
-        assert launched["cadence_basis"]["selected_interval_sec"] == selected_interval
+        assert launched["cadence_basis"]["expected_duration_is_descriptive"] is True
+        assert (
+            launched["cadence_basis"]["selected_interval_sec"]
+            == server.reservations.DEFAULT_POLL_INTERVAL_SEC
+        )
 
 
 def test_phase7_invalid_cadence_inputs_are_refused_without_reservation(
@@ -2813,6 +2843,7 @@ def test_phase7_invalid_cadence_inputs_are_refused_without_reservation(
         {"cadence_hint_sec": 0},
         {"cadence_hint_sec": -1},
         {"cadence_hint_sec": float("inf")},
+        {"cadence_hint_sec": 10**100},
         {"expected_duration_sec": False},
         {"expected_duration_sec": "300"},
         {"expected_duration_sec": 0},
@@ -2831,10 +2862,14 @@ def test_phase7_invalid_cadence_inputs_are_refused_without_reservation(
 
         assert result["status"] == "refused"
         assert "cadence" in result["reason"] or "duration" in result["reason"]
+    assert (
+        server._job_poll_interval({"poll_interval_sec": 10**100})
+        == server.reservations.DEFAULT_POLL_INTERVAL_SEC
+    )
     assert not registry.exists() or not any(registry.iterdir())
 
 
-def test_phase7_main_with_skip_but_no_cadence_uses_conservative_basis(
+def test_phase7_main_with_skip_but_no_cadence_uses_default_interval(
     repo_fixture,
     tmp_path,
     monkeypatch,
@@ -2860,16 +2895,22 @@ def test_phase7_main_with_skip_but_no_cadence_uses_conservative_basis(
 
     assert launched["status"] == "launched"
     assert launched["job_role"] == "main"
-    assert launched["heartbeat_interval_sec"] == 60
+    assert launched["poll_interval_sec"] == server.reservations.DEFAULT_POLL_INTERVAL_SEC
     assert launched["cadence_basis"]["source"] == "conservative_no_evidence"
-    assert launched["cadence_basis"]["conservative_reason"] == "smoke_skipped"
+    assert launched["cadence_basis"]["conservative_reason"] == "missing_cadence_hint"
     assert launched["cadence_basis"]["skip_reason_recorded"] is True
-    assert launched["cadence_basis"]["selected_interval_sec"] == 60
-    assert metadata["heartbeat_interval_sec"] == 60
+    assert (
+        launched["cadence_basis"]["selected_interval_sec"]
+        == server.reservations.DEFAULT_POLL_INTERVAL_SEC
+    )
+    assert (
+        metadata["heartbeat_interval_sec"]
+        == server.reservations.DEFAULT_HEARTBEAT_INTERVAL_SEC
+    )
     _assert_phase7_private_fields_not_shared(metadata)
 
 
-def test_phase7_smoke_launch_is_managed_and_uses_minimum_first_check_without_hint(
+def test_phase7_smoke_launch_is_managed_and_uses_five_minute_fallback_without_hint(
     repo_fixture,
     tmp_path,
     monkeypatch,
@@ -2897,15 +2938,19 @@ def test_phase7_smoke_launch_is_managed_and_uses_minimum_first_check_without_hin
     assert launched["status"] == "launched"
     assert launched["job_role"] == "smoke"
     assert launched["job_role_defaulted"] is False
-    assert launched["heartbeat_interval_sec"] == 60
+    assert (
+        launched["poll_interval_sec"]
+        == server.reservations.DEFAULT_SMOKE_POLL_INTERVAL_SEC
+    )
     assert launched["cadence_basis"]["source"] == "conservative_no_evidence"
-    assert launched["cadence_basis"]["conservative_reason"] == "missing_cadence_evidence"
+    assert launched["cadence_basis"]["conservative_reason"] == "missing_cadence_hint"
     assert record["job_role"] == "smoke"
-    assert metadata["heartbeat_interval_sec"] == 60
+    assert "heartbeat_interval_sec" not in record
+    assert metadata["heartbeat_interval_sec"] == server.reservations.DEFAULT_HEARTBEAT_INTERVAL_SEC
     _assert_phase7_private_fields_not_shared(metadata)
 
 
-def test_phase7_successful_smoke_status_reports_recommended_main_launch(
+def test_phase7_successful_smoke_status_reports_neutral_viability_evidence(
     repo_fixture,
     tmp_path,
     monkeypatch,
@@ -2966,11 +3011,11 @@ def test_phase7_successful_smoke_status_reports_recommended_main_launch(
     assert status["status"] == "ok"
     assert status["job_role"] == "smoke"
     assert status["job_lifecycle"] == "succeeded"
-    recommendation = status["recommended_next_call"]
-    assert recommendation["tool"] == "run_python_on_gpu"
-    assert recommendation["kwargs"]["job_role"] == "main"
-    assert recommendation["kwargs"]["smoke_job_id"] == launched["job_id"]
-    assert recommendation["kwargs"]["smoke_cadence_representative"] is False
+    assert status["smoke_evidence"] == {
+        "smoke_job_id": launched["job_id"],
+        "positive_viability_evidence": True,
+    }
+    assert "recommended_next_call" not in status
 
 
 def test_phase7_successful_smoke_job_is_viability_only_without_cadence_signal(
@@ -2998,17 +3043,20 @@ def test_phase7_successful_smoke_job_is_viability_only_without_cadence_signal(
     ))
 
     assert launched["status"] == "launched"
-    assert launched["heartbeat_interval_sec"] == 60
+    assert launched["poll_interval_sec"] == server.reservations.DEFAULT_POLL_INTERVAL_SEC
     assert launched["cadence_basis"]["source"] == "smoke_job"
     assert launched["cadence_basis"]["smoke_job_id"] == smoke["job_id"]
     assert launched["cadence_basis"]["smoke_lifecycle"] == "succeeded"
     assert launched["cadence_basis"]["positive_viability_evidence"] is True
     assert launched["cadence_basis"]["cadence_evidence_used"] is False
-    assert launched["cadence_basis"]["conservative_reason"] == "smoke_observation_only"
-    assert launched["cadence_basis"]["selected_interval_sec"] == 60
+    assert launched["cadence_basis"]["conservative_reason"] == "missing_cadence_hint"
+    assert (
+        launched["cadence_basis"]["selected_interval_sec"]
+        == server.reservations.DEFAULT_POLL_INTERVAL_SEC
+    )
 
 
-def test_phase7_representative_smoke_runtime_can_drive_cadence_band(
+def test_phase7_representative_smoke_runtime_is_descriptive_without_hint(
     repo_fixture,
     tmp_path,
     monkeypatch,
@@ -3034,13 +3082,13 @@ def test_phase7_representative_smoke_runtime_can_drive_cadence_band(
     ))
 
     assert launched["status"] == "launched"
-    assert launched["heartbeat_interval_sec"] == 600
+    assert launched["poll_interval_sec"] == server.reservations.DEFAULT_POLL_INTERVAL_SEC
     assert launched["cadence_basis"]["source"] == "smoke_job"
     assert launched["cadence_basis"]["smoke_job_id"] == smoke["job_id"]
     assert launched["cadence_basis"]["smoke_runtime_sec"] == 1801
     assert launched["cadence_basis"]["smoke_cadence_representative"] is True
-    assert launched["cadence_basis"]["cadence_evidence_used"] is True
-    assert launched["cadence_basis"]["selected_interval_sec"] == 600
+    assert launched["cadence_basis"]["cadence_evidence_used"] is False
+    assert launched["cadence_basis"]["selected_interval_sec"] == server.reservations.DEFAULT_POLL_INTERVAL_SEC
 
 
 def test_phase7_main_launch_refuses_unusable_smoke_references(
@@ -3274,7 +3322,15 @@ def test_phase7_update_cadence_refuses_missing_reason_or_cadence_input(
         {"cadence_hint_sec": 300},
         {"cadence_hint_sec": 300, "reason": ""},
         {"cadence_hint_sec": 300, "reason": "   "},
+        {
+            "cadence_hint_sec": 10**100,
+            "reason": "exercise the technical datetime boundary",
+        },
         {"reason": "need a different cadence"},
+        {
+            "expected_duration_sec": 7200,
+            "reason": "duration metadata alone must not change polling",
+        },
     ]
 
     for kwargs in cases:
@@ -3547,6 +3603,29 @@ def test_remote_host_run_records_failure_reason(repo_fixture, monkeypatch):
 
     assert server._host_run("gpu-a", "nvidia-smi", timeout=3) is None
     assert "timeout" in server._host_run_error("gpu-a", "nvidia-smi")
+
+
+def test_direct_ssh_run_defaults_to_policy_sync_timeout(repo_fixture, monkeypatch):
+    config = _write_config(repo_fixture)
+    server = _import_server_with_config(monkeypatch, config)
+    seen = {}
+
+    class FakeResult:
+        stdout = "ok\n"
+
+    class FakeConnection:
+        def run(self, cmd, hide=True, timeout=15):
+            seen["timeout"] = timeout
+            return FakeResult()
+
+    monkeypatch.setattr(
+        server,
+        "_conn",
+        lambda host, user=server.GPU_MCP_USER: FakeConnection(),
+    )
+
+    assert server._ssh_run("gpu-a", "true") == "ok"
+    assert seen["timeout"] == server.SYNC_TIMEOUT_SEC
 
 
 def test_remote_python_argv_uses_staged_safe_runner_not_server(repo_fixture, monkeypatch):

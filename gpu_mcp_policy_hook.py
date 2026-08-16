@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import json
 import os
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -25,6 +27,10 @@ HOOK_REMINDER_ADDITIONAL_CONTEXT = "additionalContext"
 HOOK_REMINDER_OFF = "off"
 TEST_POLICY_APPROVAL_STORE_ENV = "GPU_MCP_TEST_POLICY_APPROVAL_STORE"
 TEST_HOOK_CAPABILITY_NONCE_ENV = "GPU_MCP_TEST_HOOK_CAPABILITY_NONCE"
+TEST_STOP_STATE_ROOT_ENV = "GPU_MCP_TEST_STOP_STATE_ROOT"
+STOP_LOCAL_SCAN_INTERVAL_SEC = 1.0
+STOP_STATE_ROOT = Path.home() / "gpu-mcp" / "state" / "hook-stop"
+TERMINAL_JOB_LIFECYCLES = {"succeeded", "failed", "finished"}
 
 
 HOOK_MESSAGE = (
@@ -214,18 +220,19 @@ def _reservation_metadata_for_record(record: dict) -> dict | None:
     return metadata
 
 
-def _heartbeat_interval_sec(metadata: dict) -> int:
-    raw = metadata.get("heartbeat_interval_sec")
+def _poll_interval_sec(record: dict) -> int:
+    raw = record.get("poll_interval_sec")
     if isinstance(raw, bool):
-        interval = reservations.DEFAULT_HEARTBEAT_INTERVAL_SEC
+        interval = reservations.DEFAULT_POLL_INTERVAL_SEC
     else:
         try:
             interval = int(raw)
         except (TypeError, ValueError):
-            interval = reservations.DEFAULT_HEARTBEAT_INTERVAL_SEC
-    return max(
-        reservations.MIN_HEARTBEAT_INTERVAL_SEC,
-        min(reservations.MAX_HEARTBEAT_INTERVAL_SEC, interval),
+            interval = reservations.DEFAULT_POLL_INTERVAL_SEC
+    return (
+        interval
+        if interval >= reservations.MIN_POLL_INTERVAL_SEC
+        else reservations.DEFAULT_POLL_INTERVAL_SEC
     )
 
 
@@ -236,12 +243,12 @@ def _status_acknowledged(record: dict, due_at: datetime) -> bool:
     return checked_at is not None and checked_at >= due_at
 
 
-def _claim_due_reminder(
+def _claim_job_reminder(
     repo_root: Path,
     record: dict,
-    metadata: dict,
     *,
-    due_at: datetime,
+    kind: str,
+    due_at: datetime | None,
     now: datetime,
 ) -> bool | None:
     job_id = record.get("job_id")
@@ -266,36 +273,66 @@ def _claim_due_reminder(
             reminder = _read_json_quiet(reminder_path)
             if not isinstance(reminder, dict):
                 reminder = {}
-            if _status_acknowledged(record, due_at):
+            if kind == "poll_due" and (
+                due_at is None or _status_acknowledged(record, due_at)
+            ):
                 return False
-            same_poll = (
-                reminder.get("last_reminded_poll_after") == record.get("next_poll_after")
-                and reminder.get("attempt_id") == record.get("active_attempt_id")
+            same_attempt = (
+                reminder.get("attempt_id") == record.get("active_attempt_id")
                 and reminder.get("reservation_key") == record.get("reservation_key")
             )
+            if kind == "outcome":
+                same_event = (
+                    same_attempt
+                    and reminder.get("last_outcome_attempt_id")
+                    == record.get("active_attempt_id")
+                )
+                last_reminded_key = "last_outcome_reminded_at"
+                count_key = "outcome_reminder_count"
+            else:
+                same_event = (
+                    same_attempt
+                    and reminder.get("last_reminded_poll_after")
+                    == record.get("next_poll_after")
+                )
+                last_reminded_key = "last_reminded_at"
+                count_key = "reminder_count_for_poll_after"
+
             count = 0
-            if same_poll:
-                last_reminded_at = _parse_hook_time(reminder.get("last_reminded_at"))
+            if same_event:
+                last_reminded_at = _parse_hook_time(reminder.get(last_reminded_key))
                 if last_reminded_at is not None:
                     elapsed = (now - last_reminded_at).total_seconds()
-                    if elapsed < _heartbeat_interval_sec(metadata):
+                    if elapsed < _poll_interval_sec(record):
                         return False
-                raw_count = reminder.get("reminder_count_for_poll_after")
+                raw_count = reminder.get(count_key)
                 if isinstance(raw_count, int) and not isinstance(raw_count, bool) and raw_count > 0:
                     count = raw_count
-            try:
-                reservations.atomic_write_json(
-                    reminder_path,
+            updated = {
+                **reminder,
+                "schema_version": 1,
+                "job_id": job_id,
+                "attempt_id": record.get("active_attempt_id"),
+                "reservation_key": record.get("reservation_key"),
+            }
+            if kind == "outcome":
+                updated.update(
                     {
-                        "schema_version": 1,
-                        "job_id": job_id,
-                        "attempt_id": record.get("active_attempt_id"),
-                        "reservation_key": record.get("reservation_key"),
+                        "last_outcome_attempt_id": record.get("active_attempt_id"),
+                        "last_outcome_reminded_at": _iso_hook_time(now),
+                        "outcome_reminder_count": count + 1,
+                    }
+                )
+            else:
+                updated.update(
+                    {
                         "last_reminded_poll_after": record.get("next_poll_after"),
                         "last_reminded_at": _iso_hook_time(now),
                         "reminder_count_for_poll_after": count + 1,
-                    },
+                    }
                 )
+            try:
+                reservations.atomic_write_json(reminder_path, updated)
             except Exception:
                 return None
             return True
@@ -303,25 +340,51 @@ def _claim_due_reminder(
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
-def _reminder_output(records: list[tuple[dict, datetime]], *, now: datetime) -> dict:
-    records = sorted(records, key=lambda item: (item[1], str(item[0].get("job_id"))))
+def _reminder_output(
+    records: list[tuple[dict, datetime | None, str]],
+    *,
+    now: datetime,
+) -> dict:
+    records = sorted(
+        records,
+        key=lambda item: (
+            item[2] != "outcome",
+            item[1].timestamp() if isinstance(item[1], datetime) else float("inf"),
+            str(item[0].get("job_id")),
+        ),
+    )
     count = len(records)
-    lines = [
-        (
-            "GPU MCP: 1 managed job is due for status."
+    kinds = {kind for _record, _due_at, kind in records}
+    if kinds == {"poll_due"}:
+        heading = (
+            "GPU MCP: 1 managed job has a scheduled status check due."
             if count == 1
-            else f"GPU MCP: {count} managed jobs are due for status."
+            else f"GPU MCP: {count} managed jobs have scheduled status checks due."
         )
-    ]
-    for record, due_at in records:
+    elif kinds == {"outcome"}:
+        heading = (
+            "GPU MCP: 1 managed job has a local outcome to reconcile through status."
+            if count == 1
+            else f"GPU MCP: {count} managed jobs have local outcomes to reconcile through status."
+        )
+    else:
+        heading = f"GPU MCP: {count} managed jobs have status events to reconcile."
+    lines = [heading]
+    for record, due_at, kind in records:
         job_id = record.get("job_id")
+        if kind == "outcome":
+            lines.append(
+                f'- {job_id}: local outcome detected; '
+                f'call manage_gpu_job(action="status", job_id="{job_id}").'
+            )
+            continue
+        assert due_at is not None
         overdue_min = max(0, int((now - due_at).total_seconds() // 60))
         lines.append(
-            f'- {job_id}: overdue by {overdue_min}m; '
-            f'call manage_gpu_job(action="status", job_id="{job_id}") '
-            "before using this job's outputs."
+            f'- {job_id}: scheduled status check is overdue by {overdue_min}m; '
+            f'call manage_gpu_job(action="status", job_id="{job_id}").'
         )
-    lines.append("Independent work may continue; output-dependent work must wait for terminal status.")
+    lines.append("Continue from the returned lifecycle.")
     context = "\n".join(lines)
     return {
         "hookSpecificOutput": {
@@ -337,19 +400,6 @@ def _parse_next_poll_after(value: object) -> datetime | None:
     return _parse_hook_time(value)
 
 
-def _phase7_output(context: str) -> dict:
-    return {
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "additionalContext": context,
-        },
-    }
-
-
-def _tool_suffix(tool_name: str) -> str:
-    return tool_name.rsplit("/", 1)[-1]
-
-
 def _nonempty_text(value: object) -> str | None:
     if not isinstance(value, str):
         return None
@@ -357,82 +407,26 @@ def _nonempty_text(value: object) -> str | None:
     return text or None
 
 
-def _phase7_role(tool_input: dict) -> str:
-    raw_role = tool_input.get("job_role")
-    if isinstance(raw_role, str) and raw_role.strip().lower() in {"smoke", "main", "one_off"}:
-        return raw_role.strip().lower()
-    return "main" if tool_input.get("async_mode") is True else "one_off"
-
-
-def _phase7_launch_guidance(tool_input: object) -> dict | None:
-    if not isinstance(tool_input, dict):
-        return None
-    if _phase7_role(tool_input) != "main":
-        return None
-    if reservations.is_job_id(tool_input.get("smoke_job_id")):
-        return None
-    if _nonempty_text(tool_input.get("smoke_skip_reason")) is not None:
-        return None
-    context = (
-        "GPU MCP: you are about to launch a main/background GPU job without smoke evidence. "
-        "Before proceeding, either run run_python_on_gpu(job_role=\"smoke\", ...) with small "
-        "representative inputs, or retry the main launch with smoke_skip_reason explaining why "
-        "a smoke check is not useful. Cadence hints such as expected_duration_sec or "
-        "cadence_hint_sec help schedule checks, but do not replace smoke evidence or a skip reason."
-    )
-    return _phase7_output(context)
-
-
-def _phase7_status_guidance(
-    repo_root: Path,
-    tool_input: object,
-    *,
-    now: datetime,
-) -> dict | None:
-    if not isinstance(tool_input, dict):
-        return None
-    if str(tool_input.get("action") or "").strip().lower() != "status":
-        return None
-    if _nonempty_text(tool_input.get("early_poll_reason")) is not None:
-        return None
-    job_id = tool_input.get("job_id")
-    if not reservations.is_job_id(job_id):
-        return None
-    record = _read_json_quiet(reservations.job_record_path(repo_root, str(job_id)))
-    if not isinstance(record, dict):
-        return None
-    if record.get("job_lifecycle") in {"succeeded", "failed", "finished"}:
-        return None
-    next_poll_after = record.get("next_poll_after")
-    due_at = _parse_next_poll_after(next_poll_after)
-    if due_at is None or due_at <= now:
-        return None
-    context = (
-        f"GPU MCP: job {job_id} is not due for status until {next_poll_after}. "
-        "Do independent work or wait; do not use this job's outputs yet. "
-        f"If a full check is justified now, call manage_gpu_job(action=\"status\", "
-        f"job_id=\"{job_id}\", early_poll_reason=\"...\")."
-    )
-    return _phase7_output(context)
-
-
-def check_phase7_pretooluse_guidance(
-    cwd: str | Path,
-    *,
+def _targeted_status_call(
     tool_name: str,
     tool_input: object,
-    now: datetime | None = None,
-) -> dict | None:
-    policy_path = find_policy_file(cwd)
-    if policy_path is None:
-        return None
-    repo_root = policy_path.parent.resolve()
-    suffix = _tool_suffix(str(tool_name or ""))
-    if suffix == "run_python_on_gpu":
-        return _phase7_launch_guidance(tool_input)
-    if suffix == "manage_gpu_job":
-        return _phase7_status_guidance(repo_root, tool_input, now=now or _hook_now())
-    return None
+) -> tuple[str | None, str | None]:
+    if not str(tool_name or "").endswith("manage_gpu_job") or not isinstance(tool_input, dict):
+        return None, None
+    action = tool_input.get("action", "status")
+    if not isinstance(action, str) or action.strip().lower() != "status":
+        return None, None
+    job_id = tool_input.get("job_id")
+    reservation_key = tool_input.get("reservation_key")
+    if job_id is not None and not reservations.is_job_id(job_id):
+        return None, None
+    if reservation_key is not None and not reservations.is_reservation_key(reservation_key):
+        return None, None
+    if reservations.is_job_id(job_id):
+        return str(job_id), None
+    if reservations.is_reservation_key(reservation_key):
+        return None, str(reservation_key)
+    return None, None
 
 
 def check_test_hook_capability_nonce(*, env: dict[str, str] | None = None) -> dict | None:
@@ -451,6 +445,8 @@ def check_test_hook_capability_nonce(*, env: dict[str, str] | None = None) -> di
 def check_gpu_job_reminders(
     cwd: str | Path,
     *,
+    tool_name: str = "",
+    tool_input: object = None,
     now: datetime | None = None,
     env: dict[str, str] | None = None,
 ) -> dict | None:
@@ -465,7 +461,11 @@ def check_gpu_job_reminders(
     if not jobs_root.exists() or jobs_root.is_symlink():
         return None
     current = now or _hook_now(env=env)
-    due_records: list[tuple[dict, datetime]] = []
+    targeted_job_id, targeted_reservation_key = _targeted_status_call(
+        tool_name,
+        tool_input,
+    )
+    reminder_records: list[tuple[dict, datetime | None, str]] = []
 
     for job_dir in sorted(jobs_root.glob("job-*")):
         if job_dir.is_symlink() or not job_dir.is_dir():
@@ -475,23 +475,320 @@ def check_gpu_job_reminders(
         if not isinstance(record, dict):
             continue
         job_id = record.get("job_id")
+        attempt_id = record.get("active_attempt_id")
         next_poll_after = record.get("next_poll_after")
         due_at = _parse_hook_time(next_poll_after)
-        if not reservations.is_job_id(job_id) or due_at is None or due_at > current:
+        if (
+            not reservations.is_job_id(job_id)
+            or job_dir.name != job_id
+            or not reservations.is_attempt_id(attempt_id)
+            or record.get("active_reservation", True) is False
+            or record.get("job_lifecycle") in TERMINAL_JOB_LIFECYCLES
+        ):
             continue
-        if _status_acknowledged(record, due_at):
+        if (
+            (targeted_job_id is not None and job_id == targeted_job_id)
+            or (
+                targeted_reservation_key is not None
+                and record.get("reservation_key") == targeted_reservation_key
+            )
+        ):
             continue
         metadata = _reservation_metadata_for_record(record)
-        if metadata is None:
+        if metadata is None or metadata.get("repo") != str(repo_root):
             _retire_hook_reminder(repo_root, job_id)
             continue
-        claimed = _claim_due_reminder(repo_root, record, metadata, due_at=due_at, now=current)
+
+        try:
+            reservations.outcome_record_path(repo_root, job_id, attempt_id).lstat()
+            outcome_present = True
+        except OSError:
+            outcome_present = False
+        poll_due = (
+            due_at is not None
+            and due_at <= current
+            and not _status_acknowledged(record, due_at)
+        )
+        if not outcome_present and not poll_due:
+            continue
+
+        kind = "outcome" if outcome_present else "poll_due"
+        claimed = _claim_job_reminder(
+            repo_root,
+            record,
+            kind=kind,
+            due_at=due_at,
+            now=current,
+        )
         if not claimed:
             continue
-        due_records.append((record, due_at))
-    if not due_records:
+        reminder_records.append((record, due_at, kind))
+    if not reminder_records:
         return None
-    return _reminder_output(due_records, now=current)
+    return _reminder_output(reminder_records, now=current)
+
+
+def _stop_state_root(*, env: dict[str, str] | None = None) -> Path:
+    source = os.environ if env is None else env
+    injected = source.get(TEST_STOP_STATE_ROOT_ENV, "").strip()
+    if injected and source.get("PYTEST_CURRENT_TEST"):
+        return Path(injected).expanduser().absolute()
+    return STOP_STATE_ROOT
+
+
+def _stop_state_path(
+    repo_root: Path,
+    session_id: str,
+    *,
+    env: dict[str, str] | None = None,
+) -> Path:
+    key = hashlib.sha256(f"{repo_root}\0{session_id}".encode()).hexdigest()
+    return _stop_state_root(env=env) / f"{key}.json"
+
+
+def _claim_stop_events(
+    repo_root: Path,
+    *,
+    session_id: str,
+    turn_id: str,
+    events: list[dict],
+    env: dict[str, str] | None = None,
+) -> list[dict] | None:
+    """Claim each advisory event once within one interactive turn."""
+    try:
+        state_path = _stop_state_path(repo_root, session_id, env=env)
+        state_root = state_path.parent
+        reservations._assert_no_symlink_ancestors(state_root)
+        state_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        reservations._assert_no_symlink_ancestors(state_root)
+        lock_path = state_path.with_suffix(".lock")
+        flags = os.O_RDWR | os.O_CREAT
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(lock_path, flags, 0o600)
+    except Exception:
+        return None
+
+    try:
+        with os.fdopen(fd, "r+") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                state = _read_json_quiet(state_path)
+                turn_key = hashlib.sha256(turn_id.encode()).hexdigest()
+                if not isinstance(state, dict) or state.get("turn_key") != turn_key:
+                    delivered: dict[str, str] = {}
+                else:
+                    raw_delivered = state.get("delivered")
+                    delivered = dict(raw_delivered) if isinstance(raw_delivered, dict) else {}
+
+                claimed: list[dict] = []
+                for event in events:
+                    job_id = event.get("job_id")
+                    event_key = event.get("event_key")
+                    if not reservations.is_job_id(job_id) or not isinstance(event_key, str):
+                        continue
+                    if delivered.get(str(job_id)) == event_key:
+                        continue
+                    delivered[str(job_id)] = event_key
+                    claimed.append(event)
+                if not claimed:
+                    return []
+
+                reservations.atomic_write_json(
+                    state_path,
+                    {
+                        "schema_version": 1,
+                        "repo": str(repo_root),
+                        "turn_key": turn_key,
+                        "delivered": delivered,
+                    },
+                )
+                return claimed
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except Exception:
+        return None
+
+
+def _stop_job_candidates(repo_root: Path) -> list[dict]:
+    jobs_root = reservations.repo_job_state_root(repo_root)
+    if not jobs_root.exists() or jobs_root.is_symlink():
+        return []
+
+    candidates: list[dict] = []
+    for job_dir in sorted(jobs_root.glob("job-*")):
+        if job_dir.is_symlink() or not job_dir.is_dir():
+            continue
+        record = _read_json_quiet(job_dir / "job.json")
+        if not isinstance(record, dict):
+            continue
+        job_id = record.get("job_id")
+        attempt_id = record.get("active_attempt_id")
+        if (
+            not reservations.is_job_id(job_id)
+            or job_dir.name != job_id
+            or not reservations.is_attempt_id(attempt_id)
+            or record.get("active_reservation", True) is False
+            or record.get("job_lifecycle") in TERMINAL_JOB_LIFECYCLES
+        ):
+            continue
+        metadata = _reservation_metadata_for_record(record)
+        if metadata is None or metadata.get("repo") != str(repo_root):
+            continue
+
+        try:
+            outcome_path = reservations.outcome_record_path(repo_root, job_id, attempt_id)
+            outcome_path.lstat()
+            outcome_present = True
+        except OSError:
+            outcome_present = False
+        due_at = _parse_next_poll_after(record.get("next_poll_after"))
+        if due_at is None and not outcome_present:
+            continue
+        candidates.append(
+            {
+                "job_id": job_id,
+                "attempt_id": attempt_id,
+                "next_poll_after": record.get("next_poll_after"),
+                "due_at": due_at,
+                "outcome_present": outcome_present,
+            }
+        )
+    return candidates
+
+
+def probe_stop_wait_ownership(cwd: str | Path) -> dict:
+    """Report whether a managed GPU wait can own the next Stop event.
+
+    This is an immediate, read-only probe for another synchronous Stop hook. It
+    deliberately does not claim an event or wait for one; the normal GPU Stop
+    handler remains the lifecycle authority.
+    """
+    policy_path = find_policy_file(cwd)
+    if policy_path is None:
+        return {
+            "schema_version": 1,
+            "owner": "gpu_mcp_wait",
+            "owns_stop": False,
+            "job_ids": [],
+        }
+    repo_root = policy_path.parent.resolve()
+    candidates = _stop_job_candidates(repo_root)
+    return {
+        "schema_version": 1,
+        "owner": "gpu_mcp_wait",
+        "owns_stop": bool(candidates),
+        "job_ids": sorted(str(candidate["job_id"]) for candidate in candidates),
+    }
+
+
+def _ready_stop_events(candidates: list[dict], *, now: datetime) -> list[dict]:
+    events: list[dict] = []
+    for candidate in candidates:
+        job_id = str(candidate["job_id"])
+        attempt_id = str(candidate["attempt_id"])
+        if candidate["outcome_present"]:
+            events.append({
+                "job_id": job_id,
+                "kind": "outcome",
+                "event_key": f"outcome:{attempt_id}",
+            })
+            continue
+        due_at = candidate.get("due_at")
+        if isinstance(due_at, datetime) and due_at <= now:
+            poll_after = candidate.get("next_poll_after")
+            events.append({
+                "job_id": job_id,
+                "kind": "poll_due",
+                "event_key": f"poll:{attempt_id}:{poll_after}",
+            })
+    return sorted(events, key=lambda event: (event["kind"] != "outcome", event["job_id"]))
+
+
+def _stop_continuation(events: list[dict]) -> dict:
+    lines = ["GPU MCP: managed-job status is due."]
+    for event in events:
+        job_id = event["job_id"]
+        reason = (
+            "local outcome detected"
+            if event["kind"] == "outcome"
+            else "scheduled status check is due"
+        )
+        lines.append(
+            f'- {job_id}: {reason}; call manage_gpu_job(action="status", '
+            f'job_id="{job_id}").'
+        )
+    lines.append("Status reconciles managed state; continue from the returned lifecycle.")
+    return {"decision": "block", "reason": "\n".join(lines)}
+
+
+def wait_for_gpu_job_stop_event(
+    cwd: str | Path,
+    *,
+    session_id: str,
+    turn_id: str,
+    env: dict[str, str] | None = None,
+    now_fn=None,
+    sleep_fn=time.sleep,
+    scan_interval_sec: float = STOP_LOCAL_SCAN_INTERVAL_SEC,
+    max_wait_sec: float | None = None,
+) -> dict | None:
+    """Suspend a Stop hook until a local outcome or scheduled status event."""
+    if not _nonempty_text(session_id) or not _nonempty_text(turn_id):
+        return None
+    policy_path = find_policy_file(cwd)
+    if policy_path is None:
+        return None
+    repo_root = policy_path.parent.resolve()
+    source = os.environ if env is None else env
+    clock = now_fn or (lambda: _hook_now(env=source))
+    started = time.monotonic()
+    scan_interval = max(0.01, float(scan_interval_sec))
+
+    try:
+        while True:
+            current = clock()
+            candidates = _stop_job_candidates(repo_root)
+            if not candidates:
+                return None
+
+            ready = _ready_stop_events(candidates, now=current)
+            if ready:
+                ready_job_ids = {event["job_id"] for event in ready}
+                claimed = _claim_stop_events(
+                    repo_root,
+                    session_id=session_id,
+                    turn_id=turn_id,
+                    events=ready,
+                    env=source,
+                )
+                if claimed is None:
+                    return None
+                if claimed:
+                    return _stop_continuation(claimed)
+                if all(candidate["job_id"] in ready_job_ids for candidate in candidates):
+                    return None
+
+            if max_wait_sec is not None:
+                remaining = float(max_wait_sec) - (time.monotonic() - started)
+                if remaining <= 0:
+                    return None
+            else:
+                remaining = None
+
+            future_delays = [
+                (candidate["due_at"] - current).total_seconds()
+                for candidate in candidates
+                if isinstance(candidate.get("due_at"), datetime) and candidate["due_at"] > current
+            ]
+            sleep_for = min(scan_interval, min(future_delays, default=scan_interval))
+            if remaining is not None:
+                sleep_for = min(sleep_for, remaining)
+            if sleep_for <= 0:
+                return None
+            sleep_fn(sleep_for)
+    except Exception:
+        return None
 
 
 def _store_from_test_env(*, env: dict[str, str] | None = None) -> Path | None:
@@ -505,8 +802,18 @@ def _store_from_test_env(*, env: dict[str, str] | None = None) -> Path | None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--store", type=Path, default=None)
+    parser.add_argument("--probe-stop-wait-ownership", action="store_true")
+    parser.add_argument("--cwd", type=Path, default=None)
     args = parser.parse_args(argv)
     store_path = args.store or _store_from_test_env()
+
+    if args.probe_stop_wait_ownership:
+        try:
+            result = probe_stop_wait_ownership(args.cwd or Path.cwd())
+        except Exception:
+            return 1
+        print(json.dumps(result, sort_keys=True))
+        return 0
 
     try:
         event = json.loads(sys.stdin.read() or "{}")
@@ -524,7 +831,8 @@ def main(argv: list[str] | None = None) -> int:
             or {"cmd": event.get("command")}
         ),
     )
-    if result is None and event.get("hook_event_name") == "PreToolUse":
+    event_name = event.get("hook_event_name") or event.get("hookEventName")
+    if result is None and event_name == "PreToolUse":
         tool_name = str(event.get("tool_name") or "")
         tool_input = (
             event.get("tool_input")
@@ -534,12 +842,17 @@ def main(argv: list[str] | None = None) -> int:
         )
         result = (
             check_test_hook_capability_nonce()
-            or check_phase7_pretooluse_guidance(
+            or check_gpu_job_reminders(
                 cwd,
                 tool_name=tool_name,
                 tool_input=tool_input,
             )
-            or check_gpu_job_reminders(cwd)
+        )
+    if result is None and event_name == "Stop":
+        result = wait_for_gpu_job_stop_event(
+            cwd,
+            session_id=str(event.get("session_id") or ""),
+            turn_id=str(event.get("turn_id") or ""),
         )
     if result is not None:
         print(json.dumps(result, sort_keys=True))

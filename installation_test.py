@@ -221,7 +221,7 @@ def _live_gpu_prompt(host: str, gpu_index: int, script_path: str, output_file: s
         f"First call {MCP_SERVER_NAME}/run_python_on_gpu with "
         f"host={host!r}, gpu_index={gpu_index}, script_path={script_path!r}, "
         f"args=[], output_file={output_file!r}, job_role='smoke', "
-        "expected_duration_sec=60. Then call "
+        "expected_duration_sec=60, cadence_hint_sec=60. Then call "
         f"{MCP_SERVER_NAME}/manage_gpu_job with action='status', the returned "
         "job_id, and early_poll_reason='installation test live GPU probe'. "
         "Report only JSON with keys status, job_lifecycle, cuda_visible_devices, "

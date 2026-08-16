@@ -164,15 +164,52 @@ type = "command"
 command = "/absolute/path/to/python /home/USER/gpu-mcp/gpu_mcp_policy_hook.py"
 timeout = 5
 statusMessage = "Checking GPU MCP policy drift"
+
+[[hooks.Stop]]
+matcher = "*"
+
+[[hooks.Stop.hooks]]
+type = "command"
+command = "/absolute/path/to/python /home/USER/gpu-mcp/gpu_mcp_policy_hook.py"
+timeout = 31536000
+statusMessage = "Waiting for a managed GPU job event"
 ```
 
 Restart Codex after editing Codex config. Use `/hooks` in Codex to review and
 trust the user-global GPU MCP companion hook. The hook discovers the current
 repo from the nearest `gpu-mcp.toml` and exits quietly outside GPU MCP repos. It
 is workflow feedback: it warns the agent if `gpu-mcp.toml` has changed but has
-not been reloaded, and it may surface due managed-job reminders. The server's
-startup, preview/reload, stale-policy, reservation, and heartbeat checks remain
-the actual safety boundary if a client does not support hooks.
+not been reloaded. During active work, PreToolUse immediately surfaces a local
+job outcome or a due status check. At turn end, Stop waits for either event and
+continues the turn so the agent can call `status`. The one-year Stop timeout is
+an operational hook-runner watchdog, not a managed-job cadence cap; increase it
+if a deployment intentionally suspends turns longer than a year. Hooks never
+parse outcomes or release reservations; the server remains the lifecycle and
+safety boundary.
+
+Running jobs may expose useful intermediate artifacts. Files the application
+has already closed or atomically published may be inspected read-only and
+reported as provisional. Terminal `status` is required before claiming a final
+result, but not before every intervention while a job is running. Running-job
+analysis, cadence changes, and justified lifecycle actions remain available,
+subject to the server's ownership and process-safety checks. GPU MCP does not
+determine whether an application-specific file is durable.
+
+### Timing model
+
+- Reservation heartbeats are lease safety. New jobs use a 10-minute lease
+  interval, the local manager scans once per second and writes at least once per
+  minute, and staleness is three lease intervals after the last successful
+  write. The 60-minute heartbeat validation maximum is not a status-poll cap.
+- Agent polling is repo-local guidance. A positive `cadence_hint_sec` is used
+  exactly with no policy maximum; `expected_duration_sec` and smoke runtime are
+  descriptive only. Without a hint, smoke jobs use five minutes and main or
+  one-off jobs use one hour.
+- Due/outcome re-reminders are throttled using that job's repo-local
+  `poll_interval_sec`, never the shared heartbeat interval.
+- Stop checks local timestamps and outcome-file presence once per second so it
+  can notice early completion. That local scan is not an MCP status poll and
+  does not change the job's polling schedule.
 
 ## 4. Repo Policy
 

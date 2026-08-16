@@ -191,6 +191,7 @@ The global GPU MCP companion hook is installed on this machine. It runs:
 ```text
 PreToolUse:  /usr/bin/env GPU_MCP_HOOK_REMINDER_MODE=additionalContext /home/tingran/miniconda3/bin/python /home/tingran/gpu-mcp/gpu_mcp_policy_hook.py
 PostToolUse: /home/tingran/miniconda3/bin/python /home/tingran/gpu-mcp/gpu_mcp_policy_hook.py
+Stop:        /home/tingran/miniconda3/bin/python /home/tingran/gpu-mcp/gpu_mcp_policy_hook.py  (timeout: 31536000s operational watchdog)
 ```
 
 Do not add repo-local hook blocks, and do not put target-repo paths in the

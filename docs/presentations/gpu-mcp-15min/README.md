@@ -2,7 +2,7 @@
 
 Presentation files:
 
-- `GPU_MCP_for_Polymer_Simulators.pdf` — ten-slide deck for presenting
+- `GPU_MCP_for_Polymer_Simulators.pdf` — twelve-slide deck for presenting
   or sharing.
 - `GPU_MCP_for_Polymer_Simulators.html` — browser presentation; use arrow
   keys, Page Up/Down, or Space to navigate.

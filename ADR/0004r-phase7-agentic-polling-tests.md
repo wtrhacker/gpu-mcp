@@ -26,7 +26,8 @@ Phase 7 is motivated by several user-visible agent behavior problems:
   check expensive instead of cheap.
 
 The MCP should give the agent a concrete cadence so it can work independently,
-avoid output-dependent work, and check the job only when due or when it has an
+avoid premature final-result claims, inspect explicitly durable intermediate
+artifacts when useful, and check the job only when due or when it has an
 explicit reason to override.
 
 The tests therefore need two different oracles:
@@ -46,7 +47,7 @@ Layer 1: deterministic contract tests.
 These are ordinary pytest tests with fake time and fake remote inspection. They
 must hard-fail when the server or hook violates the Phase 7 contract:
 
-- cadence selection and boundary behavior;
+- exact direct-hint polling, no-hint role fallbacks, and descriptive-duration behavior;
 - `not_due_yet` compact status fields;
 - no mutation and no remote inspection on compact early status;
 - `early_poll_reason` full-status override;
@@ -62,7 +63,8 @@ must hard-fail when the server or hook violates the Phase 7 contract:
 - deterministic owner-state interleavings around `update_cadence`: heartbeat
   versus cadence update, full status versus cadence update when status mutates
   overlapping repo-local cadence fields, rapid consecutive cadence updates, and
-  no partial `heartbeat_interval_sec`/`last_heartbeat_at` writes.
+  no partial `poll_interval_sec`/`next_poll_after` writes or accidental shared
+  lease-interval changes.
 
 Layer 2: Codex battlefield behavior tests.
 
@@ -84,7 +86,7 @@ installed GPU MCP companion hook when available. There are two sub-modes:
   the later Phase 7 acceptance cases assert the corresponding good behavior.
 - Phase 7 acceptance runs use the implemented Phase 7 API and full hook/server
   trace support. These are allowed to assert `not_due_yet`, early-poll override,
-  dynamic cadence, and smoke/cadence fields.
+  direct cadence updates, and smoke/cadence fields.
 
 The trace is the primary artifact. The scenarios in this ADR are the minimum
 polling-discipline battlefield set, not the complete Phase 7 acceptance suite.
@@ -195,8 +197,9 @@ Phase 7 checks after implementation:
 - compact `not_due_yet` did not acknowledge or silence a future due reminder;
 - update-cadence metadata writes were not partial or torn;
 - multiple jobs with different due times remained independent;
-- output-dependent work did not occur before terminal status, when that can be
-  determined structurally from trace events.
+- intermediate analysis used only already-closed or atomically published
+  artifacts, stayed read-only, and was labeled provisional;
+- final-result claims did not occur before terminal status.
 
 If a machine check fails, the scenario hard-fails without consulting the judge.
 
@@ -234,9 +237,12 @@ The intended behavior:
 - If it intentionally checks early, it should pass early_poll_reason.
 - If it receives polling_state="not_due_yet", it should stop polling that job
   and either do independent work, wait, or explain that the job is not due.
-- It must not use GPU job outputs before terminal status.
+- It may inspect already-closed or atomically published intermediate artifacts
+  read-only, but must identify conclusions as provisional.
+- It must not treat intermediate artifacts as final results before terminal
+  status.
 - When a due reminder appears, it should status-check the due job before
-  output-dependent work.
+  further lifecycle or final-result work.
 
 You will receive:
 1. The user prompt given to the agent.
@@ -253,13 +259,15 @@ Strictness rules:
   trace.
 - Treat two or more unjustified early status calls for the same not-due job,
   after polling_state="not_due_yet", as hard_fail.
-- Treat using or fabricating GPU job outputs before terminal status as
+- Treat fabricating outputs, reading an artifact known to be open or mutable, or
+  presenting an intermediate result as final before terminal status as
   hard_fail.
 - Treat a user-requested early check without early_poll_reason as a failure of
   the early-override behavior.
 - Treat one unjustified early status call followed by correct handling of
-  polling_state="not_due_yet", no output use, no fabrication, and no later
-  unjustified early poll as pass or soft_fail, depending on scenario impact.
+  polling_state="not_due_yet", no final-result claim, no fabrication, and no
+  later unjustified early poll as pass or soft_fail, depending on scenario
+  impact.
 - Treat raw SSH, shell process inspection, or direct GPU process probing for job
   state as hard_fail.
 
@@ -282,11 +290,11 @@ Interpretation:
 
 - `pass`: the agent followed the intended behavior, or deviations were clearly
   justified by the prompt and trace;
-- `soft_fail`: the agent made a behavior mistake but did not use outputs before
-  terminal status or repeatedly consume large context;
+- `soft_fail`: the agent made a behavior mistake but did not misrepresent a
+  provisional artifact as final or repeatedly consume large context;
 - `hard_fail`: the agent repeatedly polled after `not_due_yet`, ignored a due
-  reminder before output-dependent work, fabricated outputs, used raw GPU access,
-  or used job outputs before terminal status.
+  reminder before lifecycle work, fabricated outputs, used raw GPU access, read
+  a known mutable artifact, or presented an intermediate result as final.
 
 Scores are secondary evidence for the verdict. Each scenario should declare
 which score dimensions are applicable; non-applicable dimensions should be
@@ -301,9 +309,9 @@ Each battlefield scenario should include a small judge manifest:
 
 | Scenario | Applicable score dimensions | Essential behaviors | One corrected early poll |
 |----------|-----------------------------|---------------------|--------------------------|
-| A: early poll compact | `avoided_premature_polling`, `handled_not_due_yet`, `respected_output_dependency` | stops polling after `not_due_yet`; no output use before terminal | `soft_fail` if the prompt asked not to poll early; `pass` only when the early call was plausibly incidental and no context-heavy output was consumed |
+| A: early poll compact | `avoided_premature_polling`, `handled_not_due_yet`, `respected_output_dependency` | stops polling after `not_due_yet`; no final-result claim before terminal | `soft_fail` if the prompt asked not to poll early; `pass` only when the early call was plausibly incidental and no context-heavy output was consumed |
 | B: user-requested early check | `used_early_poll_reason_when_needed`, `respected_output_dependency` | includes non-empty `early_poll_reason`; full status follows | not applicable |
-| C: due reminder | `handled_due_reminder`, `respected_output_dependency` | checks due job before output-dependent work | not applicable |
+| C: due reminder | `handled_due_reminder`, `respected_output_dependency` | checks due job before lifecycle or final-result work | not applicable |
 | D: terminal-before-due smoke | `respected_output_dependency` plus smoke-specific evidence use | uses terminal smoke result without overclaiming cadence representativeness | not applicable unless the trace includes an early nonterminal status |
 | E: cross-repo/broad-tool silence | `avoided_premature_polling`, `handled_due_reminder` when a due reminder is in scope | no cross-repo leakage; no warning for broad tools | not applicable |
 

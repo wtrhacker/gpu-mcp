@@ -17,6 +17,7 @@ pytestmark = pytest.mark.contract
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 HOOK = REPO_ROOT / "gpu_mcp_policy_hook.py"
+CADENCE_POLICY = importlib.import_module("gpu_mcp_reservations")
 
 
 def _write_config(repo: Path) -> Path:
@@ -58,7 +59,7 @@ def _seed_hook_job(
     attempt_id: str = "attempt-20260530T123456Z-hookattempt",
     server_instance_id: str = "server-gpu-a-1234-hookserver",
     gpu_index: int = 0,
-    heartbeat_interval_sec: int = 600,
+    poll_interval_sec: int = 600,
 ):
     reservations = importlib.import_module("gpu_mcp_reservations")
     script = repo / "jobs" / "hook_job.py"
@@ -76,6 +77,7 @@ def _seed_hook_job(
         server_instance_id=server_instance_id,
         next_poll_after=next_poll_after,
     )
+    job_record["poll_interval_sec"] = poll_interval_sec
     metadata = reservations.build_shared_metadata(
         job_id=job_id,
         attempt_id=attempt_id,
@@ -88,7 +90,6 @@ def _seed_hook_job(
         server_instance_id=server_instance_id,
         remote_pid=12345,
         process_fingerprint="gpu-mcp-process:hook",
-        heartbeat_interval_sec=heartbeat_interval_sec,
     )
     reservations.atomic_write_json(reservations.job_record_path(repo, job_id), job_record)
     reservations.acquire_reservation(
@@ -97,6 +98,18 @@ def _seed_hook_job(
         metadata=metadata,
     )
     return job_record
+
+
+def _write_hook_outcome(repo: Path, job_record: dict, content: str = "{}\n") -> Path:
+    reservations = importlib.import_module("gpu_mcp_reservations")
+    outcome_path = reservations.outcome_record_path(
+        repo,
+        job_record["job_id"],
+        job_record["active_attempt_id"],
+    )
+    outcome_path.parent.mkdir(parents=True, exist_ok=True)
+    outcome_path.write_text(content, encoding="utf-8")
+    return outcome_path
 
 
 def test_policy_hook_exits_quietly_for_approved_policy(tmp_path):
@@ -499,17 +512,96 @@ def test_phase6_due_reminder_emits_additional_context(tmp_path, monkeypatch):
     assert result is not None
     assert result["hookSpecificOutput"]["hookEventName"] == "PreToolUse"
     context = result["hookSpecificOutput"]["additionalContext"]
-    assert context.splitlines()[0] == "GPU MCP: 1 managed job is due for status."
-    assert (
-        f'- {job_record["job_id"]}: overdue by 5m; '
-        f'call manage_gpu_job(action="status", job_id="{job_record["job_id"]}") '
-        "before using this job's outputs."
-    ) in context
-    assert (
-        "Independent work may continue; output-dependent work must wait for terminal status."
-        in context
+    assert context.splitlines() == [
+        "GPU MCP: 1 managed job has a scheduled status check due.",
+        (
+            f'- {job_record["job_id"]}: scheduled status check is overdue by 5m; '
+            f'call manage_gpu_job(action="status", job_id="{job_record["job_id"]}").'
+        ),
+        "Continue from the returned lifecycle.",
+    ]
+
+
+@pytest.mark.parametrize("target_field", ["job_id", "reservation_key"])
+@pytest.mark.parametrize("event_kind", ["poll_due", "outcome"])
+def test_pretool_reminder_suppresses_job_covered_by_inflight_status(
+    tmp_path,
+    monkeypatch,
+    target_field,
+    event_kind,
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_config(repo)
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    job = _seed_hook_job(
+        repo,
+        registry,
+        next_poll_after=(
+            "2026-05-30T12:00:00Z"
+            if event_kind == "poll_due"
+            else "2099-01-01T00:00:00Z"
+        ),
     )
-    assert job_record["job_id"] in context
+    if event_kind == "outcome":
+        _write_hook_outcome(repo, job)
+    reservations = importlib.import_module("gpu_mcp_reservations")
+    reminder_path = reservations.hook_reminder_path(repo, job["job_id"])
+    hook = importlib.import_module("gpu_mcp_policy_hook")
+
+    result = hook.check_gpu_job_reminders(
+        repo,
+        tool_name="mcp__repo_managed_gpu__manage_gpu_job",
+        tool_input={"action": "status", target_field: job[target_field]},
+        now=datetime(2026, 5, 30, 12, 5, tzinfo=timezone.utc),
+    )
+
+    assert result is None
+    assert not reminder_path.exists()
+
+
+def test_pretool_targeted_status_suppresses_only_the_covered_due_job(
+    tmp_path,
+    monkeypatch,
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_config(repo)
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    covered = _seed_hook_job(
+        repo,
+        registry,
+        next_poll_after="2026-05-30T12:00:00Z",
+        job_id="job-20260530T123456Z-covered",
+        attempt_id="attempt-20260530T123456Z-covered",
+        gpu_index=0,
+    )
+    remaining = _seed_hook_job(
+        repo,
+        registry,
+        next_poll_after="2026-05-30T12:00:00Z",
+        job_id="job-20260530T123456Z-remaining",
+        attempt_id="attempt-20260530T123456Z-remaining",
+        gpu_index=1,
+    )
+    reservations = importlib.import_module("gpu_mcp_reservations")
+    hook = importlib.import_module("gpu_mcp_policy_hook")
+
+    result = hook.check_gpu_job_reminders(
+        repo,
+        tool_name="repo_managed_gpu/manage_gpu_job",
+        tool_input={"action": "status", "job_id": covered["job_id"]},
+        now=datetime(2026, 5, 30, 12, 5, tzinfo=timezone.utc),
+    )
+
+    assert result is not None
+    context = result["hookSpecificOutput"]["additionalContext"]
+    assert covered["job_id"] not in context
+    assert remaining["job_id"] in context
+    assert not reservations.hook_reminder_path(repo, covered["job_id"]).exists()
+    assert reservations.hook_reminder_path(repo, remaining["job_id"]).exists()
 
 
 def test_phase6_test_capability_nonce_emits_additional_context_only_under_pytest():
@@ -595,7 +687,7 @@ def test_phase6_due_reminder_is_silent_inside_time_throttle_window(tmp_path, mon
     assert reminder["reminder_count_for_poll_after"] == 1
 
 
-def test_phase6_due_reminder_reemits_after_shared_heartbeat_interval(tmp_path, monkeypatch):
+def test_phase6_due_reminder_reemits_after_job_poll_interval(tmp_path, monkeypatch):
     repo = tmp_path / "repo"
     repo.mkdir()
     _write_config(repo)
@@ -606,7 +698,7 @@ def test_phase6_due_reminder_reemits_after_shared_heartbeat_interval(tmp_path, m
         repo,
         registry,
         next_poll_after="2026-05-30T12:00:00Z",
-        heartbeat_interval_sec=600,
+        poll_interval_sec=600,
     )
     hook = importlib.import_module("gpu_mcp_policy_hook")
 
@@ -633,18 +725,18 @@ def test_phase6_due_reminder_reemits_after_shared_heartbeat_interval(tmp_path, m
 
 
 @pytest.mark.parametrize(
-    ("metadata_value", "expected_interval_sec"),
+    ("record_value", "expected_interval_sec"),
     [
-        (None, 600),
-        ("fast", 600),
-        (1, 60),
-        (7200, 3600),
+        (None, CADENCE_POLICY.DEFAULT_POLL_INTERVAL_SEC),
+        ("fast", CADENCE_POLICY.DEFAULT_POLL_INTERVAL_SEC),
+        (1, 1),
+        (3 * CADENCE_POLICY.SECONDS_PER_HOUR, 3 * CADENCE_POLICY.SECONDS_PER_HOUR),
     ],
 )
-def test_phase6_due_reminder_interval_defaults_and_clamps(
+def test_phase6_due_reminder_interval_defaults_and_has_no_policy_cap(
     tmp_path,
     monkeypatch,
-    metadata_value,
+    record_value,
     expected_interval_sec,
 ):
     repo = tmp_path / "repo"
@@ -657,16 +749,16 @@ def test_phase6_due_reminder_interval_defaults_and_clamps(
         repo,
         registry,
         next_poll_after="2026-05-30T12:00:00Z",
-        heartbeat_interval_sec=600,
+        poll_interval_sec=600,
     )
     reservations = importlib.import_module("gpu_mcp_reservations")
-    metadata_path = registry / "gpu-a.gpu0" / "metadata.json"
-    metadata = json.loads(metadata_path.read_text())
-    if metadata_value is None:
-        metadata.pop("heartbeat_interval_sec")
+    job_path = reservations.job_record_path(repo, "job-20260530T123456Z-hookjob")
+    record = json.loads(job_path.read_text())
+    if record_value is None:
+        record.pop("poll_interval_sec", None)
     else:
-        metadata["heartbeat_interval_sec"] = metadata_value
-    reservations.atomic_write_json(metadata_path, metadata)
+        record["poll_interval_sec"] = record_value
+    reservations.atomic_write_json(job_path, record)
     hook = importlib.import_module("gpu_mcp_policy_hook")
     first_at = datetime(2026, 5, 30, 12, 5, tzinfo=timezone.utc)
 
@@ -860,18 +952,16 @@ def test_phase6_due_reminder_lists_multiple_due_jobs(tmp_path, monkeypatch):
     assert result is not None
     context = result["hookSpecificOutput"]["additionalContext"]
     assert context.splitlines() == [
-        "GPU MCP: 2 managed jobs are due for status.",
+        "GPU MCP: 2 managed jobs have scheduled status checks due.",
         (
-            f'- {old_job["job_id"]}: overdue by 18m; '
-            f'call manage_gpu_job(action="status", job_id="{old_job["job_id"]}") '
-            "before using this job's outputs."
+            f'- {old_job["job_id"]}: scheduled status check is overdue by 18m; '
+            f'call manage_gpu_job(action="status", job_id="{old_job["job_id"]}").'
         ),
         (
-            f'- {new_job["job_id"]}: overdue by 16m; '
-            f'call manage_gpu_job(action="status", job_id="{new_job["job_id"]}") '
-            "before using this job's outputs."
+            f'- {new_job["job_id"]}: scheduled status check is overdue by 16m; '
+            f'call manage_gpu_job(action="status", job_id="{new_job["job_id"]}").'
         ),
-        "Independent work may continue; output-dependent work must wait for terminal status.",
+        "Continue from the returned lifecycle.",
     ]
     reservations = importlib.import_module("gpu_mcp_reservations")
     for job_record in (old_job, new_job):
@@ -966,6 +1056,144 @@ def test_phase6_future_poll_and_posttooluse_are_silent(tmp_path, monkeypatch):
     )
     assert later_pretool is not None
     assert "job-20260530T123456Z-duepost" in later_pretool["hookSpecificOutput"]["additionalContext"]
+
+
+def test_pretool_outcome_reminder_fires_before_future_poll_without_parsing(
+    tmp_path,
+    monkeypatch,
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_config(repo)
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    job = _seed_hook_job(repo, registry, next_poll_after="2099-01-01T00:00:00Z")
+    reservations = importlib.import_module("gpu_mcp_reservations")
+    job_path = reservations.job_record_path(repo, job["job_id"])
+    metadata_path = registry / job["reservation_key"] / "metadata.json"
+    _write_hook_outcome(repo, job, "{malformed outcome")
+    job_before = job_path.read_bytes()
+    metadata_before = metadata_path.read_bytes()
+    hook = importlib.import_module("gpu_mcp_policy_hook")
+
+    result = hook.check_gpu_job_reminders(
+        repo,
+        now=datetime(2026, 5, 30, 12, 5, tzinfo=timezone.utc),
+    )
+
+    assert result is not None
+    context = result["hookSpecificOutput"]["additionalContext"]
+    assert context.splitlines()[0] == (
+        "GPU MCP: 1 managed job has a local outcome to reconcile through status."
+    )
+    assert "local outcome detected" in context
+    assert f'job_id="{job["job_id"]}"' in context
+    assert job_path.read_bytes() == job_before
+    assert metadata_path.read_bytes() == metadata_before
+
+
+def test_pretool_outcome_reminder_is_throttled_per_attempt(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_config(repo)
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    job = _seed_hook_job(
+        repo,
+        registry,
+        next_poll_after="2099-01-01T00:00:00Z",
+        poll_interval_sec=600,
+    )
+    _write_hook_outcome(repo, job)
+    hook = importlib.import_module("gpu_mcp_policy_hook")
+    first_at = datetime(2026, 5, 30, 12, 5, tzinfo=timezone.utc)
+
+    first = hook.check_gpu_job_reminders(repo, now=first_at)
+    duplicate = hook.check_gpu_job_reminders(
+        repo,
+        now=first_at + timedelta(seconds=599),
+    )
+    repeated = hook.check_gpu_job_reminders(
+        repo,
+        now=first_at + timedelta(seconds=600),
+    )
+
+    assert first is not None
+    assert duplicate is None
+    assert repeated is not None
+    reservations = importlib.import_module("gpu_mcp_reservations")
+    reminder = json.loads(
+        reservations.hook_reminder_path(repo, job["job_id"]).read_text()
+    )
+    assert reminder["last_outcome_attempt_id"] == job["active_attempt_id"]
+    assert reminder["outcome_reminder_count"] == 2
+
+
+def test_pretool_new_outcome_is_not_hidden_by_recent_poll_reminder(
+    tmp_path,
+    monkeypatch,
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_config(repo)
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    job = _seed_hook_job(
+        repo,
+        registry,
+        next_poll_after="2026-05-30T12:00:00Z",
+        poll_interval_sec=600,
+    )
+    hook = importlib.import_module("gpu_mcp_policy_hook")
+    first_at = datetime(2026, 5, 30, 12, 5, tzinfo=timezone.utc)
+
+    poll_reminder = hook.check_gpu_job_reminders(repo, now=first_at)
+    _write_hook_outcome(repo, job)
+    outcome_reminder = hook.check_gpu_job_reminders(
+        repo,
+        now=first_at + timedelta(seconds=1),
+    )
+
+    assert poll_reminder is not None
+    assert outcome_reminder is not None
+    context = outcome_reminder["hookSpecificOutput"]["additionalContext"]
+    assert "local outcome" in context
+    assert "overdue by" not in context
+
+
+def test_pretool_outcome_reminder_surfaces_during_other_tool_call(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    config = _write_config(repo)
+    store = tmp_path / "approved-policies.json"
+    _approve_policy(config, store)
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    monkeypatch.setenv("GPU_MCP_TEST_NOW", "2026-05-30T12:05:00Z")
+    job = _seed_hook_job(repo, registry, next_poll_after="2099-01-01T00:00:00Z")
+    _write_hook_outcome(repo, job)
+
+    completed = subprocess.run(
+        [sys.executable, str(HOOK), "--store", str(store)],
+        input=json.dumps(
+            {
+                "hook_event_name": "PreToolUse",
+                "cwd": str(repo),
+                "tool_name": "mcp__gpu_cluster_mcp__run_python_on_gpu",
+                "tool_input": {"async_mode": True, "job_role": "main"},
+            }
+        ),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+    assert completed.returncode == 0
+    result = json.loads(completed.stdout)
+    context = result["hookSpecificOutput"]["additionalContext"]
+    assert "local outcome" in context
+    assert job["job_id"] in context
 
 
 def test_phase6_due_reminder_filters_to_current_repo_jobs(tmp_path, monkeypatch):
@@ -1293,435 +1521,7 @@ def test_phase6_main_emits_pretooluse_additional_context(tmp_path, monkeypatch):
     assert "manage_gpu_job" in result["hookSpecificOutput"]["additionalContext"]
 
 
-def test_phase7_early_status_hook_warns_only_for_targeted_current_repo_job(
-    tmp_path,
-    monkeypatch,
-):
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    _write_config(repo)
-    registry = tmp_path / "reservations"
-    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
-    job_record = _seed_hook_job(
-        repo,
-        registry,
-        next_poll_after="2026-05-30T13:00:00Z",
-    )
-    hook = importlib.import_module("gpu_mcp_policy_hook")
-    now = datetime(2026, 5, 30, 12, 5, tzinfo=timezone.utc)
-
-    try:
-        result = hook.check_phase7_pretooluse_guidance(
-            repo,
-            tool_name="repo_managed_gpu/manage_gpu_job",
-            tool_input={"action": "status", "job_id": job_record["job_id"]},
-            now=now,
-        )
-    except AttributeError as exc:
-        pytest.fail(f"hook must expose Phase 7 pretool guidance: {exc}")
-    broad = hook.check_phase7_pretooluse_guidance(
-        repo,
-        tool_name="repo_managed_gpu/check_gpus",
-        tool_input={"samples": 1},
-        now=now,
-    )
-    with_reason = hook.check_phase7_pretooluse_guidance(
-        repo,
-        tool_name="repo_managed_gpu/manage_gpu_job",
-        tool_input={
-            "action": "status",
-            "job_id": job_record["job_id"],
-            "early_poll_reason": "user asked",
-        },
-        now=now,
-    )
-
-    assert result is not None
-    context = result["hookSpecificOutput"]["additionalContext"]
-    assert "not due" in context
-    assert "early_poll_reason" in context
-    assert job_record["job_id"] in context
-    assert job_record["next_poll_after"] in context
-    assert "independent work" in context.lower()
-    assert "hook_job.py" not in context
-    assert broad is None
-    assert with_reason is None
-
-
-def test_phase7_main_launch_hook_nudges_smoke_or_skip_without_blocking(
-    tmp_path,
-):
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    _write_config(repo)
-    hook = importlib.import_module("gpu_mcp_policy_hook")
-
-    result = hook.check_phase7_pretooluse_guidance(
-        repo,
-        tool_name="repo_managed_gpu/run_python_on_gpu",
-        tool_input={
-            "host": "gpu-a",
-            "gpu_index": 0,
-            "script_path": "jobs/train.py",
-            "async_mode": True,
-            "expected_duration_sec": 3600,
-        },
-    )
-    with_cadence_hint = hook.check_phase7_pretooluse_guidance(
-        repo,
-        tool_name="repo_managed_gpu/run_python_on_gpu",
-        tool_input={
-            "host": "gpu-a",
-            "gpu_index": 0,
-            "script_path": "jobs/train.py",
-            "async_mode": True,
-            "cadence_hint_sec": 600,
-        },
-    )
-    one_off = hook.check_phase7_pretooluse_guidance(
-        repo,
-        tool_name="repo_managed_gpu/run_python_on_gpu",
-        tool_input={
-            "host": "gpu-a",
-            "gpu_index": 0,
-            "script_path": "jobs/train.py",
-            "async_mode": False,
-        },
-    )
-    with_skip = hook.check_phase7_pretooluse_guidance(
-        repo,
-        tool_name="repo_managed_gpu/run_python_on_gpu",
-        tool_input={
-            "host": "gpu-a",
-            "gpu_index": 0,
-            "script_path": "jobs/train.py",
-            "async_mode": True,
-            "smoke_skip_reason": "user asked to skip smoke for this run",
-        },
-    )
-    with_smoke = hook.check_phase7_pretooluse_guidance(
-        repo,
-        tool_name="repo_managed_gpu/run_python_on_gpu",
-        tool_input={
-            "host": "gpu-a",
-            "gpu_index": 0,
-            "script_path": "jobs/train.py",
-            "async_mode": True,
-            "smoke_job_id": "job-20260530T123456Z-smokeok",
-        },
-    )
-
-    assert result is not None
-    context = result["hookSpecificOutput"]["additionalContext"]
-    assert "job_role=\"smoke\"" in context
-    assert "smoke_skip_reason" in context
-    assert "expected_duration_sec" in context
-    assert "decision" not in result
-    assert with_cadence_hint is not None
-    hint_context = with_cadence_hint["hookSpecificOutput"]["additionalContext"]
-    assert "smoke_skip_reason" in hint_context
-    assert "cadence_hint_sec" in hint_context
-    assert "decision" not in with_cadence_hint
-    assert one_off is None
-    assert with_skip is None
-    assert with_smoke is None
-
-
-def test_phase7_early_status_hook_silent_for_non_targeted_or_intentional_checks(
-    tmp_path,
-    monkeypatch,
-):
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    _write_config(repo)
-    registry = tmp_path / "reservations"
-    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
-    job_record = _seed_hook_job(
-        repo,
-        registry,
-        next_poll_after="2026-05-30T13:00:00Z",
-    )
-    hook = importlib.import_module("gpu_mcp_policy_hook")
-    now = datetime(2026, 5, 30, 12, 5, tzinfo=timezone.utc)
-    cases = [
-        (
-            "broad gpu status is not a targeted job poll",
-            "repo_managed_gpu/check_gpus",
-            {"samples": 1},
-        ),
-        (
-            "reservation listing is not a targeted job poll",
-            "repo_managed_gpu/list_gpu_reservations",
-            {"scope": "mine"},
-        ),
-        (
-            "lifecycle action is not an early status warning",
-            "repo_managed_gpu/manage_gpu_job",
-            {"action": "finish", "job_id": job_record["job_id"]},
-        ),
-        (
-            "explicit early reason makes the call intentional",
-            "repo_managed_gpu/manage_gpu_job",
-            {
-                "action": "status",
-                "job_id": job_record["job_id"],
-                "early_poll_reason": "user asked for an immediate check",
-            },
-        ),
-        (
-            "unknown job id is ambiguous and must fail quiet",
-            "repo_managed_gpu/manage_gpu_job",
-            {"action": "status", "job_id": "job-20260530T123456Z-missing"},
-        ),
-        (
-            "missing job id is ambiguous and must fail quiet",
-            "repo_managed_gpu/manage_gpu_job",
-            {"action": "status"},
-        ),
-        (
-            "null job id is ambiguous and must fail quiet",
-            "repo_managed_gpu/manage_gpu_job",
-            {"action": "status", "job_id": None},
-        ),
-        (
-            "non-string job id is ambiguous and must fail quiet",
-            "repo_managed_gpu/manage_gpu_job",
-            {"action": "status", "job_id": 12345},
-        ),
-        (
-            "reservation-key status is not a targeted job poll",
-            "repo_managed_gpu/manage_gpu_job",
-            {"action": "status", "reservation_key": job_record["reservation_key"]},
-        ),
-        (
-            "non-object tool input is ambiguous and must fail quiet",
-            "repo_managed_gpu/manage_gpu_job",
-            "not-json-object",
-        ),
-    ]
-
-    for _label, tool_name, tool_input in cases:
-        result = hook.check_phase7_pretooluse_guidance(
-            repo,
-            tool_name=tool_name,
-            tool_input=tool_input,
-            now=now,
-        )
-
-        assert result is None
-    whitespace_reason = hook.check_phase7_pretooluse_guidance(
-        repo,
-        tool_name="repo_managed_gpu/manage_gpu_job",
-        tool_input={
-            "action": "status",
-            "job_id": job_record["job_id"],
-            "early_poll_reason": "   ",
-        },
-        now=now,
-    )
-    assert whitespace_reason is not None
-
-
-def test_phase7_early_status_hook_silent_for_due_terminal_or_cross_repo_jobs(
-    tmp_path,
-    monkeypatch,
-):
-    repo_a = tmp_path / "repo-a"
-    repo_b = tmp_path / "repo-b"
-    repo_a.mkdir()
-    repo_b.mkdir()
-    _write_config(repo_a)
-    _write_config(repo_b)
-    registry = tmp_path / "reservations"
-    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
-    due_job = _seed_hook_job(
-        repo_a,
-        registry,
-        next_poll_after="2026-05-30T12:00:00Z",
-        job_id="job-20260530T123456Z-duejob",
-        gpu_index=0,
-    )
-    terminal_job = _seed_hook_job(
-        repo_a,
-        registry,
-        next_poll_after="2026-05-30T13:00:00Z",
-        job_id="job-20260530T123456Z-terminal",
-        gpu_index=1,
-    )
-    reservations = importlib.import_module("gpu_mcp_reservations")
-    terminal_path = reservations.job_record_path(repo_a, terminal_job["job_id"])
-    terminal_record = json.loads(terminal_path.read_text())
-    terminal_record["job_lifecycle"] = "succeeded"
-    reservations.atomic_write_json(terminal_path, terminal_record)
-    hook = importlib.import_module("gpu_mcp_policy_hook")
-    now = datetime(2026, 5, 30, 12, 5, tzinfo=timezone.utc)
-
-    due_result = hook.check_phase7_pretooluse_guidance(
-        repo_a,
-        tool_name="repo_managed_gpu/manage_gpu_job",
-        tool_input={"action": "status", "job_id": due_job["job_id"]},
-        now=now,
-    )
-    terminal_result = hook.check_phase7_pretooluse_guidance(
-        repo_a,
-        tool_name="repo_managed_gpu/manage_gpu_job",
-        tool_input={"action": "status", "job_id": terminal_job["job_id"]},
-        now=now,
-    )
-    cross_repo_result = hook.check_phase7_pretooluse_guidance(
-        repo_b,
-        tool_name="repo_managed_gpu/manage_gpu_job",
-        tool_input={"action": "status", "job_id": due_job["job_id"]},
-        now=now,
-    )
-
-    assert due_result is None
-    assert terminal_result is None
-    assert cross_repo_result is None
-
-
-@pytest.mark.parametrize(
-    ("stored_value", "remove_field"),
-    [
-        (None, True),
-        (None, False),
-        ("", False),
-        ("not-a-date", False),
-        ("2099-01-01T00:00:00+00:00", False),
-        ("2099-01-01T00:00:00Z garbage", False),
-    ],
-)
-def test_phase7_early_status_hook_silent_for_missing_or_malformed_next_poll_after(
-    tmp_path,
-    monkeypatch,
-    stored_value,
-    remove_field,
-):
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    _write_config(repo)
-    registry = tmp_path / "reservations"
-    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
-    job_record = _seed_hook_job(
-        repo,
-        registry,
-        next_poll_after="2026-05-30T13:00:00Z",
-    )
-    reservations = importlib.import_module("gpu_mcp_reservations")
-    record_path = reservations.job_record_path(repo, job_record["job_id"])
-    record = json.loads(record_path.read_text())
-    if remove_field:
-        record.pop("next_poll_after", None)
-    else:
-        record["next_poll_after"] = stored_value
-    reservations.atomic_write_json(record_path, record)
-    hook = importlib.import_module("gpu_mcp_policy_hook")
-
-    result = hook.check_phase7_pretooluse_guidance(
-        repo,
-        tool_name="repo_managed_gpu/manage_gpu_job",
-        tool_input={"action": "status", "job_id": job_record["job_id"]},
-        now=datetime(2026, 5, 30, 12, 5, tzinfo=timezone.utc),
-    )
-
-    assert result is None
-
-
-def test_phase7_main_launch_hook_respects_explicit_role_and_skip_inputs(
-    tmp_path,
-):
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    _write_config(repo)
-    hook = importlib.import_module("gpu_mcp_policy_hook")
-
-    explicit_main = hook.check_phase7_pretooluse_guidance(
-        repo,
-        tool_name="repo_managed_gpu/run_python_on_gpu",
-        tool_input={
-            "host": "gpu-a",
-            "gpu_index": 0,
-            "script_path": "jobs/train.py",
-            "async_mode": False,
-            "job_role": "main",
-        },
-    )
-    explicit_one_off = hook.check_phase7_pretooluse_guidance(
-        repo,
-        tool_name="repo_managed_gpu/run_python_on_gpu",
-        tool_input={
-            "host": "gpu-a",
-            "gpu_index": 0,
-            "script_path": "jobs/train.py",
-            "async_mode": True,
-            "job_role": "one_off",
-        },
-    )
-    explicit_smoke = hook.check_phase7_pretooluse_guidance(
-        repo,
-        tool_name="repo_managed_gpu/run_python_on_gpu",
-        tool_input={
-            "host": "gpu-a",
-            "gpu_index": 0,
-            "script_path": "jobs/smoke.py",
-            "async_mode": True,
-            "job_role": "smoke",
-        },
-    )
-    whitespace_skip = hook.check_phase7_pretooluse_guidance(
-        repo,
-        tool_name="repo_managed_gpu/run_python_on_gpu",
-        tool_input={
-            "host": "gpu-a",
-            "gpu_index": 0,
-            "script_path": "jobs/train.py",
-            "async_mode": True,
-            "smoke_skip_reason": "   ",
-        },
-    )
-
-    assert explicit_main is not None
-    context = explicit_main["hookSpecificOutput"]["additionalContext"]
-    assert "job_role=\"smoke\"" in context
-    assert "smoke_skip_reason" in context
-    assert "decision" not in explicit_main
-    assert explicit_one_off is None
-    assert explicit_smoke is None
-    assert whitespace_skip is not None
-
-
-def test_phase7_main_launch_hook_emits_compact_additional_context_shape(
-    tmp_path,
-):
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    _write_config(repo)
-    hook = importlib.import_module("gpu_mcp_policy_hook")
-
-    result = hook.check_phase7_pretooluse_guidance(
-        repo,
-        tool_name="repo_managed_gpu/run_python_on_gpu",
-        tool_input={
-            "host": "gpu-a",
-            "gpu_index": 0,
-            "script_path": "jobs/train.py",
-            "async_mode": True,
-        },
-    )
-
-    assert result is not None
-    assert "decision" not in result
-    assert result["hookSpecificOutput"]["hookEventName"] == "PreToolUse"
-    context = result["hookSpecificOutput"]["additionalContext"]
-    assert len(context) <= 1000
-    assert "GPU MCP" in context
-    assert "job_role=\"smoke\"" in context
-    assert "smoke_skip_reason" in context
-    assert "Cadence hints" in context
-    assert "jobs/train.py" not in context
-
-
-def test_phase7_early_status_hook_wires_pretooluse_guidance_through_main(
+def test_phase6_main_suppresses_reminder_for_inflight_targeted_status(
     tmp_path,
     monkeypatch,
 ):
@@ -1733,97 +1533,19 @@ def test_phase7_early_status_hook_wires_pretooluse_guidance_through_main(
     registry = tmp_path / "reservations"
     monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
     monkeypatch.setenv("GPU_MCP_TEST_NOW", "2026-05-30T12:05:00Z")
-    job_record = _seed_hook_job(
-        repo,
-        registry,
-        next_poll_after="2026-05-30T13:00:00Z",
-    )
+    job = _seed_hook_job(repo, registry, next_poll_after="2026-05-30T12:00:00Z")
+    reservations = importlib.import_module("gpu_mcp_reservations")
 
     completed = subprocess.run(
         [sys.executable, str(HOOK), "--store", str(store)],
-        input=json.dumps({
-            "hook_event_name": "PreToolUse",
-            "cwd": str(repo),
-            "tool_name": "repo_managed_gpu/manage_gpu_job",
-            "tool_input": {"action": "status", "job_id": job_record["job_id"]},
-        }),
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
-
-    assert completed.returncode == 0
-    assert completed.stdout, "early status guidance must be emitted through hook main"
-    result = json.loads(completed.stdout)
-    assert "decision" not in result
-    context = result["hookSpecificOutput"]["additionalContext"]
-    assert "not due" in context
-    assert "early_poll_reason" in context
-    assert job_record["job_id"] in context
-    assert "hook_job.py" not in context
-
-
-def test_phase7_main_hook_wires_pretooluse_guidance_through_main(
-    tmp_path,
-):
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    config = _write_config(repo)
-    store = tmp_path / "approved-policies.json"
-    _approve_policy(config, store)
-
-    completed = subprocess.run(
-        [sys.executable, str(HOOK), "--store", str(store)],
-        input=json.dumps({
-            "hook_event_name": "PreToolUse",
-            "cwd": str(repo),
-            "tool_name": "repo_managed_gpu/run_python_on_gpu",
-            "tool_input": {
-                "host": "gpu-a",
-                "gpu_index": 0,
-                "script_path": "jobs/train.py",
-                "async_mode": True,
-            },
-        }),
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
-
-    assert completed.returncode == 0
-    assert completed.stdout, "Phase 7 PreToolUse guidance must be emitted through hook main"
-    result = json.loads(completed.stdout)
-    assert "decision" not in result
-    context = result["hookSpecificOutput"]["additionalContext"]
-    assert "job_role=\"smoke\"" in context
-    assert "smoke_skip_reason" in context
-    assert "jobs/train.py" not in context
-
-
-def test_phase7_pretooluse_guidance_is_silent_for_posttooluse(
-    tmp_path,
-):
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    config = _write_config(repo)
-    store = tmp_path / "approved-policies.json"
-    _approve_policy(config, store)
-
-    completed = subprocess.run(
-        [sys.executable, str(HOOK), "--store", str(store)],
-        input=json.dumps({
-            "hook_event_name": "PostToolUse",
-            "cwd": str(repo),
-            "tool_name": "repo_managed_gpu/run_python_on_gpu",
-            "tool_input": {
-                "host": "gpu-a",
-                "gpu_index": 0,
-                "script_path": "jobs/train.py",
-                "async_mode": True,
-            },
-        }),
+        input=json.dumps(
+            {
+                "hook_event_name": "PreToolUse",
+                "cwd": str(repo),
+                "tool_name": "mcp__repo_managed_gpu__manage_gpu_job",
+                "tool_input": {"action": "status", "job_id": job["job_id"]},
+            }
+        ),
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -1832,9 +1554,10 @@ def test_phase7_pretooluse_guidance_is_silent_for_posttooluse(
 
     assert completed.returncode == 0
     assert completed.stdout == ""
+    assert not reservations.hook_reminder_path(repo, job["job_id"]).exists()
 
 
-def test_phase7_main_hook_keeps_stale_policy_block_ahead_of_guidance(
+def test_pretool_stale_policy_block_remains_authoritative(
     tmp_path,
 ):
     repo = tmp_path / "repo"
@@ -1867,4 +1590,256 @@ def test_phase7_main_hook_keeps_stale_policy_block_ahead_of_guidance(
     result = json.loads(completed.stdout)
     assert result["decision"] == "block"
     assert "gpu-mcp.toml has changed" in result["reason"]
+    assert "hookSpecificOutput" not in result
+
+
+def _configure_stop_hook_test(tmp_path, monkeypatch) -> tuple[Path, dict[str, str]]:
+    registry = tmp_path / "reservations"
+    monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(registry))
+    monkeypatch.setenv("GPU_MCP_TEST_STOP_STATE_ROOT", str(tmp_path / "stop-state"))
+    return registry, dict(os.environ)
+
+
+def test_stop_hook_due_event_blocks_once_per_turn(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_config(repo)
+    registry, env = _configure_stop_hook_test(tmp_path, monkeypatch)
+    job = _seed_hook_job(repo, registry, next_poll_after="2026-05-30T12:00:00Z")
+    hook = importlib.import_module("gpu_mcp_policy_hook")
+    now = lambda: datetime(2026, 5, 30, 12, 5, tzinfo=timezone.utc)
+
+    first = hook.wait_for_gpu_job_stop_event(
+        repo,
+        session_id="session-a",
+        turn_id="turn-a",
+        env=env,
+        now_fn=now,
+        max_wait_sec=0,
+    )
+    sleeps: list[float] = []
+    real_monotonic = hook.time.monotonic
+    ticks = iter([0.0, 0.0, 2.0])
+    monkeypatch.setattr(hook.time, "monotonic", lambda: next(ticks))
+    duplicate = hook.wait_for_gpu_job_stop_event(
+        repo,
+        session_id="session-a",
+        turn_id="turn-a",
+        env=env,
+        now_fn=now,
+        sleep_fn=sleeps.append,
+        max_wait_sec=1,
+    )
+    monkeypatch.setattr(hook.time, "monotonic", real_monotonic)
+    next_turn = hook.wait_for_gpu_job_stop_event(
+        repo,
+        session_id="session-a",
+        turn_id="turn-b",
+        env=env,
+        now_fn=now,
+        max_wait_sec=0,
+    )
+
+    assert first is not None and first["decision"] == "block"
+    assert job["job_id"] in first["reason"]
+    assert 'manage_gpu_job(action="status"' in first["reason"]
+    assert duplicate is None
+    assert sleeps == []
+    assert next_turn is not None and next_turn["decision"] == "block"
+
+
+def test_stop_hook_outcome_presence_wakes_without_parsing_or_mutating_job(
+    tmp_path,
+    monkeypatch,
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_config(repo)
+    registry, env = _configure_stop_hook_test(tmp_path, monkeypatch)
+    job = _seed_hook_job(repo, registry, next_poll_after="2099-01-01T00:00:00Z")
+    reservations = importlib.import_module("gpu_mcp_reservations")
+    job_path = reservations.job_record_path(repo, job["job_id"])
+    metadata_path = registry / job["reservation_key"] / "metadata.json"
+    outcome_path = reservations.outcome_record_path(
+        repo,
+        job["job_id"],
+        job["active_attempt_id"],
+    )
+    outcome_path.parent.mkdir(parents=True)
+    outcome_path.write_text("{malformed outcome", encoding="utf-8")
+    job_before = job_path.read_bytes()
+    metadata_before = metadata_path.read_bytes()
+    hook = importlib.import_module("gpu_mcp_policy_hook")
+
+    result = hook.wait_for_gpu_job_stop_event(
+        repo,
+        session_id="session-a",
+        turn_id="turn-a",
+        env=env,
+        now_fn=lambda: datetime(2026, 5, 30, 12, 5, tzinfo=timezone.utc),
+        max_wait_sec=0,
+    )
+
+    assert result is not None and result["decision"] == "block"
+    assert "local outcome" in result["reason"]
+    assert "Status reconciles managed state" in result["reason"]
+    assert "Wait again only" not in result["reason"]
+    assert job_path.read_bytes() == job_before
+    assert metadata_path.read_bytes() == metadata_before
+
+
+def test_stop_hook_waits_until_outcome_appears(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_config(repo)
+    registry, env = _configure_stop_hook_test(tmp_path, monkeypatch)
+    job = _seed_hook_job(repo, registry, next_poll_after="2099-01-01T00:00:00Z")
+    reservations = importlib.import_module("gpu_mcp_reservations")
+    outcome_path = reservations.outcome_record_path(
+        repo,
+        job["job_id"],
+        job["active_attempt_id"],
+    )
+    sleeps: list[float] = []
+
+    def create_outcome_after_first_sleep(delay: float) -> None:
+        sleeps.append(delay)
+        outcome_path.parent.mkdir(parents=True, exist_ok=True)
+        outcome_path.write_text("{}\n", encoding="utf-8")
+
+    hook = importlib.import_module("gpu_mcp_policy_hook")
+    result = hook.wait_for_gpu_job_stop_event(
+        repo,
+        session_id="session-a",
+        turn_id="turn-a",
+        env=env,
+        now_fn=lambda: datetime(2026, 5, 30, 12, 5, tzinfo=timezone.utc),
+        sleep_fn=create_outcome_after_first_sleep,
+        max_wait_sec=1,
+    )
+
+    assert sleeps
+    assert result is not None and "local outcome detected" in result["reason"]
+
+
+def test_stop_hook_allows_new_cadence_event_in_same_continued_turn(
+    tmp_path,
+    monkeypatch,
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_config(repo)
+    registry, env = _configure_stop_hook_test(tmp_path, monkeypatch)
+    job = _seed_hook_job(repo, registry, next_poll_after="2026-05-30T12:00:00Z")
+    reservations = importlib.import_module("gpu_mcp_reservations")
+    hook = importlib.import_module("gpu_mcp_policy_hook")
+
+    first = hook.wait_for_gpu_job_stop_event(
+        repo,
+        session_id="session-a",
+        turn_id="turn-a",
+        env=env,
+        now_fn=lambda: datetime(2026, 5, 30, 12, 5, tzinfo=timezone.utc),
+        max_wait_sec=0,
+    )
+    job_path = reservations.job_record_path(repo, job["job_id"])
+    updated = json.loads(job_path.read_text())
+    updated["last_status_checked_at"] = "2026-05-30T12:05:00Z"
+    updated["next_poll_after"] = "2026-05-30T12:10:00Z"
+    reservations.atomic_write_json(job_path, updated)
+    second = hook.wait_for_gpu_job_stop_event(
+        repo,
+        session_id="session-a",
+        turn_id="turn-a",
+        env=env,
+        now_fn=lambda: datetime(2026, 5, 30, 12, 10, tzinfo=timezone.utc),
+        max_wait_sec=0,
+    )
+
+    assert first is not None and first["decision"] == "block"
+    assert second is not None and second["decision"] == "block"
+
+
+def test_stop_hook_requires_matching_active_reservation(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_config(repo)
+    registry, env = _configure_stop_hook_test(tmp_path, monkeypatch)
+    job = _seed_hook_job(repo, registry, next_poll_after="2026-05-30T12:00:00Z")
+    reservations = importlib.import_module("gpu_mcp_reservations")
+    metadata_path = registry / job["reservation_key"] / "metadata.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata["attempt_id"] = "attempt-20260530T123456Z-different"
+    reservations.atomic_write_json(metadata_path, metadata)
+    hook = importlib.import_module("gpu_mcp_policy_hook")
+
+    result = hook.wait_for_gpu_job_stop_event(
+        repo,
+        session_id="session-a",
+        turn_id="turn-a",
+        env=env,
+        now_fn=lambda: datetime(2026, 5, 30, 12, 5, tzinfo=timezone.utc),
+        max_wait_sec=0,
+    )
+
+    assert result is None
+
+
+def test_stop_hook_fails_open_when_deduplication_state_cannot_be_written(
+    tmp_path,
+    monkeypatch,
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_config(repo)
+    registry, env = _configure_stop_hook_test(tmp_path, monkeypatch)
+    _seed_hook_job(repo, registry, next_poll_after="2026-05-30T12:00:00Z")
+    hook = importlib.import_module("gpu_mcp_policy_hook")
+
+    def fail_write(*args, **kwargs):
+        raise OSError("test state write failure")
+
+    monkeypatch.setattr(hook.reservations, "atomic_write_json", fail_write)
+    result = hook.wait_for_gpu_job_stop_event(
+        repo,
+        session_id="session-a",
+        turn_id="turn-a",
+        env=env,
+        now_fn=lambda: datetime(2026, 5, 30, 12, 5, tzinfo=timezone.utc),
+        max_wait_sec=0,
+    )
+
+    assert result is None
+
+
+def test_stop_hook_main_emits_codex_block_shape(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    config = _write_config(repo)
+    store = tmp_path / "approved-policies.json"
+    _approve_policy(config, store)
+    registry, _env = _configure_stop_hook_test(tmp_path, monkeypatch)
+    job = _seed_hook_job(repo, registry, next_poll_after="2026-05-30T12:00:00Z")
+    monkeypatch.setenv("GPU_MCP_TEST_NOW", "2026-05-30T12:05:00Z")
+
+    completed = subprocess.run(
+        [sys.executable, str(HOOK), "--store", str(store)],
+        input=json.dumps({
+            "hook_event_name": "Stop",
+            "cwd": str(repo),
+            "session_id": "session-a",
+            "turn_id": "turn-a",
+            "stop_hook_active": False,
+        }),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        timeout=5,
+    )
+
+    assert completed.returncode == 0
+    result = json.loads(completed.stdout)
+    assert result["decision"] == "block"
+    assert job["job_id"] in result["reason"]
     assert "hookSpecificOutput" not in result

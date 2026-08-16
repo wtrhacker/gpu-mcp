@@ -116,8 +116,11 @@ behavior.
   policy records, startup approval, preview/reload/reject tokens, stale-policy
   refusal, token expiry, and token cap behavior.
 - `test/test_gpu_mcp_policy_hook_contract.py`: deterministic coverage for the
-  PreToolUse/PostToolUse `gpu-mcp.toml` drift hook helper, recovery-tool
-  allowlist, and runtime instructions.
+  PreToolUse/PostToolUse policy checks, active managed-job reminders, Stop
+  waiter, recovery-tool allowlist, and runtime instructions.
+- `test/ADR0005_INTERACTIVE_HOOK_RESULTS.md`: human-supervised live evidence
+  for active and waiting managed-job notification in an interactive Codex
+  session.
 - `test/test_gpu_mcp_server_contract.py`: server startup, safe-run boundaries,
   staged remote runner behavior, guard edge cases, output symlink handling,
   async PID validation, kill argument validation, SSH key checks, and host alias

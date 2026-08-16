@@ -315,7 +315,7 @@ Tool output and any Codex-facing hook should teach the same operating discipline
   MCP tools, or become part of the reservation safety boundary.
 - Status is the result-retrieval path. For short smoke probes, status may include a bounded stdout/stderr tail or a pointer to an approved output log. Long-running jobs should return handles, status summaries, and log pointers rather than keeping the launch RPC open.
 - Tool timeouts apply to launch/status RPCs and inspection calls, not to total GPU job runtime.
-- If the heartbeat manager is unhealthy, tool output should explain that the server cannot safely manage its leases. The agent should pause owner-side lifecycle actions (`launch`, `retry`, `stop`, `finish`) and avoid output-dependent work until heartbeat health recovers. Read-only diagnostics and fingerprint-gated rescue kill remain governed by the rules above.
+- If the heartbeat manager is unhealthy, tool output should explain that the server cannot safely manage its leases. The agent should pause owner-side lifecycle actions (`launch`, `retry`, `stop`, `finish`) and final-result claims that depend on unverified lifecycle state. Read-only, provisional analysis of application-defined durable artifacts may continue. Diagnostics and fingerprint-gated rescue kill remain governed by the rules above.
 - The rescue kill reminder is behavioral friction, not a human approval gate and not an ownership boundary. An autonomous agent may use it when it explicitly chooses the rescue path for a specific inspected target and the fingerprint matches.
 
 ## 8. Process Identity: How to Not Get Fooled

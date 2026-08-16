@@ -32,14 +32,15 @@ Until acknowledged, the hook may re-remind for the same `next_poll_after`, but
 only after a time throttle. The v1 throttle is:
 
 - suppress immediate duplicate reminders for the same due timestamp;
-- allow a repeat reminder only after at least one heartbeat interval has elapsed
+- allow a repeat reminder only after at least one repo-local polling interval has elapsed
   since the last reminder for that job.
 
-The heartbeat interval comes from the matching shared reservation metadata's
-`heartbeat_interval_sec`. If that field is missing or malformed, use ADR 0004p's
-default heartbeat interval. Clamp the resulting interval to ADR 0004p's
-minimum/maximum heartbeat interval bounds before comparing against
-`last_reminded_at`.
+The throttle interval comes from the matching repo-local job record's
+`poll_interval_sec`. If that field is missing, malformed, boolean, or
+non-positive, use ADR 0004p's one-hour default polling interval. A valid positive
+value is used exactly, with no policy maximum. Shared reservation
+`heartbeat_interval_sec` is deliberately not consulted: lease renewal frequency
+must not determine how often the agent is reminded to perform a status check.
 
 The hook-owned advisory state should therefore track, per job:
 
@@ -79,17 +80,17 @@ context should be compact and shaped like:
 
 ```text
 GPU MCP: 1 managed job is due for status.
-- job-20260530T123456Z-a: overdue by 5m; call manage_gpu_job(action="status", job_id="job-20260530T123456Z-a") before using this job's outputs.
-Independent work may continue; output-dependent work must wait for terminal status.
+- job-20260530T123456Z-a: overdue by 5m; call manage_gpu_job(action="status", job_id="job-20260530T123456Z-a") now.
+After status, a running job's already-closed or atomically published outputs may be analyzed read-only as provisional results; final-result claims require terminal status.
 ```
 
 For multiple due jobs, emit one context block:
 
 ```text
 GPU MCP: 2 managed jobs are due for status.
-- job-20260530T123456Z-a: overdue by 18m; call manage_gpu_job(action="status", job_id="job-20260530T123456Z-a") before using this job's outputs.
-- job-20260530T123457Z-b: overdue by 16m; call manage_gpu_job(action="status", job_id="job-20260530T123457Z-b") before using this job's outputs.
-Independent work may continue; output-dependent work must wait for terminal status.
+- job-20260530T123456Z-a: overdue by 18m; call manage_gpu_job(action="status", job_id="job-20260530T123456Z-a") now.
+- job-20260530T123457Z-b: overdue by 16m; call manage_gpu_job(action="status", job_id="job-20260530T123457Z-b") now.
+After status, a running job's already-closed or atomically published outputs may be analyzed read-only as provisional results; final-result claims require terminal status.
 ```
 
 ## 3. `finish` Must Refuse While the Process Is Live
@@ -130,10 +131,12 @@ Phase 6 tests should amend the existing reminder cases as follows:
 - assert reminders default to `additionalContext`, with only an explicit `off`
   mode disabling them;
 - replace `test_phase6_due_reminder_deduplicates_same_due_timestamp` with a
-  throttle-window test: same due timestamp is silent before one heartbeat
+  throttle-window test: same due timestamp is silent before one polling
   interval has elapsed;
-- add a same-due-timestamp re-reminder test after one clamped
-  `heartbeat_interval_sec` when no status acknowledgement occurred;
+- add a same-due-timestamp re-reminder test after one repo-local
+  `poll_interval_sec` when no status acknowledgement occurred;
+- test the one-hour malformed/missing fallback and a direct interval longer than
+  the former heartbeat maximum;
 - add a status-acknowledgement test: `manage_gpu_job(status)` for job A updates
   `last_status_checked_at` and silences job A's old due timestamp only when it
   performs the full status path;

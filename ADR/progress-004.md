@@ -201,7 +201,7 @@ coordination behavior:
   `server_instance_id`, process identity summary when known, current-repo
   output/log pointer when available, and `next_poll_after`. Phase 7 launch
   results also include `job_role`, `job_role_defaulted`,
-  `heartbeat_interval_sec`, and structured `cadence_basis`. A refusal must say
+  `poll_interval_sec`, and structured `cadence_basis`. A refusal must say
   why the launch did not happen, include a structured refusal code when
   available, and must not create a job that the caller then has to manage.
 - [ ] `manage_gpu_job(action, job_id=None, reservation_key=None,
@@ -302,8 +302,10 @@ Invariants and implementation pressure:
 
 - [ ] Materialize `DEFAULT_HEARTBEAT_INTERVAL_SEC = 600`.
 - [ ] Materialize `MIN_HEARTBEAT_INTERVAL_SEC = 60` and
-  `MAX_HEARTBEAT_INTERVAL_SEC = 3600`.
+  `MAX_HEARTBEAT_INTERVAL_SEC = 3600` for lease metadata validation.
 - [ ] Materialize `STALE_MULTIPLIER = 3`.
+- [ ] Materialize polling separately: technical minimum `1`, smoke fallback
+  `300`, main/one-off fallback `3600`, and no policy maximum.
 - [ ] Materialize the shared registry root constant:
   `~/gpu-mcp/state/reservations/`. Production uses ADR 0002 trusted state; tests
   inject an alternate root.
@@ -595,14 +597,16 @@ Supporting tests:
 
 User-visible requirement: after launch, the agent follows the job through
 `manage_gpu_job(status)`, recovers lost context by repo when unambiguous, and is
-told not to proceed with output-dependent work before terminal status.
+told to reserve final-result claims and lifecycle actions for terminal status.
+Read-only analysis of already-closed or atomically published intermediate
+artifacts is allowed and must be labeled provisional.
 
 Agentic battlefield first:
 
 - [ ] Repo A launches `hold_gpu.py` and asks for status. The answer says whether
   the job is still running, where to look for logs/results, when to check again,
-  that output-dependent work must wait, and that independent work may continue
-  until the next poll.
+  that durable intermediate outputs may be analyzed read-only as provisional,
+  and that final-result claims require terminal status.
 - [ ] Repo A launches `quick_success.py` and `quick_fail.py` in separate runs.
   After each finishes, status reports success or failure from the managed
   launcher outcome record, and returns a log pointer or bounded tail containing a
@@ -845,7 +849,7 @@ Supporting tests:
 - [ ] Stale local reminder state is retired when the shared reservation is gone
   or no longer matches.
 
-## Phase 7: Dynamic Cadence
+## Phase 7: Agentic Polling Cadence
 
 Do not implement this until the fixed-cadence lifecycle and Phase 6 hook
 delivery are correct, and ADR 0004p's public cadence input interface is
@@ -925,14 +929,13 @@ Agentic battlefield first:
   that the role was defaulted, without treating the compatibility flag as proof
   of short runtime.
 - [ ] Live Codex prompt: Repo A supplies representative smoke arguments. The
-  agent launches `job_role="smoke"` with an explicit short
-  `expected_duration_sec` or `cadence_hint_sec`; launch output exposes
-  `heartbeat_interval_sec`, `next_poll_after`, and a smoke cadence basis, with
-  the interval selected by the pinned coarse-band contract and clamped no lower
-  than the minimum.
+  agent launches `job_role="smoke"` with an explicit `cadence_hint_sec` chosen
+  for that task; launch output exposes that exact `poll_interval_sec`,
+  `next_poll_after`, and a smoke cadence basis. `expected_duration_sec` is
+  descriptive only.
 - [ ] Repo A launches `job_role="smoke"` without explicit cadence input. The
   smoke job still creates a normal reservation and heartbeat, and its first
-  `heartbeat_interval_sec`/`next_poll_after` use the minimum interval.
+  `poll_interval_sec`/`next_poll_after` use the five-minute fallback.
 - [ ] Live Codex prompt: Repo A's main script has no built-in small-run flag.
   The agent creates or adapts a smoke path, such as a small input fixture, an
   added smoke mode, or a separate managed smoke script that exercises the same
@@ -944,8 +947,8 @@ Agentic battlefield first:
   `smoke_job_id`.
 - [ ] Repo A launches `job_role="main"` with a valid same-repo successful
   `smoke_job_id` but no explicit cadence evidence. Launch output cites the smoke
-  job as viability evidence in `cadence_basis` and uses the conservative minimum
-  first poll cadence instead of extrapolating from smoke runtime.
+  job as viability evidence in `cadence_basis` and uses the default first poll
+  cadence instead of extrapolating from smoke runtime.
 - [ ] Repo A launches `job_role="main"` with a valid same-repo failed, running,
   or unknown-outcome `smoke_job_id`. Launch output records the smoke lifecycle
   in `cadence_basis` but does not describe it as positive viability evidence,
@@ -954,26 +957,22 @@ Agentic battlefield first:
   cadence signal is supplied.
 - [ ] Repo A launches `job_role="main"` with a valid same-repo successful
   `smoke_job_id` plus `smoke_cadence_representative=true`,
-  `expected_duration_sec`, or `cadence_hint_sec`. Launch output may use the smoke
-  runtime or explicit cadence signal in `cadence_basis` and tells the agent when
-  to check next.
+  `expected_duration_sec`, or `cadence_hint_sec`. Launch output records the smoke
+  and duration evidence, but only a direct `cadence_hint_sec` changes polling.
 - [ ] Repo A launches `job_role="main"` with a missing, cross-repo, wrong-role, or
   unreadable-lifecycle `smoke_job_id`. The tool refuses to use it as smoke
   evidence.
 - [ ] Repo A launches a main/long job with an explicit long
-  `expected_duration_sec` or `cadence_hint_sec`, successful smoke or
-  `smoke_skip_reason`, and no stronger cadence input. A direct
-  `cadence_hint_sec` wins and clamps to `60..3600`; otherwise
-  `expected_duration_sec` maps through the pinned coarse duration bands. The
-  tool gives a later next-check time no higher than the maximum interval.
+  `cadence_hint_sec`, successful smoke or `smoke_skip_reason`. The server uses
+  the hint exactly, including the requested three-hour interval. An accompanying
+  `expected_duration_sec` is descriptive only.
 - [ ] Repo A launches `job_role="main"` with `smoke_skip_reason` but no
   `expected_duration_sec` or `cadence_hint_sec`. Launch output records the skip
-  reason in `cadence_basis` and uses the conservative minimum first poll cadence.
+  reason in `cadence_basis` and uses the default first poll cadence.
 - [ ] During polling, Repo A observes that the initial cadence is wrong and calls
   `manage_gpu_job(action="update_cadence", job_id=...,
-  expected_duration_sec=... or cadence_hint_sec=..., reason=...)`. The server
-  updates cadence and heartbeat together, and the next status output reports the
-  revised basis.
+  cadence_hint_sec=..., reason=...)`. The server updates repo-local polling and
+  performs a fresh heartbeat without changing the lease interval.
 - [ ] When a running job is due, the hook reminder tells the agent to
   status-check and optionally update cadence if observed progress contradicts
   the old cadence. It must not perform the status check or write cadence itself.
@@ -1030,9 +1029,8 @@ Invariants and implementation pressure:
   always wins, and launch output reports whether the role was defaulted.
 - [ ] A `job_role="main"` launch with no positive smoke viability evidence and
   no `smoke_skip_reason` soft-refuses with guidance to run smoke first or
-  provide a skip reason. `expected_duration_sec` and `cadence_hint_sec` are
-  cadence evidence only; they do not explain why smoke was skipped.
-- [ ] Launch and status output expose the chosen `heartbeat_interval_sec`,
+  provide a skip reason. Timing fields do not explain why smoke was skipped.
+- [ ] Launch and status output expose the chosen `poll_interval_sec`,
   `next_poll_after`, and `cadence_basis`.
 - [ ] `manage_gpu_job(action="status")` accepts optional `early_poll_reason`.
   Blank or whitespace-only values behave as absent. The reason is repo-local
@@ -1046,7 +1044,7 @@ Invariants and implementation pressure:
   `polling_state="not_due_yet"`. This response is local-only and is not a
   lifecycle assertion; it must not imply the remote process is alive.
 - [ ] `polling_state="not_due_yet"` includes `job_id`, `reservation_key` when
-  known, `heartbeat_interval_sec`, `next_poll_after`, `seconds_until_due`,
+  known, `poll_interval_sec`, `next_poll_after`, `seconds_until_due`,
   `full_status_performed=false`, `remote_inspection_performed=false`,
   `log_tail_included=false`, and concise guidance to do independent work or
   retry with `early_poll_reason` for an immediate full check.
@@ -1063,84 +1061,73 @@ Invariants and implementation pressure:
   status and records an intentional override in repo-local state and/or output.
   If override recording fails, full status may still return with
   `early_poll_override_recorded=false` and a bounded warning.
-- [ ] `select_cadence` is deterministic. Inputs are positive finite numeric
-  seconds; booleans, non-numeric values, non-positive values, and non-finite
-  values are invalid, and fractional values are rounded up before selection.
-  Precedence is direct `cadence_hint_sec`, then `expected_duration_sec`, then a
-  successful `smoke_job_id` with `smoke_cadence_representative=true`, then
-  conservative no-evidence cadence.
-- [ ] Expected duration and cadence-representative successful smoke runtime use
-  the same coarse bands: `<=300` seconds selects `60`, `>300` and `<=1800`
-  selects `180`, `>1800` and `<=7200` selects `600`, and `>7200` selects
-  `1800`. Direct `cadence_hint_sec` is not banded; it is clamped to `60..3600`.
-- [ ] `next_poll_after` is computed as `now + heartbeat_interval_sec` using the
-  same owner-side timestamp as the heartbeat write and is returned as a UTC RFC
-  3339 timestamp ending in `Z`. Terminal jobs omit it or return null.
+- [ ] Poll selection is deterministic. `cadence_hint_sec` is a positive integer
+  used exactly, with no policy maximum. Without it, smoke uses `300` seconds and
+  main/one-off uses `3600` seconds. `expected_duration_sec` and smoke runtime are
+  descriptive only.
+- [ ] `next_poll_after` is computed as `now + poll_interval_sec` and returned as
+  a UTC RFC 3339 timestamp ending in `Z`. Terminal jobs omit it or return null.
 - [ ] The cadence basis records whether launch had smoke viability evidence,
-  smoke cadence evidence, explicit expected duration, direct cadence hint,
-  conservative no-evidence cadence, or default cadence. Sensitive script paths
+  smoke evidence, descriptive expected duration, direct cadence hint, or a role
+  fallback. Sensitive script paths
   and arguments stay repo-local under the existing metadata rules.
 - [ ] `cadence_basis` is a structured object, not prose. It records fields such
   as `source`, `conservative_reason`, `smoke_job_id`, `smoke_lifecycle`,
   `smoke_runtime_sec`, `positive_viability_evidence`,
   `cadence_evidence_used`, `expected_duration_sec`, `cadence_hint_sec`,
   `smoke_cadence_representative`, `skip_reason_recorded`,
-  `selected_interval_sec`, and `duration_band` when applicable.
-- [ ] Phase 7 state storage is repo-local except for lease cadence. Shared
+  `selected_interval_sec`, and `expected_duration_is_descriptive` when applicable.
+- [ ] Phase 7 polling state is repo-local. Shared
   metadata may contain `last_heartbeat_at` and `heartbeat_interval_sec`, plus
   existing sanitized reservation identity fields. `job_role`, `smoke_*`,
   `expected_duration_sec`, `cadence_hint_sec`, `smoke_skip_reason`, observed
-  runtime, `cadence_basis`, `next_poll_after`, and output pointers stay in
+  runtime, `poll_interval_sec`, `cadence_basis`, `next_poll_after`, and output pointers stay in
   repo-local job state or current-repo tool output.
 - [ ] `smoke_job_id` is a valid smoke reference when it names a same-repo
   managed job with `job_role="smoke"` and readable lifecycle/outcome. Success is
-  required only before the server may describe it as positive viability evidence
-  or use its runtime as cadence evidence.
+  required only before the server may describe it as positive viability evidence.
 - [ ] `smoke_job_id` is the normal smoke-result index. The server uses it to
   retrieve the repo-local smoke job record, lifecycle/outcome, runtime, and output
   pointers. Listing/searching recent smoke jobs is not required for Phase 7.
 - [ ] A successful smoke status response gives explicit smoke-to-main guidance:
   preserve the smoke `job_id`, report observed runtime when available, and show
   that the main launch should pass `job_role="main"` and `smoke_job_id`. It may
-  tell the agent to include `smoke_cadence_representative=true` if the agent
-  judges the smoke runtime representative enough for cadence.
+  tell the agent to convert any runtime judgment into an explicit
+  `cadence_hint_sec` when a non-default schedule is useful.
 - [ ] Smoke status guidance includes a structured `recommended_next_call` object
   when applicable; prose guidance is secondary.
 - [ ] `manage_gpu_job(action="update_cadence")` is owner-side, requires a
-  reason, clamps the interval to `60..3600`, and writes
-  `heartbeat_interval_sec` plus `last_heartbeat_at` in the same metadata update.
+  reason and direct `cadence_hint_sec`, uses the hint exactly, updates repo-local
+  polling, and refreshes `last_heartbeat_at` without changing the lease interval.
   It refuses for non-owned reservations, stale policy, unhealthy heartbeat
   manager, missing cadence input, missing/blank reason, or failed owner metadata
   update.
-- [ ] Smoke/preflight evidence maps to initial cadence only when the probe is
-  explicitly cadence-representative or paired with expected main-job duration.
-  The MCP server does not invent smoke arguments or judge semantic
-  representativeness.
+- [ ] Smoke/preflight evidence never maps to cadence implicitly. The agent may
+  use it to choose `cadence_hint_sec`; the MCP server does not invent smoke
+  arguments or judge semantic representativeness.
 - [ ] A smoke path may be reduced arguments for the target script, an added smoke
   mode, a tiny input fixture, a dry-run/max-steps path, or a separate managed
   smoke script that exercises the same relevant GPU code path. The harness must
   not confine this choice beyond requiring MCP launch and `job_role="smoke"`.
 - [ ] Smoke jobs are not heartbeat-free. They use the normal reservation and
   heartbeat protocol because a smoke run can hang or overrun while holding a GPU.
-  Without explicit smoke cadence input, first poll guidance uses the minimum
-  heartbeat interval.
+  Without `cadence_hint_sec`, first poll guidance uses the five-minute fallback.
 - [ ] Do not add smoke templates, smoke recipe files, or a separate smoke-only
   launch path. A smoke test is an ordinary managed GPU job submitted through the
   MCP launch tool.
 - [ ] A likely main/long job without positive smoke viability evidence must
-  record a non-empty `smoke_skip_reason`; expected duration and cadence hints
-  affect polling but do not replace smoke or a skip reason. The hook nudges this
+  record a non-empty `smoke_skip_reason`; cadence hints affect polling while
+  expected duration is descriptive, and neither replaces smoke or a skip reason. The hook nudges this
   and the launch tool may soft-refuse accidental omissions, but neither is a GPU
   safety boundary. The server records the reason but does not semantically grade
   it.
-- [ ] A main launch with no cadence evidence, including a launch that has only
-  `smoke_skip_reason` or only smoke viability evidence, uses the minimum
-  heartbeat interval for the first poll. This is the operational cost of weak
-  cadence evidence.
+- [ ] A main launch with no cadence hint, including a launch that has only
+  `smoke_skip_reason` or only smoke viability evidence, uses the default
+  one-hour polling interval.
 - [ ] Do not infer duration from comments, arbitrary stdout, `ps`, or
   `nvidia-smi` utilization patterns in v1.
-- [ ] Intervals remain clamped to `60..3600` seconds.
-- [ ] The same `select_cadence` contract applies to launch-time cadence and
+- [ ] Direct polling intervals are positive integers with no policy maximum.
+- [ ] The same direct-hint contract applies to launch-time cadence and
   `manage_gpu_job(action="update_cadence")`.
 - [ ] Runtime estimates remain non-authoritative for cleanup.
 - [ ] The hook never acts as a scheduler and never writes heartbeat or cadence
@@ -1156,17 +1143,13 @@ Invariants and implementation pressure:
 
 Supporting tests:
 
-- [ ] Direct `cadence_hint_sec` clamps to `60..3600` and wins over
-  `expected_duration_sec` and cadence-representative smoke runtime.
+- [ ] Direct `cadence_hint_sec` is used exactly, including intervals below one
+  minute and at three hours, and wins over descriptive duration/smoke data.
 - [ ] Invalid cadence inputs are refused: booleans, non-numeric values,
   non-positive values, and non-finite values.
-- [ ] Expected duration coarse-band boundaries:
-  `300 -> 60`, `301 -> 180`, `1800 -> 180`, `1801 -> 600`, `7200 -> 600`,
-  and `7201 -> 1800`.
-- [ ] Cadence-representative successful smoke runtime uses the same coarse-band
-  boundaries when no direct hint or expected duration is present.
-- [ ] `next_poll_after` is derived from the same timestamp as the heartbeat
-  write and equals `now + heartbeat_interval_sec` for nonterminal jobs.
+- [ ] Expected duration and smoke runtime never change polling without a direct
+  cadence hint.
+- [ ] `next_poll_after` equals `now + poll_interval_sec` for nonterminal jobs.
 - [ ] Malformed nonterminal `next_poll_after` values take the full status path
   instead of `not_due_yet`: missing field, null, empty string, invalid
   timestamp, timestamp without trailing `Z`, and timestamp with garbage suffix.
@@ -1221,25 +1204,24 @@ Supporting tests:
 - [ ] Flexible smoke path: separate smoke script or added smoke mode is accepted
   as ordinary `job_role="smoke"` evidence.
 - [ ] Smoke launch without explicit cadence input still heartbeats and uses
-  minimum first poll cadence.
+  the five-minute first-poll fallback.
 - [ ] Successful smoke status emits smoke-to-main guidance.
 - [ ] Invalid `smoke_job_id` (missing, cross-repo, wrong-role, unreadable
   lifecycle/outcome) is refused as smoke evidence.
 - [ ] Valid successful `smoke_job_id` without cadence evidence is positive
-  viability evidence only and uses conservative minimum first cadence.
+  viability evidence only and uses the default first cadence.
 - [ ] Valid failed, running, or unknown-outcome `smoke_job_id` is recorded as a
   smoke observation but not positive viability evidence, and does not satisfy the
   smoke-or-skip precondition by itself.
 - [ ] No-smoke main launch with only `smoke_skip_reason` records the reason and
-  uses conservative minimum first cadence.
-- [ ] `smoke_cadence_representative=true` allows smoke runtime to contribute to
-  cadence basis after successful smoke validation.
+  uses the default first cadence.
+- [ ] `smoke_cadence_representative=true` remains descriptive and never changes
+  polling without `cadence_hint_sec`.
 - [ ] Interval revision with fresh heartbeat.
 - [ ] `update_cadence` owner-state writes are deterministic under interleaving:
   heartbeat versus cadence update, full status versus cadence update when status
   mutates overlapping repo-local cadence fields, rapid consecutive cadence
-  updates, and no partial `heartbeat_interval_sec`/`last_heartbeat_at` metadata
-  write.
+  updates, and no accidental lease-interval mutation.
 - [ ] `update_cadence` refuses for non-owned reservations, stale policy,
   unhealthy heartbeat manager, missing cadence input, missing/blank reason, and
   failed metadata writes without partially updating interval or heartbeat.
