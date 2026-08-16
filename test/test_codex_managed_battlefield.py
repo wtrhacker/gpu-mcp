@@ -1545,7 +1545,10 @@ def _active_wait_violation(
     if state_peek_commands:
         return {
             "verdict": "hard_fail",
-            "reason": "agent inspected job output/log/state files before terminal MCP status",
+            "reason": (
+                "agent inspected fixture output/log/state that was not declared durable "
+                "before terminal MCP status"
+            ),
             "job_id": job_id,
             "pre_terminal_state_peek_commands": state_peek_commands,
         }
@@ -2022,9 +2025,10 @@ def test_phase4_codex_exec_status_outcomes_and_lost_context_recovery(
     )
     running_status = _first_payload(running_text, status="ok")
     assert running_status["job_lifecycle"] == "running"
-    assert "intermediate outputs may be analyzed" in running_status["agent_guidance"]
-    assert "provisional results" in running_status["agent_guidance"]
-    assert "Final-result claims" in running_status["agent_guidance"]
+    assert "provisional evidence" in running_status["agent_guidance"]
+    assert "drive live scientific decisions" in running_status["agent_guidance"]
+    assert "including stopping" in running_status["agent_guidance"]
+    assert "Terminal status is required only" in running_status["agent_guidance"]
     assert running_status["output"]["path"]
     assert running_status["next_poll_after"]
 
@@ -2408,10 +2412,10 @@ def test_phase6_codex_exec_pretooluse_due_reminder_dedup_and_policy_precedence(
         "phase6_due_reminder.txt",
         extra_env={"GPU_MCP_TEST_NOW": "2099-01-01T00:00:00Z"},
     )
-    assert "GPU MCP: 1 managed job is due for status." in reminder_text
+    assert "GPU MCP: 1 managed job has a scheduled status check due." in reminder_text
     assert "manage_gpu_job(action=" in reminder_text
     assert "status" in reminder_text
-    assert "outputs may be analyzed read-only as provisional results" in reminder_text
+    assert "Continue from the returned lifecycle." in reminder_text
     assert launch["job_id"] in reminder_text
     reminder_state = json.loads(reminder_path.read_text())
     assert reminder_state["last_reminded_poll_after"] == job_record["next_poll_after"]

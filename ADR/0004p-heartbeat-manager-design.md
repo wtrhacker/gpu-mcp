@@ -43,7 +43,10 @@ The separate polling schedule should:
 - prevent agents from burning tokens polling too often;
 - allow read-only, provisional analysis of outputs that the application has
   already closed or atomically published;
-- reserve final-result claims and lifecycle decisions for terminal status;
+- let provisional evidence drive live scientific decisions, including
+  stopping;
+- require terminal status only before claiming that the job completed or that
+  an artifact is its final result;
 - allow other independent work to continue while the GPU job runs;
 - let the agent choose a task-specific cadence explicitly.
 
@@ -182,12 +185,13 @@ Full status responses should report:
 - agent guidance derived from job lifecycle and reservation diagnostics;
 - suggested next poll time or poll interval.
 
-If the job lifecycle is running or retrying, or if reservation diagnostics are
-unclear because inspection failed, tool output should tell the agent not to
-invent dependent work. It may continue independent work before the next
-suggested check. If no independent work is available, waiting until the next
-suggested check and then polling is acceptable behavior. If the job is terminal,
-status should distinguish success, failure, and
+If the job lifecycle is running or retrying, already-closed or atomically
+published output may be used as provisional evidence. It may already show that
+the run should stop. What it cannot establish is that the run completed or that
+an artifact is its final result. If reservation diagnostics are unclear because
+inspection failed, keep that uncertainty visible. Independent work and
+intentional waiting both remain valid before the next suggested check. If the
+job is terminal, status should distinguish success, failure, and
 process-gone-with-unknown-outcome, then tell the agent what outputs are ready
 and what lifecycle actions are valid.
 
@@ -403,9 +407,9 @@ newer than the hook-owned `last_hook_reminded_poll_after`, the hook injects a
 small `additionalContext` reminder telling the agent to call
 `manage_gpu_job(status)` when appropriate. If status still reports a running
 job, already-durable intermediate artifacts may be analyzed read-only and must
-be labeled provisional. The hook then
-records in its advisory state that this due timestamp was reminded, so normal
-tool use is not spammed with the same reminder.
+be labeled provisional. The hook then records in its advisory state that this
+due timestamp was reminded, so normal tool use is not spammed with the same
+reminder.
 
 ADR 0004q amends this simple de-duplication rule with throttled re-reminders
 until status acknowledgement. Phase 7 uses the ADR 0004q acknowledgement and

@@ -58,10 +58,14 @@ updates. Stable documentation and ADRs carry fuller operational detail.
 
 ### Current evidence belongs in tool results
 
-Tool results report state, provenance, and epistemic limits. A running or
-compact not-due status identifies closed or atomically published artifacts as
-provisional evidence and reserves final claims for terminal status. An unknown
-outcome explicitly remains nonterminal. A terminal result says so directly.
+Tool results say what happened, where the evidence came from, and what is still
+uncertain. A running or compact not-due status identifies closed or atomically
+published artifacts as provisional evidence. Provisional does not mean
+unusable; it means the evidence
+may still change. It may still show that a live run should stop. What it cannot
+establish by itself is that the job completed or that an artifact is its final
+result. An unknown outcome remains nonterminal. A terminal result says so
+directly.
 
 A successful smoke result exposes neutral evidence metadata: the
 `smoke_job_id` and the fact that it is positive viability evidence. It does not
@@ -86,8 +90,9 @@ Hard gates protect real invariants:
 - stale policy requires the approval protocol;
 - reservation and process identity must be proven before destructive lifecycle
   changes or retry;
-- an outcome is reconciled through `status` before final lifecycle claims and
-  reservation release; and
+- a recorded outcome is reconciled through `status` before it is called
+  terminal, and a reservation is released only after a terminal outcome or
+  separate proof that the process is gone; and
 - a not-due status avoids remote inspection unless the call carries a reason.
 
 Smoke and early-poll defaults admit explicit, auditable judgment. An explicitly

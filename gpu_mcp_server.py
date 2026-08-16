@@ -2823,7 +2823,9 @@ def _compact_not_due_response(*, action: str, job_record: dict, due_at: datetime
         "agent_guidance": (
             "No remote check was performed because this job is not due. Closed or "
             "atomically published outputs may be inspected read-only as provisional "
-            "evidence; final claims require terminal status. Repeat status with "
+            "evidence. Provisional evidence may drive live scientific decisions, "
+            "including stopping. Terminal status is required only to claim that the job "
+            "completed or that an artifact is its final result. Repeat status with "
             "early_poll_reason only when immediate inspection is justified."
         ),
         "server_instance_id": SERVER_INSTANCE_ID,
@@ -2987,7 +2989,9 @@ def _job_status_response(
         "next_poll_after": None if job_lifecycle in {"succeeded", "failed"} else return_next_poll_after,
         "agent_guidance": (
             "Running. Closed or atomically published outputs may be inspected read-only "
-            "as provisional evidence; final claims require terminal status."
+            "as provisional evidence. Provisional evidence may drive live scientific "
+            "decisions, including stopping. Terminal status is required only to claim "
+            "that the job completed or that an artifact is its final result."
             if job_lifecycle == "running"
             else (
                 "Terminal status reached; outputs may be inspected."
@@ -2996,8 +3000,10 @@ def _job_status_response(
                     "Terminal status is not established. First investigate why the outcome "
                     "metadata is delayed, missing, or invalid, using logs and read-only "
                     "inspection of available outputs as part of that diagnosis. Those outputs "
-                    "may also be treated as provisional scientific evidence, but preserve "
-                    "provenance and do not make final-result claims."
+                    "may also be treated as provisional scientific evidence. Provisional "
+                    "evidence may drive live scientific decisions, including stopping. "
+                    "Keep its provenance clear. Terminal status is required only to claim that "
+                    "the job completed or that an artifact is its final result."
                 )
             )
         ),
@@ -3624,7 +3630,10 @@ def manage_gpu_job(
     full check is needed now. action="update_cadence" requires a non-empty
     reason and a positive cadence_hint_sec, which is used exactly when its UTC
     poll time is representable; there is no policy cap. expected_duration_sec is
-    optional descriptive metadata only.
+    optional descriptive metadata only. Provisional evidence may drive live
+    scientific decisions, including action="stop". Stopping does not require
+    terminal status. It still requires ownership, a healthy heartbeat manager,
+    and an exact process match.
     """
     kwargs = {
         "action": action,

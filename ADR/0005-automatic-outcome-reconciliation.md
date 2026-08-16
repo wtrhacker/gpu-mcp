@@ -68,10 +68,13 @@ reservation state unchanged.
 
 ## Intermediate Outputs
 
-Terminal status is required for final-result claims and lifecycle actions, not
-for every read of application output. While a job is running, an agent may
-analyze an artifact read-only when the application has already closed it or
-published it atomically. Such analysis must be described as provisional.
+Terminal status is required only to claim that the job completed or that an
+artifact is its final result. It is not required before deciding whether a live
+run should continue. While a job is running, an agent may analyze an artifact
+read-only when the application has already closed it or published it atomically.
+Such analysis must be described as provisional. Provisional does not mean
+unusable; it means the evidence may still change. Provisional evidence may drive
+live scientific decisions, including stopping.
 
 GPU MCP does not infer durability for arbitrary scientific formats. The job's
 own output protocol defines the safe boundary, such as a closed HDF5 chunk or

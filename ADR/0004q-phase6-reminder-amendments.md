@@ -64,9 +64,9 @@ not part of v1.
 If several current-repo managed jobs are due, the hook should emit one compact
 reminder that lists the due jobs together instead of choosing only one job.
 
-The reminder should include each due job's `job_id`, how overdue it is, and the
-same output-dependency discipline: status must be checked before using that
-job's outputs, while independent work may continue.
+The reminder should include each due job's `job_id` and how overdue it is. It
+should not decide the science. The agent can still use the current job state and
+durable intermediate evidence to choose what to do.
 
 There is no v1 priority queue, severity scoring, or cross-job scheduling policy.
 If a deterministic order is needed, sort by oldest `next_poll_after` first, then
@@ -76,21 +76,21 @@ Throttle and acknowledgement state remain per job, not global. A status check
 for job A must not acknowledge or silence job B.
 
 The hook emits `hookSpecificOutput.additionalContext`. For one due job, the
-context should be compact and shaped like:
+context should be compact. This is a synthetic example:
 
 ```text
-GPU MCP: 1 managed job is due for status.
-- job-20260530T123456Z-a: overdue by 5m; call manage_gpu_job(action="status", job_id="job-20260530T123456Z-a") now.
-After status, a running job's already-closed or atomically published outputs may be analyzed read-only as provisional results; final-result claims require terminal status.
+GPU MCP: 1 managed job has a scheduled status check due.
+- <job-id>: scheduled status check is overdue by 5m; call manage_gpu_job(action="status", job_id="<job-id>").
+Continue from the returned lifecycle.
 ```
 
-For multiple due jobs, emit one context block:
+For multiple due jobs, emit one context block. Again, the IDs are placeholders:
 
 ```text
-GPU MCP: 2 managed jobs are due for status.
-- job-20260530T123456Z-a: overdue by 18m; call manage_gpu_job(action="status", job_id="job-20260530T123456Z-a") now.
-- job-20260530T123457Z-b: overdue by 16m; call manage_gpu_job(action="status", job_id="job-20260530T123457Z-b") now.
-After status, a running job's already-closed or atomically published outputs may be analyzed read-only as provisional results; final-result claims require terminal status.
+GPU MCP: 2 managed jobs have scheduled status checks due.
+- <job-id-a>: scheduled status check is overdue by 18m; call manage_gpu_job(action="status", job_id="<job-id-a>").
+- <job-id-b>: scheduled status check is overdue by 16m; call manage_gpu_job(action="status", job_id="<job-id-b>").
+Continue from the returned lifecycle.
 ```
 
 ## 3. `finish` Must Refuse While the Process Is Live

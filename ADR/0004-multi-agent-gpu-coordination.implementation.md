@@ -304,7 +304,7 @@ Rescue tool, not the normal lifecycle API.
 
 Tool output and any Codex-facing hook should teach the same operating discipline:
 
-- After launch or retry, keep a live obligation to poll `manage_gpu_job(status)` until the job reaches a terminal state. Do not proceed with work that depends on the job's outputs while the job is still running or retrying, or while reservation diagnostics are unclear because inspection failed. This does not require the agent to idle: it may work on independent tasks that do not depend on the GPU job's outputs, as long as it preserves the obligation to return to the job at the suggested time. If no independent work is available, waiting idly and polling is acceptable behavior.
+- After launch or retry, keep track of the job until the attempt is resolved. An unfinished run must not be presented as complete, but its durable output is not useless. A partial trajectory may already show that the run should stop. The agent may also do independent work or intentionally wait, as long as it returns to the job when needed.
 - When supported by the client, a user-global GPU MCP `PreToolUse` hook may
   surface due or overdue GPU-job reminders as model-visible context. The hook
   scopes itself to the current repo by walking upward from the hook working

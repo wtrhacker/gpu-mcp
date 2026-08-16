@@ -1730,7 +1730,8 @@ def test_phase4_missing_outcome_reports_unknown(repo_fixture, tmp_path, monkeypa
     assert "Terminal status is not established" in status["agent_guidance"]
     assert "First investigate why the outcome metadata" in status["agent_guidance"]
     assert "provisional scientific evidence" in status["agent_guidance"]
-    assert "do not make final-result claims" in status["agent_guidance"]
+    assert "including stopping" in status["agent_guidance"]
+    assert "Terminal status is required only" in status["agent_guidance"]
 
 
 def test_phase4_corrupt_outcome_reports_unknown(
@@ -2515,9 +2516,11 @@ def test_phase7_status_before_next_poll_is_compact_and_local_only(
     assert status["seconds_until_due"] > 0
     assert status["agent_guidance"] == (
         "No remote check was performed because this job is not due. Closed or atomically "
-        "published outputs may be inspected read-only as provisional evidence; final claims "
-        "require terminal status. Repeat status with early_poll_reason only when immediate "
-        "inspection is justified."
+        "published outputs may be inspected read-only as provisional evidence. Provisional "
+        "evidence may drive live scientific decisions, including stopping. Terminal status "
+        "is required only to claim that the job completed or that an artifact is its final "
+        "result. Repeat status with early_poll_reason only when immediate inspection is "
+        "justified."
     )
     assert inspections == []
     assert reread["next_poll_after"] == "2099-01-01T00:00:00Z"
@@ -2606,7 +2609,9 @@ def test_phase7_early_poll_reason_forces_full_status_and_records_override(
     assert status["early_poll_override_recorded"] is True
     assert status["agent_guidance"] == (
         "Running. Closed or atomically published outputs may be inspected read-only as "
-        "provisional evidence; final claims require terminal status."
+        "provisional evidence. Provisional evidence may drive live scientific decisions, "
+        "including stopping. Terminal status is required only to claim that the job "
+        "completed or that an artifact is its final result."
     )
     assert inspections
     assert reread["last_early_poll_reason"] == "user explicitly asked for an immediate check"

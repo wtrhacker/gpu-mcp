@@ -189,11 +189,12 @@ safety boundary.
 
 Running jobs may expose useful intermediate artifacts. Files the application
 has already closed or atomically published may be inspected read-only and
-reported as provisional. Terminal `status` is required before claiming a final
-result, but not before every intervention while a job is running. Running-job
-analysis, cadence changes, and justified lifecycle actions remain available,
-subject to the server's ownership and process-safety checks. GPU MCP does not
-determine whether an application-specific file is durable.
+reported as provisional. Provisional evidence may drive live scientific
+decisions, including stopping. Terminal `status` is required only to claim that
+the job completed or that an artifact is its final result. The server still
+checks that the agent owns the job and is signaling the right process; it does
+not decide whether the science is worth continuing. GPU MCP does not determine
+whether an application-specific file is durable.
 
 ### Timing model
 

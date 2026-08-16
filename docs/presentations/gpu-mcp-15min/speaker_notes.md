@@ -147,8 +147,9 @@ job event. These mechanisms complement each other; none of them decides whether
 the polymer physics is credible.
 
 Already-closed or atomically published intermediate artifacts may be inspected
-read-only and reported as provisional. Final-result claims still wait for
-terminal status.
+read-only and reported as provisional. They may already show that a run should
+stop. What waits for terminal status is the claim that the run completed or an
+artifact is its final result.
 
 ## 11. Bounded autonomy: the safety model
 

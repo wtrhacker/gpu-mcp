@@ -597,16 +597,18 @@ Supporting tests:
 
 User-visible requirement: after launch, the agent follows the job through
 `manage_gpu_job(status)`, recovers lost context by repo when unambiguous, and is
-told to reserve final-result claims and lifecycle actions for terminal status.
-Read-only analysis of already-closed or atomically published intermediate
-artifacts is allowed and must be labeled provisional.
+told that terminal status is required only to claim that the job completed or
+that an artifact is its final result. Read-only analysis of already-closed or
+atomically published intermediate artifacts is allowed and must be labeled
+provisional. A partial trajectory may already be enough to stop a bad run.
 
 Agentic battlefield first:
 
 - [ ] Repo A launches `hold_gpu.py` and asks for status. The answer says whether
   the job is still running, where to look for logs/results, when to check again,
   that durable intermediate outputs may be analyzed read-only as provisional,
-  and that final-result claims require terminal status.
+  and that they may guide a decision to stop even though they cannot establish
+  the completed result.
 - [ ] Repo A launches `quick_success.py` and `quick_fail.py` in separate runs.
   After each finishes, status reports success or failure from the managed
   launcher outcome record, and returns a log pointer or bounded tail containing a
@@ -766,9 +768,10 @@ Agentic battlefield first:
   job's `next_poll_after` due by advancing fake time or using a short test
   interval. Before Repo A's next ordinary tool call, `PreToolUse` gives the agent
   one status-check reminder visible to the model.
-- [ ] The reminder tells the agent the practical behavior: call status when
-  appropriate, do not use outputs before the job is terminal, and continue only
-  with work that does not depend on those outputs.
+- [ ] The reminder says that status is due and identifies the exact job. It does
+  not decide what the agent should do next. Provisional evidence may drive live
+  scientific decisions, including stopping; terminal status is required only for
+  completed-run or final-result claims.
 - [ ] Repo A keeps using tools without checking status. The hook does not repeat
   the exact same reminder over and over for the same due time.
 - [ ] Repo A has a due managed job, then Repo B runs an ordinary MCP tool call
