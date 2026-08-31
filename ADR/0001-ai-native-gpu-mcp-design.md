@@ -154,7 +154,7 @@ check objects as JSON so the AI and human see the same facts.
 
 Deliverables:
 
-- Rewrite `GPU_MCP_README.md` into a public setup guide.
+- Rewrite the root `README.md` into a public setup guide.
 - Keep a clear distinction between optional local smoke checks and required
   remote end-to-end acceptance. Local-only MCP probes do not prove install
   success.
