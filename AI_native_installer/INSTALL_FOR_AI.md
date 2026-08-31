@@ -1,7 +1,8 @@
 # How to Install GPU MCP for a Research Project
 
 This guide is for an AI assistant (like Codex) that is helping a human set up
-GPU access for their research code.
+GPU access for their research code. GPU MCP is AI-native: the assistant does
+the setup work, while the human reviews and approves the safety boundary.
 
 **What is MCP?** MCP stands for Model Context Protocol. It is how an AI
 assistant talks to tools. GPU MCP is a set of tools that let the AI run Python
@@ -12,17 +13,15 @@ jobs on remote GPU machines safely.
 ## What GPU MCP Does
 
 GPU MCP is a safety layer that lets an AI agent run Python jobs on remote GPU
-machines. For the current version (01-03) it does three things:
+machines. It does four things:
 
 1. **Runs** approved Python scripts on remote GPU hosts with safety guards.
 2. **Checks** host reachability, GPU status, and policy compliance before and
 during runs.
 3. **Enforces** that only scripts from approved folders can execute, and only
 writes to approved output locations.
-
-A future version (004) will add cooperative GPU reservations and managed job
-tracking so multiple agents do not collide. This guide sets up the foundation
-that 004 will build on.
+4. **Coordinates** managed jobs and cooperative GPU reservations so agents can
+track work without silently colliding.
 
 The human keeps control. The agent cannot run arbitrary commands on GPU hosts.
 It can only run approved Python scripts from approved folders.
@@ -119,69 +118,31 @@ are safety boundaries.
 
 **Why:** If `script_roots` is too narrow, the AI cannot run experiments. If
 `write_roots` is too broad, the AI could overwrite important files. Propose safe
-defaults and ask the human to approve.
+defaults for the bootstrap preview; approval happens only after the raw,
+validated preview is shown.
 
-### Step 5: Ask the Human to Approve
+### Step 5: Write the Repo-Local Codex Config First
 
-Show the human a concrete `gpu-mcp.toml` with all values filled in. Ask for
-explicit approval before writing it.
-
-**Why:** Safety policy should not be set by the AI alone. The human must
-understand and agree to which hosts, which scripts, and which write locations
-are allowed.
-
-### Step 6: Write `gpu-mcp.toml`
-
-After the human approves, write the file to the repo root:
-
-```toml
-schema_version = 1
-repo_root = "/shared/lab/my-research-repo"
-
-nodes = ["gpu01.example.edu", "gpu02.example.edu"]
-
-script_roots = ["."]
-write_roots = [".", "/tmp/gpu_mcp_outputs"]
-output_roots = [".gpu_mcp_logs"]
-
-sync_timeout_sec = 300
-```
-
-Keep it small. Do not add fields the human did not approve.
-
-**Why:** The server reads this file on every startup. A small, explicit policy
-is easier to review and less likely to hide unsafe settings.
-
-### Step 7: Approve the Policy
-
-Run:
-
-```bash
-python ~/gpu-mcp/gpu_mcp_doctor.py approve-policy \
-  --config /absolute/path/to/repo/gpu-mcp.toml --yes
-```
-
-**Why:** This records that the human has reviewed and approved the policy. The
-MCP server will refuse to start until a policy is approved. This prevents the
-AI from accidentally using an unsafe or unfinished config.
-
-### Step 8: Write Repo-Local Codex Config
-
-Write `.codex/config.toml` inside the research repo:
+Before `gpu-mcp.toml` exists, write `.codex/config.toml` inside the research
+repo. Point it at the exact future policy path:
 
 ```toml
 [mcp_servers.gpu-cluster-mcp]
-command = "python"
+command = "/absolute/path/to/python"
 args = [
   "/absolute/path/to/gpu_mcp_server.py",
   "--config",
   "/absolute/path/to/repo/gpu-mcp.toml",
 ]
+cwd = "/absolute/path/to/repo"
+enabled = true
+startup_timeout_sec = 20
 tool_timeout_sec = 360
 
-# "approve" means the tool runs automatically without asking the human.
-# Use this for operational tools so non-interactive runs (like codex exec) work.
 [mcp_servers.gpu-cluster-mcp.tools.run_python_on_gpu]
+approval_mode = "approve"
+
+[mcp_servers.gpu-cluster-mcp.tools.check_gpus]
 approval_mode = "approve"
 
 [mcp_servers.gpu-cluster-mcp.tools.kill_gpu_process]
@@ -190,27 +151,43 @@ approval_mode = "approve"
 [mcp_servers.gpu-cluster-mcp.tools.check_gpu_processes]
 approval_mode = "approve"
 
-# "prompt" means Codex asks the human before running the tool.
-# Use this for policy changes so the AI cannot change safety boundaries silently.
+[mcp_servers.gpu-cluster-mcp.tools.cluster_info]
+approval_mode = "approve"
+
+[mcp_servers.gpu-cluster-mcp.tools.manage_gpu_job]
+approval_mode = "approve"
+
+[mcp_servers.gpu-cluster-mcp.tools.list_gpu_reservations]
+approval_mode = "approve"
+
+[mcp_servers.gpu-cluster-mcp.tools.preview_policy_reload]
+approval_mode = "approve"
+
+[mcp_servers.gpu-cluster-mcp.tools.reject_policy_reload]
+approval_mode = "approve"
+
+# Codex must prompt the human at the activation boundary.
 [mcp_servers.gpu-cluster-mcp.tools.reload_policy]
 approval_mode = "prompt"
-
-# 004 extension: add check_gpus, manage_gpu_job, list_gpu_reservations here.
-# Read-only tools should be "approve". Lifecycle tools should be "approve".
 ```
 
-**Why repo-local config:** If you wrote this in global Codex config, every
-repo would use the same GPU hosts and script paths. That is dangerous. Each
-research repo gets its own private config.
+**Why config comes first:** The server can start safely before a usable policy
+exists. A missing, invalid, unapproved, or changed-at-start policy puts it in
+`bootstrap_pending` quarantine instead of making the MCP disappear. The
+preview/activation tools remain available, while every GPU, SSH, process,
+reservation, and managed-job operation is blocked by the server.
 
-**Why `--config` with absolute path:** The server must know exactly which
-policy to use. Relative paths or guessing would let the wrong policy slip in.
+**Why repo-local config:** If you wrote this in global Codex config, every repo
+would use the same GPU hosts and script paths. Each research repo needs its own
+policy and MCP entry.
 
-**Why `tool_timeout_sec` must be larger than `sync_timeout_sec`:** The server
-has its own timeout (`sync_timeout_sec`). The Codex client must wait longer
-than that, or the client will give up before the server does.
+**Why absolute paths:** The server must know exactly which executable, server,
+repo, and policy to use. Do not use relative paths or guess.
 
-### Step 9: Set Up the Policy Hook
+**Why `tool_timeout_sec` must be larger than `sync_timeout_sec`:** The client
+must wait longer than the server's own job timeout.
+
+### Step 6: Set Up the Policy Hook, Restart, and Establish Trust
 
 Add the GPU MCP companion hook once to the user's global Codex config:
 
@@ -254,16 +231,84 @@ timeout = 31536000
 statusMessage = "Waiting for a managed GPU job event"
 ```
 
-Restart Codex after editing config, then use `/hooks` to review and trust the
-global GPU MCP hook.
+Restart Codex from the research repo after editing either Codex config. Trust
+the repo when Codex asks whether to load its project config, then use `/hooks`
+to review and trust the global GPU MCP hook. A config edit does not mutate a
+server that is already running; restart again whenever the MCP command, args,
+or policy path changes.
 
-**Why:** If the AI edits `gpu-mcp.toml` and forgets to ask the human, the
-stale-policy hook blocks further tool calls. During active work, the companion
-hook immediately surfaces a local job outcome or due status check. At turn end,
-it waits for either event and continues the turn so the AI can call `status`.
-The one-year timeout is an operational hook-runner watchdog, not a polling
-maximum; raise it if this deployment intentionally suspends turns longer than a
-year. The hook is scoped by the nearest current-repo policy.
+At this point it is normal for operational tool calls to return
+`policy_state: "bootstrap_pending"`. That is a live but quarantined MCP, not a
+startup failure.
+
+### Step 7: Write or Repair `gpu-mcp.toml`
+
+Write the proposed policy to the repo root:
+
+```toml
+schema_version = 1
+repo_root = "/shared/lab/my-research-repo"
+
+nodes = ["gpu01.example.edu", "gpu02.example.edu"]
+
+script_roots = ["."]
+write_roots = [".", "/tmp/gpu_mcp_outputs"]
+output_roots = [".gpu_mcp_logs"]
+
+sync_timeout_sec = 300
+```
+
+Keep it small and explicit. This is a candidate, not an active policy.
+
+The hook deliberately permits repair of that exact policy file while the
+policy is invalid, unapproved, or stale. It also permits
+`preview_policy_reload`, `reload_policy`, and `reject_policy_reload`. Do not
+work around quarantine by editing unrelated files or calling raw remote
+commands. If a policy edit remains invalid, call preview again to get its
+validation error, repair only `gpu-mcp.toml`, and retry.
+
+### Step 8: Preview and Show the Raw Candidate
+
+Call `preview_policy_reload()`. It validates the file without activating it.
+A valid initial response has:
+
+- `status: "preview"` and `validation: "pass"`;
+- `approval_state: "bootstrap_pending"`;
+- `activation_mode: "bootstrap"`;
+- `active_hash: null` and a concrete `candidate_hash`;
+- the full `candidate_summary` and `diff_summary`; and
+- a one-time `reload_token`.
+
+Show the complete raw response to the human, including the candidate summary,
+diff, both hashes, and token context. Do not replace it with your own summary.
+Remind the human to inspect the actual `gpu-mcp.toml`, especially its nodes and
+script/write/output roots.
+
+If validation fails, there is no reload token and nothing can be activated.
+Repair the policy and preview again.
+
+### Step 9: Get Explicit Approval and Activate
+
+Ask the human to explicitly approve the exact previewed candidate. Only after
+they approve, call:
+
+```text
+reload_policy(token=<reload_token>)
+```
+
+Codex must show a tool-approval prompt because `reload_policy` is configured
+with `approval_mode = "prompt"`. Do not call it before the human approves and
+do not treat the prompt alone as approval. A successful response has
+`status: "reloaded"`, `approval_state: "active"`, and an `active_hash` equal to
+the previewed `candidate_hash`. Operations unlock in the same server process.
+
+If the human rejects the candidate, call
+`reject_policy_reload(token=<reload_token>)`. Quarantine remains in force; edit
+only the policy after the human has oriented you to the next candidate.
+
+Do not run `gpu_mcp_doctor.py approve-policy --yes` as the normal installation
+path. It bypasses the MCP preview and prompted activation ceremony that makes
+the initial policy review possible.
 
 ### Step 10: Verify Raw Remote Command Blocking
 
@@ -327,7 +372,8 @@ If the human asks to change `gpu-mcp.toml` (add hosts, change roots, etc.):
 
 1. Propose the exact diff.
 2. Call the MCP tool `preview_policy_reload()` to validate the changed file.
-3. Ask the human to approve.
+3. Show the complete raw preview, including the candidate summary, diff, and
+   hashes, then ask the human to approve that exact candidate.
 4. If approved, call `reload_policy(token=<preview_token>)`.
 5. If rejected, call `reject_policy_reload(token=<preview_token>)` and stop.
 

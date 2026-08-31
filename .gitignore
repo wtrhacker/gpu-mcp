@@ -8,6 +8,7 @@
 /gpu-mcp.toml
 /jobs/
 /results/
+/STALE/
 
 # Runtime logs and caches
 .gpu_mcp_logs/

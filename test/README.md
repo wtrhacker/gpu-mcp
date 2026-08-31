@@ -113,8 +113,9 @@ behavior.
   deterministic host, script-root, write-root, output-root, timeout, and
   Python-only guard behavior.
 - `test/test_gpu_mcp_policy_reload_contract.py`: ADR 0002 coverage for approved
-  policy records, startup approval, preview/reload/reject tokens, stale-policy
-  refusal, token expiry, and token cap behavior.
+  policy records, first-policy bootstrap quarantine, the central operational
+  capability gate, preview/reload/reject tokens, stale-policy refusal, token
+  expiry, and token cap behavior.
 - `test/test_gpu_mcp_policy_hook_contract.py`: deterministic coverage for the
   PreToolUse/PostToolUse policy checks, active managed-job reminders, Stop
   waiter, recovery-tool allowlist, and runtime instructions.
@@ -135,6 +136,9 @@ behavior.
 - `test/test_codex_repo_local_mcp.py`: two local fixture repos, repo-local MCP
   config selection, distinct policies, and opt-in live `codex exec` probes
   through the test proxy.
+- `test/test_codex_policy_bootstrap.py`: opt-in live `codex exec` proof that a
+  fresh unapproved repo can preview its first policy and that operational calls
+  are refused by the real server-side quarantine.
 - `test/support/`: test-only proxy server, deterministic kill-policy helper,
   unit coverage for the proxy, and experiment notes. See
   `test/support/README.md`.

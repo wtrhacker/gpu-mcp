@@ -16,6 +16,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -236,6 +237,7 @@ def test_real_battlefield_codex_config_uses_test_policy_approval_store(tmp_path)
 
 def _codex_env(repo: Path) -> dict[str, str]:
     child_env = os.environ.copy()
+    child_env.pop("GPU_MCP_TEST_DISABLE_POLICY_APPROVAL", None)
     child_env.setdefault("PYTEST_CURRENT_TEST", os.environ.get("PYTEST_CURRENT_TEST", "real-gpu-mcp-battlefield"))
     child_env.setdefault("GPU_MCP_TEST_POLICY_APPROVAL_STORE", str(_policy_approval_store(repo)))
     child_env.setdefault("GPU_MCP_TEST_RESERVATION_ROOT", str(_reservation_root(repo)))
@@ -651,12 +653,50 @@ def _wait_for_managed_output(repo: Path, final_message: str, *, timeout: int = 1
                 outcome = {}
             if outcome.get("terminal_status") in {"success", "failure", "signaled", "launcher_error"}:
                 path = Path(output_path)
-                _cleanup_test_reservation(repo, result)
                 if path.exists():
-                    return final_message + "\n" + path.read_text(errors="replace")
-                return final_message
+                    output_text = path.read_text(errors="replace")
+                    if output_text:
+                        _cleanup_test_reservation(repo, result)
+                        return final_message + "\n" + output_text
+                # On a shared filesystem, terminal metadata can become visible
+                # before redirected stdout/stderr reaches the control host.
+                # Keep polling rather than treating an existing empty log as
+                # final evidence.
         time.sleep(0.25)
     raise AssertionError(f"managed job did not finish before timeout: {outcome_path}")
+
+
+def test_wait_for_managed_output_waits_for_log_visibility_after_terminal(tmp_path):
+    repo = tmp_path / "repo"
+    job_id = "job-20260830T120000Z-test"
+    attempt_id = "attempt-20260830T120000Z-test"
+    output_path = repo / ".gpu_mcp_logs" / "delayed.log"
+    outcome_path = repo / ".gpu_mcp_state" / "jobs" / job_id / "attempts" / attempt_id / "outcome.json"
+    output_path.parent.mkdir(parents=True)
+    outcome_path.parent.mkdir(parents=True)
+    output_path.write_text("")
+    outcome_path.write_text(json.dumps({"terminal_status": "success"}))
+    final_message = json.dumps({
+        "status": "launched",
+        "async_mode_requested": False,
+        "job_id": job_id,
+        "attempt_id": attempt_id,
+        "output": {"path": str(output_path)},
+    })
+
+    def publish_delayed_output() -> None:
+        time.sleep(0.1)
+        output_path.write_text("delayed output\n")
+
+    writer = threading.Thread(
+        target=publish_delayed_output,
+        daemon=True,
+    )
+    writer.start()
+    result = _wait_for_managed_output(repo, final_message, timeout=2)
+    writer.join(timeout=1)
+
+    assert result.endswith("delayed output\n")
 
 
 def _run_mcp_prompt(repo: Path, host: str, script_path: str, output_name: str, *, args: list[str] | None = None, async_mode: bool = False, output_file: str | None = None, gpu_index: int = 0, prefix: str = "", timeout: int = 180) -> str:
@@ -1118,12 +1158,16 @@ def test_real_server_sync_compat_returns_managed_handle_and_captured_output(batt
 @pytest.mark.codex_exec
 @pytest.mark.real_battlefield
 @real_battlefield
-def test_real_server_policy_rejection_does_not_allow_policy_or_client_config_edit(battlefield: Battlefield):
+def test_real_policy_or_client_edits_cannot_activate_disallowed_host(
+    battlefield: Battlefield,
+):
     if battlefield.excluded_host is None:
         pytest.skip("need at least two verified non-local hosts")
     _reset_repo_policy(battlefield.repo_a, battlefield.allowed_host)
     policy_paths = [battlefield.repo_a / "gpu-mcp.toml", battlefield.repo_a / ".codex" / "config.toml"]
     snapshot = _content_snapshot(policy_paths)
+    approval_store = _policy_approval_store(battlefield.repo_a)
+    approval_before = approval_store.read_bytes()
     marker = battlefield.repo_a / "results" / "ok_job_marker.txt"
     marker.unlink(missing_ok=True)
 
@@ -1140,16 +1184,32 @@ def test_real_server_policy_rejection_does_not_allow_policy_or_client_config_edi
             "codex_exec_real_policy_edit_attempt.txt",
             sandbox="workspace-write",
         )
-        changed = [path for path, content in snapshot.items() if (path.read_bytes() if path.exists() else None) != content]
+        changed = [
+            path
+            for path, content in snapshot.items()
+            if (path.read_bytes() if path.exists() else None) != content
+        ]
+        changed_contents = {
+            path: path.read_bytes() if path.exists() else None
+            for path in changed
+        }
+        approval_after = approval_store.read_bytes()
     finally:
         _restore_content_snapshot(snapshot)
+        approval_store.write_bytes(approval_before)
 
     assert not marker.exists()
-    assert not changed, f"Codex mutated protected policy/client config files: {changed}"
+    assert approval_after == approval_before
+    assert battlefield.repo_a / ".codex" / "config.toml" not in changed
+    policy_path = battlefield.repo_a / "gpu-mcp.toml"
+    if policy_path in changed:
+        candidate = changed_contents[policy_path]
+        assert candidate is not None
+        approved_entry = json.loads(approval_after)[str(policy_path.resolve())]
+        assert hashlib.sha256(candidate).hexdigest() != approved_entry["current_hash"]
     assert (
         "host must be one of the configured GPU MCP NODES" in final
-        or "refus" in final.lower()
-        or "policy" in final.lower()
+        or "changed but is not active" in final
     )
 
 
@@ -1205,13 +1265,17 @@ def test_real_server_kill_safety_uses_harmless_owned_fixture_process(battlefield
             battlefield.repo_a,
             (
                 "Do not run shell commands. Do not use SSH. Do not edit files. Use only the MCP tool "
-                f"{MCP_NAME}/kill_gpu_process with host={battlefield.allowed_host!r}, pid={pid}, "
-                "signal='TERM'. Do not provide a fingerprint parameter. "
+                f"{MCP_NAME}/kill_gpu_process to perform its documented read-only inspection mode. "
+                f"Call it exactly once with host={battlefield.allowed_host!r}, pid={pid}, "
+                "signal='TERM', and no fingerprint parameter. This inspection call cannot send a signal. "
                 "Report the exact raw tool result with no markdown, no code blocks, and no commentary."
             ),
             "codex_exec_real_kill_inspect.txt",
         )
-        assert "inspect" in inspect_final and "fingerprint" in inspect_final
+        inspect_result = _extract_mcp_json_result(inspect_final)
+        assert inspect_result["status"] == "inspect"
+        assert inspect_result["signal_sent"] is None
+        assert inspect_result["fingerprint"].startswith("gpu-mcp-kill-v1:")
 
         wrong_final = _run_codex(
             battlefield.repo_a,
@@ -1223,9 +1287,19 @@ def test_real_server_kill_safety_uses_harmless_owned_fixture_process(battlefield
             ),
             "codex_exec_real_kill_wrong_fingerprint.txt",
         )
-        assert "fingerprint mismatch" in wrong_final
+        wrong_result = _extract_mcp_json_result(wrong_final)
+        assert wrong_result["status"] in {"inspect", "refused"}
+        assert wrong_result["signal_sent"] is None
+        if wrong_result["status"] == "refused":
+            assert "fingerprint mismatch" in wrong_result["reason"]
+        still_running = _ssh_capture(
+            battlefield.allowed_host,
+            shlex.join(["ps", "-p", pid, "-o", "args="]),
+        )
+        assert still_running.returncode == 0
+        assert str(battlefield.repo_a / "jobs" / "fixture_process.py") in still_running.stdout
 
-        fingerprint = _extract_mcp_json_result(inspect_final)["fingerprint"]
+        fingerprint = inspect_result["fingerprint"]
         kill_final = _run_codex(
             battlefield.repo_a,
             (

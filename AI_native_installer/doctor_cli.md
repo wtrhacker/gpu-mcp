@@ -9,7 +9,6 @@ Initial commands:
 ```bash
 python gpu_mcp_doctor.py check --config /absolute/path/to/repo/gpu-mcp.toml
 python gpu_mcp_doctor.py check --config /absolute/path/to/repo/gpu-mcp.toml --json
-python gpu_mcp_doctor.py approve-policy --config /absolute/path/to/repo/gpu-mcp.toml --yes
 ```
 
 `--config` is required and must be absolute. Doctor derives `repo_root` from
@@ -38,11 +37,21 @@ Readiness checks:
 - no raw-command probe may include `--ignore-rules`;
 - client `tool_timeout_sec > sync_timeout_sec`.
 
-`approve-policy` is the explicit human approval checkpoint for a repo policy.
-It validates the policy, writes the approved hash and audit history to
-`~/gpu-mcp/state/approved-policies.json`, and lets the MCP server start or
-reload that policy. It should be run only after the human has reviewed the
-safety-relevant policy values.
+Doctor is not the normal AI-native policy activation route. The agent must
+configure the repo-local MCP first, let the server enter `bootstrap_pending`
+quarantine, and use `preview_policy_reload`. The complete raw preview must be
+shown to the human, including `candidate_summary`, `diff_summary`,
+`active_hash`, and `candidate_hash`. Only after explicit human approval may the
+agent call the client-prompted `reload_policy` with the one-time preview token.
+That call writes the approved hash and audit history and unlocks operations in
+the running server.
+
+The CLI may retain `approve-policy` as an administrator recovery command, but
+an installer agent must not use `approve-policy --yes` to bypass the MCP
+preview and prompted activation ceremony. A missing, invalid, unapproved, or
+changed-at-start policy does not need that workaround: the MCP server remains
+available in bootstrap quarantine, all operational tools are blocked, and the
+policy can be repaired and previewed through the intended recovery surface.
 
 Doctor JSON should be stable:
 

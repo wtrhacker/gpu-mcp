@@ -3507,6 +3507,44 @@ def test_phase5_kill_gpu_process_does_not_remove_reservation(
     assert (registry / "gpu-a.gpu0" / "metadata.json").exists()
 
 
+def test_phase5_kill_gpu_process_refuses_wrong_fingerprint_without_signaling(
+    repo_fixture,
+    monkeypatch,
+):
+    config = _write_config(repo_fixture)
+    server = _import_server_with_config(monkeypatch, config)
+    process_info = {
+        "pid": "12345",
+        "ppid": "1",
+        "pgid": "12345",
+        "owner": server.GPU_MCP_USER,
+        "start_time": "Thu May 30 12:00:00 2026",
+        "command": "python fixture_process.py",
+        "cmd_hash": "abc123",
+        "cmd_preview": "python fixture_process.py",
+        "gpu_index": "0",
+        "gpu_memory_mib": "1",
+    }
+    process_info["fingerprint"] = server._kill_fingerprint("gpu-a", process_info)
+    monkeypatch.setattr(server, "_inspect_kill_target", lambda host, pid: process_info)
+
+    def unexpected_signal(*args, **kwargs):
+        pytest.fail("wrong fingerprint reached the remote signal path")
+
+    monkeypatch.setattr(server, "_host_run", unexpected_signal)
+
+    result = json.loads(server.kill_gpu_process(
+        host="gpu-a",
+        pid=12345,
+        fingerprint="gpu-mcp-kill-v1:wrong",
+        signal="TERM",
+    ))
+
+    assert result["status"] == "refused"
+    assert result["signal_sent"] is None
+    assert "fingerprint mismatch" in result["reason"]
+
+
 def test_phase5_kill_gpu_process_refuses_stale_policy(repo_fixture, monkeypatch):
     config = _write_config(repo_fixture)
     server = _import_server_with_config(monkeypatch, config)

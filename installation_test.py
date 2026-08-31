@@ -333,10 +333,11 @@ def run_installation_check(
                 _check(
                     "policy_approval",
                     "fail",
-                    "policy is not approved or is stale",
+                    "policy is awaiting initial activation or is stale",
                     next_action=(
-                        f"{python_path} {mcp_root_path / 'gpu_mcp_doctor.py'} "
-                        f"approve-policy --config {policy.config_path} --yes"
+                        "start or restart Codex from the trusted repo, call "
+                        "preview_policy_reload, show the complete raw preview to the human, "
+                        "then call reload_policy only after explicit approval"
                     ),
                     details=_details_from_error(exc),
                 )

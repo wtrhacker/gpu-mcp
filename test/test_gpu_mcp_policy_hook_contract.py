@@ -197,6 +197,164 @@ def test_policy_hook_allows_reload_tools_while_policy_is_stale(tmp_path):
         assert hook.check_policy_drift(repo, store_path=store, tool_name=tool_name) is None
 
 
+def test_policy_hook_bootstrap_allows_exact_recovery_names_but_not_suffix_spoofs(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_config(repo)
+    store = tmp_path / "approved-policies.json"
+    hook = importlib.import_module("gpu_mcp_policy_hook")
+
+    for tool_name in (
+        "mcp__gpu_cluster_mcp__preview_policy_reload",
+        "mcp__gpu_cluster_mcp__reload_policy",
+        "mcp__gpu_cluster_mcp__reject_policy_reload",
+    ):
+        assert hook.check_policy_drift(repo, store_path=store, tool_name=tool_name) is None
+
+    spoofed = hook.check_policy_drift(
+        repo,
+        store_path=store,
+        tool_name="mcp__untrusted__silently_reload_policy",
+    )
+    assert spoofed is not None
+    assert spoofed["decision"] == "block"
+    assert "not been activated yet" in spoofed["reason"]
+
+    bare = hook.check_policy_drift(
+        repo,
+        store_path=store,
+        tool_name="reload_policy",
+    )
+    assert bare is not None
+    assert bare["decision"] == "block"
+
+
+def test_policy_hook_allows_only_repo_codex_config_repair_during_bootstrap(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_config(repo)
+    store = tmp_path / "approved-policies.json"
+    hook = importlib.import_module("gpu_mcp_policy_hook")
+    codex_config = repo / ".codex" / "config.toml"
+
+    allowed = hook.check_policy_drift(
+        repo,
+        store_path=store,
+        tool_name="functions.apply_patch",
+        tool_input={
+            "patch": "*** Begin Patch\n*** Add File: .codex/config.toml\n+x\n*** End Patch",
+        },
+    )
+    exact_edit = hook.check_policy_drift(
+        repo,
+        store_path=store,
+        tool_name="Edit",
+        tool_input={"file_path": str(codex_config)},
+    )
+    blocked = hook.check_policy_drift(
+        repo,
+        store_path=store,
+        tool_name="Edit",
+        tool_input={"file_path": str(repo / "README.md")},
+    )
+
+    assert allowed is None
+    assert exact_edit is None
+    assert blocked is not None
+    assert blocked["decision"] == "block"
+
+
+def test_policy_hook_blocks_bootstrap_config_edits_through_symlinked_codex_dir(
+    tmp_path,
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_config(repo)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (repo / ".codex").symlink_to(outside, target_is_directory=True)
+    store = tmp_path / "approved-policies.json"
+    hook = importlib.import_module("gpu_mcp_policy_hook")
+
+    attempts = (
+        (
+            "Edit",
+            {"file_path": str(repo / ".codex" / "config.toml")},
+        ),
+        (
+            "functions.apply_patch",
+            {
+                "patch": (
+                    "*** Begin Patch\n*** Add File: .codex/config.toml\n"
+                    "+x\n*** End Patch"
+                ),
+            },
+        ),
+        (
+            "functions.apply_patch",
+            {
+                "patch": (
+                    "*** Begin Patch\n*** Update File: .codex/config.toml\n"
+                    "@@\n*** End Patch"
+                ),
+            },
+        ),
+    )
+
+    for tool_name, tool_input in attempts:
+        result = hook.check_policy_drift(
+            repo,
+            store_path=store,
+            tool_name=tool_name,
+            tool_input=tool_input,
+        )
+        assert result is not None
+        assert result["decision"] == "block"
+
+
+def test_policy_hook_blocks_bootstrap_edit_of_symlinked_codex_config(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_config(repo)
+    (repo / ".codex").mkdir()
+    outside_config = tmp_path / "outside-config.toml"
+    outside_config.write_text("outside = true\n")
+    (repo / ".codex" / "config.toml").symlink_to(outside_config)
+    store = tmp_path / "approved-policies.json"
+    hook = importlib.import_module("gpu_mcp_policy_hook")
+
+    result = hook.check_policy_drift(
+        repo,
+        store_path=store,
+        tool_name="Edit",
+        tool_input={"file_path": str(repo / ".codex" / "config.toml")},
+    )
+
+    assert result is not None
+    assert result["decision"] == "block"
+
+
+def test_policy_hook_blocks_codex_config_edit_after_approved_policy_drifts(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    config = _write_config(repo)
+    store = tmp_path / "approved-policies.json"
+    _approve_policy(config, store)
+    config.write_text(config.read_text().replace("nodes = ['gpu-a']", "nodes = ['gpu-b']"))
+    hook = importlib.import_module("gpu_mcp_policy_hook")
+
+    result = hook.check_policy_drift(
+        repo,
+        store_path=store,
+        tool_name="Edit",
+        tool_input={"file_path": str(repo / ".codex" / "config.toml")},
+    )
+
+    assert result is not None
+    assert result["decision"] == "block"
+    assert "changed but is not active" in result["reason"]
+
+
 def test_policy_hook_allows_narrow_policy_file_edit_while_stale(tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -487,7 +645,8 @@ def test_policy_hook_main_reads_codex_json_event(tmp_path):
     assert completed.returncode == 0
     result = json.loads(completed.stdout)
     assert result["decision"] == "block"
-    assert "gpu-mcp.toml has changed but is not active" in result["reason"]
+    assert "gpu-mcp.toml has not been activated yet" in result["reason"]
+    assert "candidate_summary" in result["reason"]
 
 
 def test_phase6_due_reminder_emits_additional_context(tmp_path, monkeypatch):

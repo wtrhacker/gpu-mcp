@@ -33,50 +33,59 @@ If no hosts are verified, stop and tell the human.
 - [ ] Human ran SSH bootstrap with explicit hostnames or `--hosts-file`
 - [ ] Read bootstrap inventory and found at least one verified non-local host
 
-### Policy setup
-- [ ] Confirmed research repo root with the human
-- [ ] Proposed GPU host list to the human (subset of verified hosts)
-- [ ] Proposed `script_roots` to the human
-- [ ] Proposed `write_roots` to the human
-- [ ] Human approved all proposed values
-- [ ] Wrote `gpu-mcp.toml` to repo root
-- [ ] Ran `approve-policy --yes` and it succeeded
-
-### Codex integration
+### Codex bootstrap integration
 - [ ] Wrote repo-local `.codex/config.toml`
 - [ ] Verified repo-local `.codex/config.toml` contains no GPU MCP hook blocks
 - [ ] Set `tool_timeout_sec` > `sync_timeout_sec`
 - [ ] Configured tool approval modes:
   - [ ] `run_python_on_gpu` = `"approve"`
+  - [ ] `check_gpus` = `"approve"`
   - [ ] `kill_gpu_process` = `"approve"`
   - [ ] `check_gpu_processes` = `"approve"`
+  - [ ] `cluster_info` = `"approve"`
+  - [ ] `manage_gpu_job` = `"approve"`
+  - [ ] `list_gpu_reservations` = `"approve"`
+  - [ ] `preview_policy_reload` = `"approve"`
+  - [ ] `reject_policy_reload` = `"approve"`
   - [ ] `reload_policy` = `"prompt"`
 - [ ] Installed user-global GPU MCP companion hook (`PreToolUse`, `PostToolUse`,
   and `Stop` in Codex config)
 - [ ] Human trusted the global GPU MCP hook in Codex (ran `/hooks` or equivalent)
+- [ ] Restarted Codex from the repo and trusted its project config
+- [ ] Confirmed the MCP starts in `bootstrap_pending` when no policy is active
+
+### Policy proposal and activation
+- [ ] Confirmed research repo root with the human
+- [ ] Proposed GPU host list to the human (subset of verified hosts)
+- [ ] Proposed `script_roots`, `write_roots`, and `output_roots` to the human
+- [ ] Wrote the proposed `gpu-mcp.toml` to the repo root
+- [ ] Repaired only `gpu-mcp.toml` until `preview_policy_reload` validated it
+- [ ] Saved the complete raw preview response
+- [ ] Showed the human `candidate_summary`, `diff_summary`, `active_hash`, and
+  `candidate_hash` without replacing them with an agent summary
+- [ ] Human inspected the candidate file and explicitly approved that preview
+- [ ] Called prompted `reload_policy` with the preview's one-time token
+- [ ] Verified `approval_state = "active"` and active hash = candidate hash
+- [ ] Did not use doctor `approve-policy --yes` as the normal install path
 
 ### Verification
 - [ ] Verified raw remote command blocking (SSH, scp, rsync, codex spawn)
 - [ ] Ran full doctor check with `--json`, all required checks passed
 - [ ] Ran full battlefield suite and it passed
+- [ ] Verified managed-job hook reminders and status continuation work
 - [ ] Updated this progress file
-
-### 004 extension placeholder
-When multi-agent GPU coordination is enabled, add checkboxes here:
-- [ ] Configured `check_gpus` approval mode
-- [ ] Configured `manage_gpu_job` approval mode
-- [ ] Configured `list_gpu_reservations` approval mode
-- [ ] Verified hook heartbeat reminders work
 
 ## Proposed Values
 
-Paste the actual `gpu-mcp.toml` you proposed and the human approved:
+Paste the exact `gpu-mcp.toml` candidate that was previewed and approved:
 
 ```toml
 # Paste proposal here
 ```
 
-- Human approved on: _______________
+- Preview candidate hash: _________________________________________________
+- Active policy hash: ____________________________________________________
+- Human approved on: _____________________________________________________
 
 ## Blockers
 

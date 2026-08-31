@@ -161,7 +161,9 @@ def test_static_installation_check_blocks_unapproved_policy(tmp_path):
     assert result["readiness"] == "blocked"
     check = _by_name(result)["policy_approval"]
     assert check["status"] == "fail"
-    assert "approve-policy" in check["next_action"]
+    assert "preview_policy_reload" in check["next_action"]
+    assert "reload_policy" in check["next_action"]
+    assert "approve-policy" not in check["next_action"]
 
 
 def test_live_probes_do_not_run_when_static_checks_are_blocking(tmp_path):

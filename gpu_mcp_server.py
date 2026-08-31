@@ -11,19 +11,20 @@ Usage:
 Register in Codex or another MCP-aware client as a stdio MCP server.
 """
 
-import sys, os, json, time, subprocess, re, shlex, hashlib, signal as signal_lib, secrets, shutil, threading, atexit
+import sys, os, json, time, subprocess, re, shlex, hashlib, signal as signal_lib, secrets, shutil, threading, atexit, functools
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
 import gpu_mcp_guard
 import gpu_mcp_reservations as reservations
-from gpu_mcp_config import ConfigError, GpuMcpPolicy, load_policy
+from gpu_mcp_config import ConfigError, GpuMcpPolicy, load_policy_snapshot
 from gpu_mcp_policy_approval import (
     PolicyApprovalError,
     approve_policy,
     diff_policy_summary,
     policy_file_hash,
+    policy_summary,
     verify_policy_approved,
 )
 
@@ -49,6 +50,7 @@ def _pop_config_arg(argv: list[str]) -> str:
 
 
 GPU_MCP_CONFIG_PATH = _pop_config_arg(sys.argv)
+POLICY_CONFIG_PATH = Path(GPU_MCP_CONFIG_PATH).expanduser()
 TEST_POLICY_APPROVAL_STORE_ENV = "GPU_MCP_TEST_POLICY_APPROVAL_STORE"
 GPU_MCP_TEST_DISABLE_POLICY_APPROVAL = (
     os.environ.get("GPU_MCP_TEST_DISABLE_POLICY_APPROVAL", "").strip().lower()
@@ -63,6 +65,8 @@ GPU_MCP_TEST_ENABLE_HARNESS_CONTROLS = (
     and "PYTEST_CURRENT_TEST" in os.environ
 )
 CONFIG_POLICY: GpuMcpPolicy | None = None
+POLICY_ACTIVATION_REQUIRED_REASON: str | None = None
+STARTUP_POLICY_HASH: str | None = None
 
 
 def _test_policy_approval_store() -> Path | None:
@@ -72,21 +76,49 @@ def _test_policy_approval_store() -> Path | None:
     return None
 
 
-try:
-    CONFIG_POLICY = load_policy(Path(GPU_MCP_CONFIG_PATH).expanduser())
-    if not GPU_MCP_TEST_DISABLE_POLICY_APPROVAL:
-        verify_policy_approved(
-            CONFIG_POLICY.config_path,
-            store_path=_test_policy_approval_store(),
-        )
-except ConfigError as exc:
-    print(f"ERROR: invalid GPU MCP config: {exc}", file=sys.stderr)
+if POLICY_CONFIG_PATH.is_symlink():
+    print("ERROR: invalid GPU MCP config: gpu-mcp.toml must not be a symlink", file=sys.stderr)
     raise SystemExit(2)
-except PolicyApprovalError as exc:
-    print(f"ERROR: unapproved GPU MCP policy: {exc}", file=sys.stderr)
-    raise SystemExit(2)
+POLICY_CONFIG_PATH = POLICY_CONFIG_PATH.resolve()
 
-REPO_ROOT = Path(__file__).resolve().parent
+try:
+    candidate_snapshot = load_policy_snapshot(POLICY_CONFIG_PATH)
+except ConfigError as exc:
+    POLICY_ACTIVATION_REQUIRED_REASON = f"policy is missing or invalid: {exc}"
+else:
+    candidate_policy = candidate_snapshot.policy
+    if GPU_MCP_TEST_DISABLE_POLICY_APPROVAL:
+        CONFIG_POLICY = candidate_policy
+        STARTUP_POLICY_HASH = candidate_snapshot.content_hash
+    else:
+        try:
+            verify_policy_approved(
+                candidate_policy.config_path,
+                store_path=_test_policy_approval_store(),
+                expected_hash=candidate_snapshot.content_hash,
+            )
+        except PolicyApprovalError as exc:
+            POLICY_ACTIVATION_REQUIRED_REASON = str(exc)
+        else:
+            CONFIG_POLICY = candidate_policy
+            STARTUP_POLICY_HASH = candidate_snapshot.content_hash
+
+if POLICY_ACTIVATION_REQUIRED_REASON is not None:
+    print(
+        "WARNING: GPU MCP is starting in policy bootstrap quarantine: "
+        f"{POLICY_ACTIVATION_REQUIRED_REASON}",
+        file=sys.stderr,
+    )
+
+# Safe inert defaults are used only while no approved policy is active. Every
+# operational MCP entry point is guarded before it can consume these values.
+REPO_ROOT = POLICY_CONFIG_PATH.parent
+NODES: list[str] = []
+APPROVED_SCRIPT_ROOTS: list[Path] = []
+APPROVED_WRITE_ROOTS: list[Path] = []
+APPROVED_OUTPUT_ROOTS: list[Path] = []
+GPU_MCP_WRITE_ROOTS_RAW = ""
+SYNC_TIMEOUT_SEC = 30
 PYTHON = os.environ.get("GPU_MCP_PYTHON", "").strip() or sys.executable
 _GPU_MCP_USER_ENV = os.environ.get("GPU_MCP_USER", "").strip()
 DEFAULT_GPU_MCP_USER = (
@@ -119,16 +151,11 @@ def _apply_policy(policy: GpuMcpPolicy) -> None:
     SYNC_TIMEOUT_SEC = policy.sync_timeout_sec
 
 
-_apply_policy(CONFIG_POLICY)
-ACTIVE_POLICY_HASH = policy_file_hash(CONFIG_POLICY.config_path)
-ACTIVE_POLICY_FILE_STAT = CONFIG_POLICY.config_path.stat()
-_STALE_POLICY_HASH_CACHE = {
-    "signature": (
-        ACTIVE_POLICY_FILE_STAT.st_mtime_ns,
-        ACTIVE_POLICY_FILE_STAT.st_size,
-    ),
-    "hash": ACTIVE_POLICY_HASH,
-}
+if CONFIG_POLICY is not None:
+    _apply_policy(CONFIG_POLICY)
+    ACTIVE_POLICY_HASH: str | None = STARTUP_POLICY_HASH
+else:
+    ACTIVE_POLICY_HASH = None
 PENDING_POLICY_RELOADS: dict[str, dict[str, object]] = {}
 POLICY_RELOAD_TOKEN_TTL_SEC = 60 * 60
 POLICY_RELOAD_MAX_PENDING = 64
@@ -138,7 +165,7 @@ HOST_RUN_ERRORS: dict[tuple[str, str], str] = {}
 SERVER_INSTANCE_ID = reservations.generate_server_instance_id()
 
 POLICY_RELOAD_AGENT_INSTRUCTIONS = [
-    "Show this raw preview output, including diff_summary and hashes, to the human.",
+    "Show this raw preview output, including candidate_summary, diff_summary, and hashes, to the human.",
     "Do not summarize it as the only evidence.",
     "Call reload_policy only after explicit human approval.",
     "If you edited gpu-mcp.toml yourself, remind the human to inspect the file before approving reload.",
@@ -187,6 +214,13 @@ STALE_POLICY_REFUSAL = (
     "to the next candidate edit."
 )
 
+POLICY_BOOTSTRAP_REFUSAL = (
+    "GPU MCP is in policy bootstrap quarantine because no approved policy is active. "
+    "All GPU, SSH, process, reservation, and managed-job operations are disabled. "
+    "Call preview_policy_reload and show its complete candidate_summary, diff_summary, "
+    "and hashes to the human. Call reload_policy only after explicit human approval."
+)
+
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 def _conn(host: str, user: str = GPU_MCP_USER):
@@ -211,21 +245,37 @@ def _conn(host: str, user: str = GPU_MCP_USER):
     return Connection(host, user=user, connect_kwargs=connect_kwargs, connect_timeout=SSH_CONNECT_TIMEOUT)
 
 
+def _policy_state() -> str:
+    return "active" if CONFIG_POLICY is not None and ACTIVE_POLICY_HASH is not None else "bootstrap_pending"
+
+
 def _stale_policy_refusal() -> str | None:
+    if CONFIG_POLICY is None or ACTIVE_POLICY_HASH is None:
+        return json.dumps({
+            "status": "refused",
+            "reason": POLICY_BOOTSTRAP_REFUSAL,
+            "policy_state": "bootstrap_pending",
+            "config_path": str(POLICY_CONFIG_PATH),
+            "activation_required_reason": POLICY_ACTIVATION_REQUIRED_REASON,
+        }, sort_keys=True)
     try:
-        stat = CONFIG_POLICY.config_path.stat()
-        signature = (stat.st_mtime_ns, stat.st_size)
-        if _STALE_POLICY_HASH_CACHE.get("signature") == signature:
-            current_hash = str(_STALE_POLICY_HASH_CACHE["hash"])
-        else:
-            current_hash = policy_file_hash(CONFIG_POLICY.config_path)
-            _STALE_POLICY_HASH_CACHE["signature"] = signature
-            _STALE_POLICY_HASH_CACHE["hash"] = current_hash
+        current_hash = policy_file_hash(POLICY_CONFIG_PATH)
     except Exception as exc:
         return f"{STALE_POLICY_REFUSAL}\nCurrent policy file could not be hashed: {exc}"
     if current_hash != ACTIVE_POLICY_HASH:
         return STALE_POLICY_REFUSAL
     return None
+
+
+def _requires_active_policy(func):
+    """Apply the central capability gate to an operational MCP tool."""
+    @functools.wraps(func)
+    def guarded(*args, **kwargs):
+        if refusal := _stale_policy_refusal():
+            return refusal
+        return func(*args, **kwargs)
+
+    return guarded
 
 
 def _short_host(host: str) -> str:
@@ -3018,6 +3068,9 @@ def _job_status_response(
 # ── MCP Server ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "--safe-run":
+    if refusal := _stale_policy_refusal():
+        print(refusal, file=sys.stderr)
+        raise SystemExit(2)
     raise SystemExit(_run_script_under_guard(sys.argv[2:]))
 
 from mcp.server.fastmcp import FastMCP
@@ -3030,7 +3083,10 @@ mcp = FastMCP("gpu-cluster", instructions=(
     "general cleanup or scheduling tool: use it only for a specific PID that "
     "the caller intends to stop. First inspect the target, read the owner, GPU, "
     "start time, process group, and command preview, then pass the returned "
-    "fingerprint only if it is still clearly the intended process."
+    "fingerprint only if it is still clearly the intended process. When "
+    "approval_state is bootstrap_pending, every operational tool is quarantined; "
+    "use preview_policy_reload, show the complete raw preview to the human, and "
+    "call reload_policy only after explicit human approval."
 ))
 
 
@@ -3044,29 +3100,48 @@ def preview_policy_reload():
     """
     _cleanup_policy_reload_tokens()
     try:
-        candidate = load_policy(CONFIG_POLICY.config_path)
+        candidate_snapshot = load_policy_snapshot(POLICY_CONFIG_PATH)
     except ConfigError as exc:
         return json.dumps({
             "status": "error",
             "validation": "fail",
+            "approval_state": _policy_state(),
+            "config_path": str(POLICY_CONFIG_PATH),
             "reason": str(exc),
         }, sort_keys=True)
 
-    candidate_hash = policy_file_hash(candidate.config_path)
-    diff_summary = diff_policy_summary(CONFIG_POLICY, candidate)
+    candidate = candidate_snapshot.policy
+    candidate_hash = candidate_snapshot.content_hash
+    candidate_policy_summary = policy_summary(candidate)
+    if CONFIG_POLICY is None or ACTIVE_POLICY_HASH is None:
+        activation_mode = "bootstrap"
+        diff_summary = [
+            "initial policy activation; no approved active-policy baseline is loaded",
+        ]
+    else:
+        activation_mode = "reload"
+        diff_summary = diff_policy_summary(CONFIG_POLICY, candidate)
     token = "gpu-mcp-reload-v1:" + secrets.token_urlsafe(24)
     PENDING_POLICY_RELOADS[token] = {
+        "activation_mode": activation_mode,
+        "active_hash": ACTIVE_POLICY_HASH,
+        "config_path": str(candidate.config_path),
         "candidate_hash": candidate_hash,
+        "candidate_summary": candidate_policy_summary,
         "diff_summary": diff_summary,
+        "server_instance_id": SERVER_INSTANCE_ID,
         "created_at": time.monotonic(),
     }
     _cleanup_policy_reload_tokens()
     return json.dumps({
         "status": "preview",
         "validation": "pass",
+        "approval_state": _policy_state(),
+        "activation_mode": activation_mode,
         "config_path": str(candidate.config_path),
         "active_hash": ACTIVE_POLICY_HASH,
         "candidate_hash": candidate_hash,
+        "candidate_summary": candidate_policy_summary,
         "diff_summary": diff_summary,
         "reload_token": token,
         "agent_instructions": POLICY_RELOAD_AGENT_INSTRUCTIONS,
@@ -3077,7 +3152,7 @@ def preview_policy_reload():
 def reload_policy(token: str):
     """Activate a previously previewed and human-approved policy reload."""
     global ACTIVE_POLICY_HASH
-    global _STALE_POLICY_HASH_CACHE
+    global POLICY_ACTIVATION_REQUIRED_REASON
 
     if not isinstance(token, str) or not token:
         return json.dumps({
@@ -3091,8 +3166,24 @@ def reload_policy(token: str):
             "reason": token_error,
         }, sort_keys=True)
 
+    if pending.get("config_path") != str(POLICY_CONFIG_PATH):
+        return json.dumps({
+            "status": "refused",
+            "reason": "reload token belongs to a different policy path; preview again",
+        }, sort_keys=True)
+    if pending.get("server_instance_id") != SERVER_INSTANCE_ID:
+        return json.dumps({
+            "status": "refused",
+            "reason": "reload token belongs to a different server instance; preview again",
+        }, sort_keys=True)
+    if pending.get("active_hash") != ACTIVE_POLICY_HASH:
+        return json.dumps({
+            "status": "refused",
+            "reason": "active policy state changed after preview; preview again",
+        }, sort_keys=True)
+
     try:
-        candidate = load_policy(CONFIG_POLICY.config_path)
+        candidate_snapshot = load_policy_snapshot(POLICY_CONFIG_PATH)
     except ConfigError as exc:
         return json.dumps({
             "status": "error",
@@ -3100,25 +3191,67 @@ def reload_policy(token: str):
             "reason": str(exc),
         }, sort_keys=True)
 
-    candidate_hash = policy_file_hash(candidate.config_path)
+    candidate = candidate_snapshot.policy
+    candidate_hash = candidate_snapshot.content_hash
     if candidate_hash != pending["candidate_hash"]:
         return json.dumps({
             "status": "refused",
             "reason": "policy changed after preview; preview again",
         }, sort_keys=True)
+    candidate_policy_summary = policy_summary(candidate)
+    if candidate_policy_summary != pending.get("candidate_summary"):
+        return json.dumps({
+            "status": "refused",
+            "reason": "policy summary changed after preview; preview again",
+        }, sort_keys=True)
 
-    approve_policy(candidate, diff_summary=list(pending["diff_summary"]))
+    try:
+        approval_record = approve_policy(
+            candidate,
+            store_path=_test_policy_approval_store(),
+            diff_summary=list(pending["diff_summary"]),
+            expected_hash=candidate_hash,
+        )
+    except (OSError, PolicyApprovalError) as exc:
+        return json.dumps({
+            "status": "error",
+            "reason": f"could not record policy approval: {exc}",
+            "approval_state": _policy_state(),
+        }, sort_keys=True)
+    if approval_record.get("current_hash") != candidate_hash:
+        return json.dumps({
+            "status": "refused",
+            "reason": "policy changed while approval was being recorded; preview again",
+            "approval_state": _policy_state(),
+        }, sort_keys=True)
+
+    try:
+        current_hash = policy_file_hash(POLICY_CONFIG_PATH)
+    except OSError as exc:
+        return json.dumps({
+            "status": "error",
+            "reason": f"could not recheck policy after recording approval: {exc}",
+            "approval_state": _policy_state(),
+        }, sort_keys=True)
+    if current_hash != candidate_hash:
+        return json.dumps({
+            "status": "refused",
+            "reason": "policy changed while approval was being recorded; preview again",
+            "approval_state": _policy_state(),
+        }, sort_keys=True)
+
+    activation_mode = str(pending["activation_mode"])
     _apply_policy(candidate)
     ACTIVE_POLICY_HASH = candidate_hash
-    stat = CONFIG_POLICY.config_path.stat()
-    _STALE_POLICY_HASH_CACHE = {
-        "signature": (stat.st_mtime_ns, stat.st_size),
-        "hash": ACTIVE_POLICY_HASH,
-    }
+    POLICY_ACTIVATION_REQUIRED_REASON = None
+    PENDING_POLICY_RELOADS.clear()
     return json.dumps({
         "status": "reloaded",
+        "approval_state": _policy_state(),
+        "activation_mode": activation_mode,
         "config_path": str(candidate.config_path),
         "active_hash": ACTIVE_POLICY_HASH,
+        "candidate_summary": candidate_policy_summary,
         "diff_summary": pending["diff_summary"],
     }, sort_keys=True)
 
@@ -3139,12 +3272,15 @@ def reject_policy_reload(token: str):
         }, sort_keys=True)
     return json.dumps({
         "status": "rejected",
+        "approval_state": _policy_state(),
+        "activation_mode": pending.get("activation_mode"),
         "active_hash": ACTIVE_POLICY_HASH,
         "reason": "reload token discarded; active policy unchanged",
     }, sort_keys=True)
 
 
 @mcp.tool()
+@_requires_active_policy
 def check_gpus(
     samples: int = 2,
     threshold: int = 10,
@@ -3159,8 +3295,6 @@ def check_gpus(
         JSON report with per-GPU availability and registry status.
     """
     _apply_test_controls_from_file()
-    if stale := _stale_policy_refusal():
-        return stale
     if not isinstance(samples, int) or isinstance(samples, bool) or samples < 1:
         return _json_tool_response({"status": "refused", "reason": "samples must be a positive integer"})
     if not isinstance(threshold, int) or isinstance(threshold, bool) or threshold < 0:
@@ -3278,6 +3412,7 @@ def check_gpus(
 
 
 @mcp.tool()
+@_requires_active_policy
 def check_gpu_processes(
     hosts: Optional[list[str]] = None,
     user_filter: Optional[str] = None,
@@ -3295,8 +3430,6 @@ def check_gpu_processes(
     Returns:
         Per-host report of GPU-owning processes with PID, user, command, and memory usage.
     """
-    if stale := _stale_policy_refusal():
-        return stale
     if hosts is not None and (
         not isinstance(hosts, list) or any(not isinstance(host, str) for host in hosts)
     ):
@@ -3372,6 +3505,7 @@ def check_gpu_processes(
 
 
 @mcp.tool()
+@_requires_active_policy
 def kill_gpu_process(
     host: str,
     pid: int,
@@ -3404,8 +3538,6 @@ def kill_gpu_process(
         Compact JSON describing the inspected target and whether a signal was sent.
     """
     _apply_test_controls_from_file()
-    if stale := _stale_policy_refusal():
-        return stale
     if isinstance(pid, bool):
         return json.dumps({
             "status": "refused",
@@ -3530,8 +3662,6 @@ def _manage_gpu_job_impl(
     are implemented in later ADR 0004 phases.
     """
     _apply_test_controls_from_file()
-    if stale := _stale_policy_refusal():
-        return stale
     if not isinstance(action, str):
         return _json_tool_response({
             "status": "refused",
@@ -3614,6 +3744,7 @@ def _manage_gpu_job_impl(
 
 
 @mcp.tool()
+@_requires_active_policy
 def manage_gpu_job(
     action: str = "status",
     job_id: Optional[str] = None,
@@ -3651,6 +3782,7 @@ def manage_gpu_job(
 
 
 @mcp.tool()
+@_requires_active_policy
 def list_gpu_reservations(scope: str = "mine", fresh: bool = False):
     """List active GPU reservations for recovery or diagnostics.
 
@@ -3658,8 +3790,6 @@ def list_gpu_reservations(scope: str = "mine", fresh: bool = False):
     stable read/report shape; stale inspection and cleanup are added later.
     """
     _apply_test_controls_from_file()
-    if stale := _stale_policy_refusal():
-        return stale
     if scope not in {"mine", "all"}:
         return _json_tool_response({
             "status": "refused",
@@ -3731,8 +3861,6 @@ def _run_python_on_gpu_impl(
         JSON managed job handle.
     """
     _apply_test_controls_from_file()
-    if stale := _stale_policy_refusal():
-        return stale
     if not HEARTBEAT_MANAGER.is_healthy():
         return _launch_refusal(
             "heartbeat manager is unhealthy; new launches are unsafe",
@@ -4147,6 +4275,7 @@ def _run_python_on_gpu_impl(
 
 
 @mcp.tool()
+@_requires_active_policy
 def run_python_on_gpu(
     host: str,
     gpu_index: int,
@@ -4194,14 +4323,13 @@ def run_python_on_gpu(
 
 
 @mcp.tool()
+@_requires_active_policy
 def cluster_info():
     """Get a quick overview of the entire cluster: which nodes are reachable, GPU counts, load.
 
     Returns:
         Summary table of all cluster nodes.
     """
-    if stale := _stale_policy_refusal():
-        return stale
     gpu_query = (
         "nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total "
         "--format=csv,noheader,nounits"

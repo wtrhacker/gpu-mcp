@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import io
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,6 +22,14 @@ class GpuMcpPolicy:
     allowed_gpu_names: tuple[str, ...]
     min_free_memory_mib: int
     sync_timeout_sec: int
+
+
+@dataclass(frozen=True)
+class PolicySnapshot:
+    """A policy parsed and hashed from one immutable byte snapshot."""
+
+    policy: GpuMcpPolicy
+    content_hash: str
 
 
 def _inside(path: Path, root: Path) -> bool:
@@ -83,7 +93,8 @@ def _validate_roots(
     return roots
 
 
-def load_policy(config_path: str | Path) -> GpuMcpPolicy:
+def load_policy_snapshot(config_path: str | Path) -> PolicySnapshot:
+    """Read, validate, and hash a policy without a parse/hash race."""
     config = Path(config_path).expanduser()
     if not config.is_absolute():
         raise ConfigError("--config path must be absolute")
@@ -93,11 +104,14 @@ def load_policy(config_path: str | Path) -> GpuMcpPolicy:
     if not config.exists():
         raise ConfigError(f"config file does not exist: {config}")
 
-    with config.open("rb") as fh:
-        try:
-            raw = tomllib.load(fh)
-        except tomllib.TOMLDecodeError as exc:
-            raise ConfigError(f"config file is invalid TOML: {exc}") from exc
+    try:
+        contents = config.read_bytes()
+    except OSError as exc:
+        raise ConfigError(f"could not read config file: {config}: {exc}") from exc
+    try:
+        raw = tomllib.load(io.BytesIO(contents))
+    except tomllib.TOMLDecodeError as exc:
+        raise ConfigError(f"config file is invalid TOML: {exc}") from exc
 
     if raw.get("schema_version") != 1:
         raise ConfigError("schema_version must be 1")
@@ -138,7 +152,7 @@ def load_policy(config_path: str | Path) -> GpuMcpPolicy:
     if not output_roots:
         raise ConfigError("output_roots must not be empty")
 
-    return GpuMcpPolicy(
+    policy = GpuMcpPolicy(
         config_path=config,
         repo_root=repo_root,
         nodes=nodes,
@@ -155,3 +169,11 @@ def load_policy(config_path: str | Path) -> GpuMcpPolicy:
             name="sync_timeout_sec",
         ),
     )
+    return PolicySnapshot(
+        policy=policy,
+        content_hash=hashlib.sha256(contents).hexdigest(),
+    )
+
+
+def load_policy(config_path: str | Path) -> GpuMcpPolicy:
+    return load_policy_snapshot(config_path).policy

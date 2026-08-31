@@ -15,10 +15,15 @@ import gpu_mcp_reservations as reservations
 from gpu_mcp_policy_approval import PolicyApprovalError, verify_policy_approved
 
 MAX_POLICY_SEARCH_DEPTH = 32
-ALLOWED_STALE_TOOL_SUFFIXES = (
+POLICY_RECOVERY_TOOL_LEAVES = (
     "preview_policy_reload",
     "reload_policy",
     "reject_policy_reload",
+)
+ALLOWED_POLICY_RECOVERY_TOOL_NAMES = frozenset(
+    tuple(f"mcp__gpu_cluster_mcp__{name}" for name in POLICY_RECOVERY_TOOL_LEAVES)
+    + tuple(f"mcp__gpu-cluster-mcp__{name}" for name in POLICY_RECOVERY_TOOL_LEAVES)
+    + tuple(f"gpu-cluster-mcp/{name}" for name in POLICY_RECOVERY_TOOL_LEAVES)
 )
 POLICY_EDIT_TOOL_NAMES = {"Edit", "MultiEdit"}
 PATCH_TOOL_NAMES = {"functions.apply_patch", "apply_patch"}
@@ -45,6 +50,18 @@ HOOK_MESSAGE = (
     "Only edit gpu-mcp.toml while stale after explicit human rejection or "
     "cancellation of the prior candidate and explicit human re-orientation "
     "to the next candidate edit."
+)
+
+POLICY_BOOTSTRAP_MESSAGE = (
+    "gpu-mcp.toml has not been activated yet. GPU MCP normal work is quarantined.\n\n"
+    "Call preview_policy_reload and show the human the complete raw preview, "
+    "including candidate_summary, diff_summary, and hashes. Call reload_policy "
+    "only after explicit human approval.\n\n"
+    "If the recovery tools are not visible yet, create or repair only this repo's "
+    ".codex/config.toml registration, then ask the human to start or restart Codex "
+    "from this trusted repo. This exception limits the path, not the TOML contents, "
+    "so the human must inspect the complete config before restarting. Do not use "
+    "gpu_mcp_doctor.py approve-policy as an agent-side shortcut."
 )
 
 POLICY_SYMLINK_MESSAGE = (
@@ -85,7 +102,12 @@ def _is_policy_file_edit(
     return _path_matches_policy(raw_path, policy_path=policy_path)
 
 
-def _path_matches_policy(raw_path: object, *, policy_path: Path) -> bool:
+def _path_matches_policy(
+    raw_path: object,
+    *,
+    policy_path: Path,
+    relative_to: Path | None = None,
+) -> bool:
     if not isinstance(raw_path, str) or not raw_path:
         return False
     if policy_path.is_symlink():
@@ -93,7 +115,7 @@ def _path_matches_policy(raw_path: object, *, policy_path: Path) -> bool:
     try:
         target = Path(raw_path).expanduser()
         if not target.is_absolute():
-            target = (policy_path.parent / target).resolve()
+            target = ((relative_to or policy_path.parent) / target).resolve()
         else:
             target = target.resolve()
     except OSError:
@@ -126,6 +148,47 @@ def _is_policy_patch_edit(
     )
 
 
+def _is_bootstrap_codex_config_edit(
+    tool_name: str,
+    tool_input: object,
+    *,
+    policy_path: Path,
+) -> bool:
+    """Allow only the repo MCP registration file to be repaired before activation."""
+    codex_config = policy_path.parent / ".codex" / "config.toml"
+    if (policy_path.parent / ".codex").is_symlink() or codex_config.is_symlink():
+        return False
+    if tool_name in POLICY_EDIT_TOOL_NAMES and isinstance(tool_input, dict):
+        raw_path = tool_input.get("file_path") or tool_input.get("path")
+        return _path_matches_policy(
+            raw_path,
+            policy_path=codex_config,
+            relative_to=policy_path.parent,
+        )
+    if tool_name not in PATCH_TOOL_NAMES:
+        return False
+    if isinstance(tool_input, dict):
+        patch = tool_input.get("patch") or tool_input.get("cmd") or tool_input.get("command")
+    else:
+        patch = tool_input
+    if not isinstance(patch, str) or not patch:
+        return False
+    touched: list[str] = []
+    for line in patch.splitlines():
+        if line.startswith(("*** Delete File: ", "*** Move to: ")):
+            return False
+        if line.startswith(("*** Add File: ", "*** Update File: ")):
+            touched.append(line.split(": ", 1)[1].strip())
+    return bool(touched) and all(
+        _path_matches_policy(
+            path,
+            policy_path=codex_config,
+            relative_to=policy_path.parent,
+        )
+        for path in touched
+    )
+
+
 def check_policy_drift(
     cwd: str | Path,
     *,
@@ -138,14 +201,22 @@ def check_policy_drift(
         return None
     if policy_path.is_symlink():
         return _hook_block(POLICY_SYMLINK_MESSAGE, policy_path=policy_path)
-    if any(tool_name.endswith(suffix) for suffix in ALLOWED_STALE_TOOL_SUFFIXES):
+    if tool_name in ALLOWED_POLICY_RECOVERY_TOOL_NAMES:
         return None
     try:
         verify_policy_approved(policy_path, store_path=store_path)
-    except PolicyApprovalError:
+    except PolicyApprovalError as exc:
         if _is_policy_file_edit(tool_name, tool_input, policy_path=policy_path):
             return None
-        return _hook_block(HOOK_MESSAGE, policy_path=policy_path)
+        initial_bootstrap = str(exc).startswith("policy is not approved:")
+        if initial_bootstrap and _is_bootstrap_codex_config_edit(
+            tool_name,
+            tool_input,
+            policy_path=policy_path,
+        ):
+            return None
+        message = POLICY_BOOTSTRAP_MESSAGE if initial_bootstrap else HOOK_MESSAGE
+        return _hook_block(message, policy_path=policy_path)
     return None
 
 

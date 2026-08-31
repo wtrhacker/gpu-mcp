@@ -7,17 +7,32 @@ preview/reload, hook behavior, and the remaining human-facing checks.
 
 ## The Core State Machine
 
-The active MCP server keeps one policy in memory. Editing `gpu-mcp.toml` on disk
-does not automatically change that active policy.
+The MCP server has two fail-closed starting states. An exact approved hash starts
+active. A missing, invalid, unapproved, or changed startup file starts
+`bootstrap_pending`: the MCP recovery surface exists, but one central capability
+gate refuses every operational tool before side effects.
 
-The tested flow is:
+The first-policy flow is:
+
+```text
+no approved active policy
+  -> MCP starts in bootstrap quarantine
+  -> operational tools refuse without SSH/process/reservation/job work
+  -> preview_policy_reload validates and returns active_hash=null,
+     complete candidate_summary, diff_summary, hash, and token
+  -> human approves the raw preview
+  -> reload_policy(token) records and activates exactly that hash
+  -> normal GPU tools become usable
+```
+
+The established-policy edit flow remains:
 
 ```text
 approved active policy
   -> gpu-mcp.toml changes on disk
   -> normal GPU tools refuse as stale
   -> preview_policy_reload validates and returns raw preview output:
-     diff_summary, hashes, and a token
+     candidate_summary, diff_summary, hashes, and a token
   -> human approves reload
   -> reload_policy(token) activates exactly the previewed hash
   -> normal GPU tools work again
@@ -43,10 +58,13 @@ without real Codex, SSH, or GPUs.
 
 What it proves:
 
-- an unapproved policy file is rejected at startup;
+- an unapproved, missing, or invalid first policy starts in quarantine;
+- every operational tool shares a side-effect-free bootstrap gate;
+- initial preview reports `active_hash=null` and the complete candidate summary;
+- initial reject and activation behavior preserve one-time token semantics;
 - an approved policy file can start the server;
-- `preview_policy_reload` returns active hash, candidate hash, diff summary,
-  raw agent instructions, and a one-time reload token;
+- `preview_policy_reload` returns active hash, candidate hash, candidate summary,
+  diff summary, raw agent instructions, and a one-time reload token;
 - invalid policy changes produce a validation error and no token;
 - `reload_policy` refuses invalid, expired, or already-used tokens;
 - `reload_policy` refuses if `gpu-mcp.toml` changes after preview, because the
@@ -63,7 +81,6 @@ Recent focused run:
 
 ```text
 pytest -q test/test_gpu_mcp_policy_reload_contract.py
-passed as part of: 21 passed with the hook contract tests
 ```
 
 ## Modality 2: Deterministic Hook Contracts
@@ -87,8 +104,13 @@ What it proves:
   `preview_policy_reload`;
 - the message now treats preview as part of the recovery flow, not as a separate
   human approval checkpoint;
-- the hook allows `preview_policy_reload`, `reload_policy`, and
-  `reject_policy_reload` to run while stale so the agent can recover;
+- the hook allows exact canonical `preview_policy_reload`, `reload_policy`, and
+  `reject_policy_reload` names while stale or awaiting first activation;
+- spoofed tool names that merely end in a recovery suffix remain blocked;
+- a path-limited repo-local `.codex/config.toml` repair is allowed only during
+  first bootstrap so a policy-first installation can recover;
+- symlinked `.codex` paths are rejected, and the human must inspect the full
+  config contents before trusting or restarting the repo;
 - the hook allows a narrow direct edit of `gpu-mcp.toml` while stale, so a
   rejected inactive candidate can be replaced without activating it first;
 - when the policy file is approved, the hook emits no replacement JSON.
@@ -97,7 +119,6 @@ Recent focused run:
 
 ```text
 pytest -q test/test_gpu_mcp_policy_hook_contract.py test/test_gpu_mcp_policy_reload_contract.py
-21 passed
 ```
 
 ## Modality 3: Interactive Hook And Reload Walkthrough

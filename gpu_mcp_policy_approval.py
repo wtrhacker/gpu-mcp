@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from gpu_mcp_config import GpuMcpPolicy, load_policy
+from gpu_mcp_config import ConfigError, GpuMcpPolicy, load_policy_snapshot
 
 
 class PolicyApprovalError(ValueError):
@@ -59,11 +59,21 @@ def approve_policy(
     store_path: str | Path | None = None,
     diff_summary: list[str] | None = None,
     approved_by: str = "human",
+    expected_hash: str | None = None,
 ) -> dict[str, Any]:
+    """Record approval only for the exact current validated policy snapshot."""
     store = Path(store_path).expanduser() if store_path is not None else default_store_path()
     store = store.resolve()
     config_path = str(policy.config_path.resolve())
-    current_hash = policy_file_hash(policy.config_path)
+    try:
+        snapshot = load_policy_snapshot(policy.config_path)
+    except ConfigError as exc:
+        raise PolicyApprovalError(f"policy cannot be approved: {exc}") from exc
+    if snapshot.policy != policy:
+        raise PolicyApprovalError("policy changed after it was loaded; load it again before approval")
+    if expected_hash is not None and snapshot.content_hash != expected_hash:
+        raise PolicyApprovalError("policy changed after preview; approval was not recorded")
+    current_hash = snapshot.content_hash
     data = _load_store(store)
     entry = data.get(config_path)
     if not isinstance(entry, dict):
@@ -76,7 +86,7 @@ def approve_policy(
         "hash": current_hash,
         "approved_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
         "approved_by": approved_by,
-        "summary": policy_summary(policy),
+        "summary": policy_summary(snapshot.policy),
         "diff_summary": list(diff_summary or []),
     }
     history.append(event)
@@ -93,6 +103,7 @@ def verify_policy_approved(
     config_path: str | Path,
     *,
     store_path: str | Path | None = None,
+    expected_hash: str | None = None,
 ) -> dict[str, Any]:
     config = Path(config_path).expanduser().resolve()
     store = Path(store_path).expanduser() if store_path is not None else default_store_path()
@@ -101,7 +112,7 @@ def verify_policy_approved(
     entry = data.get(str(config))
     if not isinstance(entry, dict):
         raise PolicyApprovalError(f"policy is not approved: {config}")
-    current_hash = policy_file_hash(config)
+    current_hash = expected_hash if expected_hash is not None else policy_file_hash(config)
     approved_hash = entry.get("current_hash")
     if approved_hash != current_hash:
         raise PolicyApprovalError(f"policy changed since approval: {config}")
@@ -136,6 +147,10 @@ def load_and_verify_policy(
     *,
     store_path: str | Path | None = None,
 ) -> GpuMcpPolicy:
-    policy = load_policy(config_path)
-    verify_policy_approved(policy.config_path, store_path=store_path)
-    return policy
+    snapshot = load_policy_snapshot(config_path)
+    verify_policy_approved(
+        snapshot.policy.config_path,
+        store_path=store_path,
+        expected_hash=snapshot.content_hash,
+    )
+    return snapshot.policy
