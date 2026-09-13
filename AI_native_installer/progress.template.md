@@ -9,10 +9,11 @@ real evidence is doctor JSON output and test results.
 | Item | Value |
 |------|-------|
 | Research repo root | |
-| GPU MCP install path (e.g. `~/gpu-mcp`) | |
-| GPU MCP server path (e.g. `~/gpu-mcp/gpu_mcp_server.py`) | |
+| GPU MCP runtime root | |
+| GPU MCP server path (`<runtime>/gpu_mcp_server.py`) | |
 | Control host (where you are running) | |
-| Python executable used | |
+| Server Python executable | |
+| GPU job Python executable | |
 | MCP config path | |
 | Dedicated SSH key | `~/.ssh/gpu_mcp_key` (created by bootstrap) |
 | `tool_timeout_sec` | Must be > `sync_timeout_sec` (e.g. 360 vs 300) |
@@ -30,6 +31,10 @@ If no hosts are verified, stop and tell the human.
 ## Installation Checklist
 
 ### Human prerequisites
+- [ ] Human identified the exact installed runtime root and server Python
+- [ ] Verified the runtime files exist and server Python imports MCP SDK v1,
+  Fabric, and Paramiko
+- [ ] Confirmed the research repo root with the human
 - [ ] Human ran SSH bootstrap with explicit hostnames or `--hosts-file`
 - [ ] Read bootstrap inventory and found at least one verified non-local host
 
@@ -70,8 +75,11 @@ If no hosts are verified, stop and tell the human.
 
 ### Verification
 - [ ] Verified raw remote command blocking (SSH, scp, rsync, codex spawn)
-- [ ] Ran full doctor check with `--json`, all required checks passed
-- [ ] Ran full battlefield suite and it passed
+- [ ] Ran focused installation test with explicit runtime/Python paths
+- [ ] Ran doctor check with `--json`; required local checks passed and any
+  skipped live checks were reported honestly
+- [ ] If requested, ran a harmless live GPU launch proof on an explicit host
+- [ ] Did not treat the maintainer battlefield suite as a normal install step
 - [ ] Verified managed-job hook reminders and status continuation work
 - [ ] Updated this progress file
 
@@ -101,7 +109,8 @@ List anything that stopped or slowed the install:
 | Test | Command | Result | Notes |
 |------|---------|--------|-------|
 | Doctor JSON | `gpu_mcp_doctor.py check --config ... --json` | | |
-| Battlefield | `GPU_MCP_RUN_REAL_BATTLEFIELD_TESTS=1 pytest ...` | | |
+| Focused install | `installation_test.py --repo ... --mcp-root ... --python ... --json` | | |
+| Optional live launch | `installation_test.py ... --live-gpu --host ...` | | |
 
 ## Notes
 
