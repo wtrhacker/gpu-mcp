@@ -85,6 +85,13 @@ grace. Persistent identity failures retry every thirty seconds; late result
 reads remain independent of that deadline. The monitor shows uncertainty while
 recovery is pending. A persistent problem then produces one owner alert; a
 verified job failure keeps its normal notification. No timeout frees a GPU.
+
+For a finished SSH job, a missing local result also triggers a bounded read on
+the execution host. The result must match the saved job, attempt, host, GPU,
+reservation and PID. This handles a delayed control-side filesystem view without
+rerunning successful work. Invalid or unavailable results remain uncertain;
+SSH verification continues with bounded retries. Reconciliation clears old
+uncertainty text and updates the process observation used by log diagnostics.
 Launch tools accept an optional, single-line `job_title` of at most 120
 characters, such as “Learning-rate sweep, seed 3”. This labels the human view;
 it does not alter the command, polling, permissions or scientific outcome.

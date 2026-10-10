@@ -90,6 +90,7 @@ Existing-repo upgrades and slow shared HTTP calls have focused regressions:
 ```bash
 pytest -q test/test_gpu_mcp_codex_upgrade.py test/test_gpu_mcp_codex_concurrency.py
 pytest -q test/test_gpu_mcp_restart_recovery.py
+pytest -q test/test_gpu_mcp_remote_outcomes.py
 ```
 
 They use temporary registrations, policies and jobs. They check preserved
@@ -97,6 +98,9 @@ approvals and active GPU/CPU job refusal, and reproduce health starvation while
 another request is doing slow work. They do not launch models, SSH or GPU jobs.
 The restart cases also check completed-orphan cleanup and saved terminal state
 through fresh direct/shared servers, including transaction and identity races.
+The producer-read cases model a negative control-side lookup after the execution
+host has published its result. They verify the generated reader locally and
+never connect to SSH or launch GPU work.
 
 The `/monitor` frontend has focused local checks in
 `test/test_gpu_mcp_codex_cli.py`. A separate native case verifies that a human

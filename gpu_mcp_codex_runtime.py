@@ -356,7 +356,8 @@ class CodexRuntime:
             if uncertain and not changed_outcome:
                 if self._verification_retry_after.get(signature_key, 0) > time.monotonic():
                     continue
-                if state == 'process_gone_unknown_outcome' and self.verification_age(record) >= VERIFICATION_GRACE_SEC:
+                if (state == 'process_gone_unknown_outcome' and self.verification_age(record) >= VERIFICATION_GRACE_SEC
+                        and record.get('launch_mode') != 'ssh'):
                     continue  # Local result reads continue; an already-gone process need not be checked repeatedly.
             if state in TERMINAL_STATES and self._release_after.get(signature_key, 0) > time.monotonic() and not changed_outcome:
                 continue

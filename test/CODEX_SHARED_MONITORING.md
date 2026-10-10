@@ -15,6 +15,7 @@ fixtures or required inputs to this suite.
 | `test_gpu_mcp_codex_state.py` | Native identity, immutable ownership, GPU/CPU result-event transactions, injected event-write failure, restart persistence, attempt conflicts and per-job locks. |
 | `test_gpu_mcp_codex_shared.py` | Real server tools with controlled process facts: foreign reads/mutations, listings, smoke/PID boundaries, fixed stale timing, quiet checks, result-before-release, CPU builds, concurrency, policy drift and scoped alerts. |
 | `test_gpu_mcp_restart_recovery.py` | Fresh server imports with old completed GPU jobs: direct/shared status, automatic owner recovery, cached results, missing/replaced bookings, fresh/alive/uncertain reservations, transaction failures, locked identity races and a new booking's heartbeat after recovery. |
+| `test_gpu_mcp_remote_outcomes.py` | Independent producer/control filesystem views, bounded execution-host reads, result identity checks, unavailable replies, regular-file constraints, retries after alert grace and current process diagnostics. |
 | `test_gpu_mcp_codex_delivery.py` | Queued delivery shape, archived/unloaded threads, acknowledgement reconciliation, private success/visible failure instructions and display adaptation. |
 | `test_gpu_mcp_codex_transport.py` | Actual localhost backends and stdio gateways, automatic reuse, separate repo identity, native request metadata, agent/human authentication, read-only snapshots and PTY monitor closure. |
 | `test_gpu_mcp_codex_concurrency.py` | A slow synchronous tool or human snapshot cannot block health/other calls; native caller context and tool schemas survive HTTP offloading. |
@@ -41,6 +42,7 @@ re-imports. It launches no models, GPU computation or SSH work:
 
 ```bash
 pytest -q test/test_gpu_mcp_restart_recovery.py
+pytest -q test/test_gpu_mcp_remote_outcomes.py
 ```
 
 It covers both legacy JSON persistence and the shared backend's protected

@@ -2087,6 +2087,12 @@ def _read_outcome_record(job_record: dict) -> dict | None:
         )
     except Exception:
         return None
+    return _matching_outcome_record(job_record, outcome)
+
+
+def _matching_outcome_record(job_record: dict, outcome: object) -> dict | None:
+    job_id = job_record.get("job_id")
+    attempt_id = job_record.get("active_attempt_id")
     if not isinstance(outcome, dict):
         return None
     if outcome.get("job_id") != job_id or outcome.get("attempt_id") != attempt_id:
@@ -2107,6 +2113,42 @@ def _read_outcome_record(job_record: dict) -> dict | None:
     if outcome.get("terminal_status") not in {"success", "failure", "signaled", "launcher_error"}:
         return None
     return outcome
+
+
+def _read_execution_host_outcome(job_record: dict) -> dict | None:
+    """Read a finished SSH job's exact result through its producer's file view.
+
+    A control-side NFS lookup may remain negative after the producer published
+    its result. This is a bounded internal read, never an agent-supplied command.
+    Call only after proving that the original process is gone.
+    """
+    host = job_record.get("host")
+    pid = job_record.get("remote_pid")
+    if (job_record.get("launch_mode") != "ssh" or not isinstance(host, str)
+            or not _is_allowed_host(host) or _is_local_host(host)
+            or not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0
+            or not reservations.is_job_id(job_record.get("job_id"))
+            or not reservations.is_attempt_id(job_record.get("active_attempt_id"))):
+        return None
+    path = reservations.outcome_record_path(REPO_ROOT, job_record["job_id"], job_record["active_attempt_id"])
+    reader = (
+        "import json,os,stat,sys\n"
+        "fd=os.open(sys.argv[1],os.O_RDONLY|getattr(os,'O_NOFOLLOW',0)|getattr(os,'O_NONBLOCK',0))\n"
+        "with os.fdopen(fd,'r') as f:\n"
+        " s=os.fstat(f.fileno())\n"
+        " if not stat.S_ISREG(s.st_mode) or s.st_size>65536: raise ValueError('invalid outcome file')\n"
+        " data=f.read(65537)\n"
+        " if len(data.encode('utf-8'))>65536: raise ValueError('outcome too large')\n"
+        " print(json.dumps(json.loads(data)))\n"
+    )
+    command = shlex.join([PYTHON, "-c", reader, str(path)])
+    try:
+        raw = _host_run(host, command, timeout=3)
+        if not isinstance(raw, str) or len(raw) > 1024 * 1024:
+            return None
+        return _matching_outcome_record(job_record, json.loads(raw))
+    except Exception:
+        return None
 
 
 def _job_lifecycle_from_outcome(outcome: dict | None) -> str | None:
@@ -3098,7 +3140,8 @@ def _job_status_response(
                 job_lifecycle = "launch_outcome_unknown"
                 reason = inspection.get("reason", "job inspection is uncertain")
             if inspection["status"] == "gone":
-                outcome = _read_outcome_record(job_record) or local_outcome
+                outcome = (_read_outcome_record(job_record) or local_outcome
+                           or _read_execution_host_outcome(job_record))
                 terminal_lifecycle = _job_lifecycle_from_outcome(outcome)
                 if terminal_lifecycle is None:
                     job_lifecycle = "process_gone_unknown_outcome"
@@ -3106,11 +3149,13 @@ def _job_status_response(
                         reason = "Process is gone; its verified final result is not available yet."
                 else:
                     job_lifecycle = terminal_lifecycle
+    if CODEX_RUNTIME is not None and remote_inspection_performed:
+        job_record = dict(job_record, last_process_observation=dict(process))
     if terminal_lifecycle is not None:
         job_lifecycle = terminal_lifecycle
         if job_record.get("repo_local_record", True):
             job_record = dict(job_record, job_lifecycle=terminal_lifecycle, outcome=outcome,
-                              active_reservation=active_reservation, next_poll_after=None,
+                              active_reservation=active_reservation, next_poll_after=None, reason="",
                               last_status_checked_at=reservations.iso_timestamp())
             # Save completion (and the shared owner event) before either owned
             # release or recovery of a stale reservation from an older server.

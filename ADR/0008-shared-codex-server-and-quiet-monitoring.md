@@ -220,6 +220,13 @@ late result reads continue independently of the normal polling interval. Keep
 uncertainty visible in the monitor immediately, but allow recovery before waking
 the agent with an uncertainty alert. Actual job failures are not delayed. Grace
 expiry does not prove success, failure or permission to release a GPU.
+For SSH jobs whose original process is proven gone, an unavailable control-side
+result triggers a bounded read of that attempt's outcome on the execution host.
+Validate the same job, attempt, host, GPU, reservation and PID fields before
+committing it. This avoids waiting for a control-side NFS lookup to refresh.
+Unavailable or invalid replies retain uncertainty and its existing retry/alert
+rules. Successful reconciliation clears stale uncertainty text and saves the
+latest process observation for subsequent diagnostics.
 
 ### Private events and visible alerts
 
