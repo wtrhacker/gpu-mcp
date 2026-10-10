@@ -8,10 +8,12 @@ import json
 import os
 import sys
 import time
+import tomllib
 from datetime import datetime, timezone
 from pathlib import Path
 
 import gpu_mcp_reservations as reservations
+from gpu_mcp_builds import records_for_repo
 from gpu_mcp_policy_approval import PolicyApprovalError, verify_policy_approved
 
 MAX_POLICY_SEARCH_DEPTH = 32
@@ -36,6 +38,24 @@ TEST_STOP_STATE_ROOT_ENV = "GPU_MCP_TEST_STOP_STATE_ROOT"
 STOP_LOCAL_SCAN_INTERVAL_SEC = 1.0
 STOP_STATE_ROOT = Path.home() / "gpu-mcp" / "state" / "hook-stop"
 TERMINAL_JOB_LIFECYCLES = {"succeeded", "failed", "finished"}
+
+
+def _shared_codex_mode(repo_root: Path) -> bool:
+    """The shared backend owns polling and delivery; retain policy hooks only."""
+    path = repo_root / ".codex" / "config.toml"
+    try:
+        reservations._assert_no_symlink_ancestors(path)
+        with path.open("rb") as config:
+            raw = tomllib.load(config)
+        server = raw.get("mcp_servers", {}).get("gpu-cluster-mcp", {})
+        args = [str(arg) for arg in server.get("args", [])]
+        if server.get("enabled", True) is False or "--config" not in args:
+            return False
+        policy = Path(args[args.index("--config") + 1]).resolve()
+        return (policy == repo_root / "gpu-mcp.toml" and
+                any(Path(arg).name == "gpu_mcp_codex_launcher.py" for arg in args))
+    except (OSError, ValueError, IndexError, TypeError):
+        return False
 
 
 HOOK_MESSAGE = (
@@ -268,6 +288,12 @@ def _iso_hook_time(value: datetime) -> str:
 
 
 def _reservation_metadata_for_record(record: dict) -> dict | None:
+    if record.get("job_kind") == "build":
+        for authoritative in records_for_repo(record.get("repo_root", "")):
+            if all(authoritative.get(key) == record.get(key) for key in
+                   ("job_id", "active_attempt_id", "server_instance_id", "nonce")):
+                return dict(authoritative, repo=authoritative["repo_root"])
+        return None
     reservation_key = record.get("reservation_key")
     if not reservations.is_reservation_key(reservation_key):
         return None
@@ -289,6 +315,21 @@ def _reservation_metadata_for_record(record: dict) -> dict | None:
     ):
         return None
     return metadata
+
+
+def _managed_records(repo_root: Path):
+    """Build records come from authority; ordinary GPU records keep their source."""
+    jobs_root = reservations.repo_job_state_root(repo_root)
+    builds = records_for_repo(repo_root)
+    build_ids = {record["job_id"] for record in builds}
+    if jobs_root.exists() and not jobs_root.is_symlink():
+        for job_dir in sorted(jobs_root.glob("job-*")):
+            if job_dir.is_symlink() or not job_dir.is_dir() or job_dir.name in build_ids:
+                continue
+            record = _read_json_quiet(job_dir / "job.json")
+            if isinstance(record, dict) and record.get("job_kind") != "build" and record.get("job_id") == job_dir.name:
+                yield record
+    yield from builds
 
 
 def _poll_interval_sec(record: dict) -> int:
@@ -529,7 +570,7 @@ def check_gpu_job_reminders(
         return None
     repo_root = policy_path.parent.resolve()
     jobs_root = reservations.repo_job_state_root(repo_root)
-    if not jobs_root.exists() or jobs_root.is_symlink():
+    if _shared_codex_mode(repo_root):
         return None
     current = now or _hook_now(env=env)
     targeted_job_id, targeted_reservation_key = _targeted_status_call(
@@ -538,22 +579,15 @@ def check_gpu_job_reminders(
     )
     reminder_records: list[tuple[dict, datetime | None, str]] = []
 
-    for job_dir in sorted(jobs_root.glob("job-*")):
-        if job_dir.is_symlink() or not job_dir.is_dir():
-            continue
-        job_file = job_dir / "job.json"
-        record = _read_json_quiet(job_file)
-        if not isinstance(record, dict):
-            continue
+    for record in _managed_records(repo_root):
         job_id = record.get("job_id")
         attempt_id = record.get("active_attempt_id")
         next_poll_after = record.get("next_poll_after")
         due_at = _parse_hook_time(next_poll_after)
         if (
             not reservations.is_job_id(job_id)
-            or job_dir.name != job_id
             or not reservations.is_attempt_id(attempt_id)
-            or record.get("active_reservation", True) is False
+            or (record.get("job_kind") != "build" and record.get("active_reservation", True) is False)
             or record.get("job_lifecycle") in TERMINAL_JOB_LIFECYCLES
         ):
             continue
@@ -682,24 +716,18 @@ def _claim_stop_events(
 
 
 def _stop_job_candidates(repo_root: Path) -> list[dict]:
-    jobs_root = reservations.repo_job_state_root(repo_root)
-    if not jobs_root.exists() or jobs_root.is_symlink():
+    if _shared_codex_mode(repo_root):
         return []
+    jobs_root = reservations.repo_job_state_root(repo_root)
 
     candidates: list[dict] = []
-    for job_dir in sorted(jobs_root.glob("job-*")):
-        if job_dir.is_symlink() or not job_dir.is_dir():
-            continue
-        record = _read_json_quiet(job_dir / "job.json")
-        if not isinstance(record, dict):
-            continue
+    for record in _managed_records(repo_root):
         job_id = record.get("job_id")
         attempt_id = record.get("active_attempt_id")
         if (
             not reservations.is_job_id(job_id)
-            or job_dir.name != job_id
             or not reservations.is_attempt_id(attempt_id)
-            or record.get("active_reservation", True) is False
+            or (record.get("job_kind") != "build" and record.get("active_reservation", True) is False)
             or record.get("job_lifecycle") in TERMINAL_JOB_LIFECYCLES
         ):
             continue

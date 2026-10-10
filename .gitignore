@@ -14,11 +14,18 @@
 # Runtime logs and caches
 .gpu_mcp_logs/
 .gpu_mcp_runner/
+.gpu_mcp_state/
+/state/
+.pytest_cache/
 __pycache__/
 test/**/__pycache__/
 *.py[cod]
 test_mcp_repos/
 gpu-mcp-battlefield-pytest/
+
+# Local validation reports; reusable tests and guides remain versioned.
+*_RESULTS.md
+/test/*_REVIEW.md
 
 # Common local environment files
 .env

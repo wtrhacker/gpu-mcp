@@ -17,7 +17,9 @@ from pathlib import Path
 from typing import Optional
 
 import gpu_mcp_guard
+import gpu_mcp_builds
 import gpu_mcp_reservations as reservations
+from gpu_mcp_codex_state import STALE_AFTER_SEC
 from gpu_mcp_config import ConfigError, GpuMcpPolicy, load_policy_snapshot
 from gpu_mcp_policy_approval import (
     PolicyApprovalError,
@@ -50,6 +52,21 @@ def _pop_config_arg(argv: list[str]) -> str:
 
 
 GPU_MCP_CONFIG_PATH = _pop_config_arg(sys.argv)
+CODEX_RUNTIME = None
+CODEX_RUNTIME_ROOT = None
+CODEX_LISTEN_FD = None
+if "--codex-shared" in sys.argv:
+    sys.argv.remove("--codex-shared")
+    for flag in ("--runtime-root", "--listen-fd"):
+        if flag not in sys.argv:
+            raise SystemExit(f"{flag} is required for the shared Codex backend")
+        index = sys.argv.index(flag)
+        value = sys.argv[index + 1]
+        del sys.argv[index:index + 2]
+        if flag == "--runtime-root":
+            CODEX_RUNTIME_ROOT = Path(value).resolve()
+        else:
+            CODEX_LISTEN_FD = int(value)
 POLICY_CONFIG_PATH = Path(GPU_MCP_CONFIG_PATH).expanduser()
 TEST_POLICY_APPROVAL_STORE_ENV = "GPU_MCP_TEST_POLICY_APPROVAL_STORE"
 GPU_MCP_TEST_DISABLE_POLICY_APPROVAL = (
@@ -141,6 +158,8 @@ def _apply_policy(policy: GpuMcpPolicy) -> None:
     global APPROVED_SCRIPT_ROOTS, APPROVED_WRITE_ROOTS, APPROVED_OUTPUT_ROOTS
     global GPU_MCP_WRITE_ROOTS_RAW, SYNC_TIMEOUT_SEC
 
+    if CODEX_RUNTIME is not None:
+        CODEX_RUNTIME.validate_policy(policy)
     CONFIG_POLICY = policy
     REPO_ROOT = policy.repo_root
     NODES = list(policy.nodes)
@@ -273,9 +292,25 @@ def _requires_active_policy(func):
     def guarded(*args, **kwargs):
         if refusal := _stale_policy_refusal():
             return refusal
+        if CODEX_RUNTIME is not None:
+            return CODEX_RUNTIME.invoke(func, args, kwargs)
         return func(*args, **kwargs)
 
     return guarded
+
+
+def _codex_request(func):
+    """Scope bootstrap/reload calls too, without changing the policy gate."""
+    @functools.wraps(func)
+    def guarded(*args, **kwargs):
+        if CODEX_RUNTIME is not None:
+            return CODEX_RUNTIME.invoke(func, args, kwargs)
+        return func(*args, **kwargs)
+    return guarded
+
+
+def _register_codex_job(record):
+    return CODEX_RUNTIME.register(record) if CODEX_RUNTIME is not None else record
 
 
 def _short_host(host: str) -> str:
@@ -499,8 +534,9 @@ def _prepare_output_parent(path: Path) -> None:
 def _validate_output_path(output_file: Optional[str]) -> Path:
     """Validate output path for remote stdout/stderr redirection."""
     if output_file is None:
+        suffix = "_" + secrets.token_hex(8) if CODEX_RUNTIME is not None else ""
         return _resolve_under(
-            str(APPROVED_OUTPUT_ROOTS[0] / f"gpu_python_job_{int(time.time())}.log"),
+            str(APPROVED_OUTPUT_ROOTS[0] / f"gpu_python_job_{int(time.time())}{suffix}.log"),
             APPROVED_OUTPUT_ROOTS,
             "output_file",
             must_exist=False,
@@ -888,6 +924,10 @@ def _launch_handle_response(
     job_role_defaulted: bool | None = None,
     cadence_basis: dict | None = None,
 ) -> str:
+    if CODEX_RUNTIME is not None and status == "launch_outcome_unknown":
+        record = CODEX_RUNTIME.read(job_id)
+        if record is not None and record.get("active_attempt_id") == attempt_id:
+            _write_repo_job_record(dict(record, job_lifecycle="launch_outcome_unknown", reason=reason))
     payload = {
         "status": status,
         "reason": reason,
@@ -930,40 +970,83 @@ class HeartbeatManager:
         self._thread: threading.Thread | None = None
         self._owned: dict[str, dict[str, object]] = {}
         self._unhealthy_reason = ""
+        self._forced_unhealthy_reason = ""
+        self._checkins: dict[tuple[str, str], dict[str, object]] = {}
         self.force_write_failure_for_tests = False
 
     def register(self, reservation_key_value: str, *, interval_sec: int) -> None:
         with self._lock:
+            identity = None
+            try:
+                path = reservations.reservation_dir(reservations.reservation_registry_root(), reservation_key_value) / "metadata.json"
+                metadata = reservations.read_json_file_no_follow(path)
+                if metadata.get("server_instance_id") == SERVER_INSTANCE_ID:
+                    identity = (metadata.get("job_id"), metadata.get("attempt_id"))
+            except (OSError, ValueError, AttributeError):
+                pass
             self._owned[reservation_key_value] = {
                 "interval_sec": interval_sec,
                 "last_attempt_monotonic": 0.0,
+                "last_success_at": None,
+                "error": "",
+                "identity": identity,
             }
+            if identity and all(identity):
+                self._checkins[identity] = {"last_success_at": None, "error": "", "active": True}
+                if len(self._checkins) > 1000:
+                    oldest = next((key for key, value in self._checkins.items() if not value['active']), None)
+                    if oldest is not None:
+                        self._checkins.pop(oldest)
             self._ensure_thread_locked()
 
     def unregister(self, reservation_key_value: str) -> None:
         with self._lock:
-            self._owned.pop(reservation_key_value, None)
+            item = self._owned.pop(reservation_key_value, None)
+            if item and item.get('identity') in self._checkins:
+                self._checkins[item['identity']]['active'] = False
 
     def owned_keys(self) -> list[str]:
         with self._lock:
             return sorted(self._owned)
 
-    def is_healthy(self) -> bool:
+    def is_healthy(self, reservation_key_value: str | None = None) -> bool:
         with self._lock:
+            if reservation_key_value is not None:
+                item = self._owned.get(reservation_key_value)
+                return not self._forced_unhealthy_reason and not (item['error'] if item else '')
             return not self._unhealthy_reason
 
-    def health_reason(self) -> str:
+    def health_reason(self, reservation_key_value: str | None = None) -> str:
         with self._lock:
+            if reservation_key_value is not None:
+                item = self._owned.get(reservation_key_value)
+                return self._forced_unhealthy_reason or str(item['error'] if item else 'reservation has no active check-in manager')
             return self._unhealthy_reason
+
+    def diagnostics(self, job_id: str, attempt_id: str) -> dict:
+        with self._lock:
+            return dict(self._checkins.get((job_id, attempt_id), {}))
+
+    def _record_checkin(self, key: str, *, timestamp: str | None = None, error: str = '') -> None:
+        item = self._owned[key]
+        if timestamp is not None:
+            item['last_success_at'] = timestamp
+        item['error'] = error
+        identity = item.get('identity')
+        if identity and all(identity):
+            self._checkins[identity] = {'last_success_at': item['last_success_at'], 'error': error, 'active': True}
 
     def mark_unhealthy_for_tests(self, reason: str = "test heartbeat failure") -> None:
         with self._lock:
             self._unhealthy_reason = reason
+            self._forced_unhealthy_reason = reason
 
     def clear_unhealthy_for_tests(self, *, prefix: str | None = None) -> None:
         with self._lock:
             if prefix is None or self._unhealthy_reason.startswith(prefix):
                 self._unhealthy_reason = ""
+            if prefix is None or self._forced_unhealthy_reason.startswith(prefix):
+                self._forced_unhealthy_reason = ""
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -978,13 +1061,17 @@ class HeartbeatManager:
             interval = int(self._owned[reservation_key_value]["interval_sec"])
             if self.force_write_failure_for_tests:
                 self._unhealthy_reason = "heartbeat write failed: test forced failure"
+                self._record_checkin(reservation_key_value, error=self._unhealthy_reason)
                 return False
+            timestamp = now or reservations.iso_timestamp()
             try:
-                self._write_heartbeat(reservation_key_value, interval_sec=interval, now=now)
+                self._write_heartbeat(reservation_key_value, interval_sec=interval, now=timestamp)
             except Exception as exc:
                 self._unhealthy_reason = f"heartbeat write failed: {exc}"
+                self._record_checkin(reservation_key_value, error=self._unhealthy_reason)
                 return False
             self._unhealthy_reason = ""
+            self._record_checkin(reservation_key_value, timestamp=timestamp)
             self._owned[reservation_key_value]["last_attempt_monotonic"] = time.monotonic()
             return True
 
@@ -1045,10 +1132,26 @@ class HeartbeatManager:
                 raise PermissionError("current server does not own this reservation")
             metadata.update(updates)
             reservations.atomic_write_json(metadata_path, metadata)
+            item = self._owned.get(reservation_key_value)
+            identity = (metadata.get('job_id'), metadata.get('attempt_id'))
+            if item and all(identity) and item.get('identity') != identity:
+                previous = self._checkins.get(item.get('identity'))
+                if previous:
+                    previous['active'] = False
+                item['identity'] = identity
+                item['last_success_at'] = None
 
 
 HEARTBEAT_MANAGER = HeartbeatManager()
 atexit.register(HEARTBEAT_MANAGER.stop)
+
+
+def _job_checkins_healthy(key: str | None = None) -> bool:
+    return HEARTBEAT_MANAGER.is_healthy(key if CODEX_RUNTIME is not None else None)
+
+
+def _job_checkins_reason(key: str | None = None) -> str:
+    return HEARTBEAT_MANAGER.health_reason(key if CODEX_RUNTIME is not None else None)
 
 
 def _shell_env_prefix(env_values: dict[str, str]) -> str:
@@ -1560,7 +1663,8 @@ def _reservation_age_fields(metadata: dict, *, now: datetime | None = None) -> d
     return {
         "heartbeat_age_sec": age,
         "heartbeat_interval_sec": interval,
-        "heartbeat_stale": age > interval * reservations.STALE_MULTIPLIER,
+        "heartbeat_stale": age > (STALE_AFTER_SEC if CODEX_RUNTIME is not None
+                                   else interval * reservations.STALE_MULTIPLIER),
     }
 
 
@@ -1629,7 +1733,7 @@ def _reservation_row_from_metadata(metadata: dict, *, key: str) -> dict:
         "owned_by_current_server": owned,
         "allowed_actions": (
             ["status", "stop", "retry", "finish"]
-            if owned and HEARTBEAT_MANAGER.is_healthy()
+            if owned and _job_checkins_healthy(key)
             else ["status"]
         ),
         "last_inspection": None,
@@ -1729,6 +1833,13 @@ def _inspect_reservation_process(metadata: dict) -> dict:
     precise fake process-table facts; production uses conservative ps/nvidia-smi
     probes and treats missing identity as unknown rather than available.
     """
+    if metadata.get("job_kind") == "build":
+        try:
+            observed = _build_manager().rpc("status", metadata["build_spec"])
+            return {"status": observed["state"], "reason": "build namespace inspection",
+                    "remote_pid": metadata.get("remote_pid")}
+        except Exception as exc:
+            return {"status": "unknown", "reason": str(exc), "remote_pid": metadata.get("remote_pid")}
     pid = metadata.get("remote_pid")
     host = metadata.get("host")
     if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
@@ -1783,7 +1894,7 @@ def _inspect_reservation_process(metadata: dict) -> dict:
             f"{shlex.quote(PYTHON)} -c "
             + shlex.quote(
                 "import os,sys;"
-                "p=f'/proc/{}/environ'.format(sys.argv[1]);"
+                "p='/proc/{}/environ'.format(sys.argv[1]);"
                 "data=open(p,'rb').read().split(b'\\0');"
                 "print(next((x.split(b'=',1)[1].decode() for x in data "
                 "if x.startswith(b'GPU_MCP_PROCESS_FINGERPRINT=')), ''))"
@@ -1808,7 +1919,9 @@ def _inspect_reservation_process(metadata: dict) -> dict:
                     "gpu_index": gpu_index,
                     "gpu_memory_mib": gpu_memory,
                 }
-            return {"status": "unknown", "reason": "process fingerprint could not be inspected", "remote_pid": pid}
+            detail = _host_run_error(host, env_cmd)
+            reason = "process fingerprint could not be inspected" + (": " + detail[:500] if detail else "")
+            return {"status": "unknown", "reason": reason, "remote_pid": pid}
         if observed_fingerprint.strip() != str(expected_fingerprint):
             return {"status": "gone", "reason": "process fingerprint mismatch", "remote_pid": pid}
     gpu_index, gpu_memory = _process_gpu_usage(host, pid, timeout=1)
@@ -1940,6 +2053,8 @@ def _empty_status_response(*, action: str, reason: str) -> str:
 
 
 def _read_repo_job_record(job_id: str) -> dict | None:
+    if CODEX_RUNTIME is not None:
+        return CODEX_RUNTIME.read(job_id)
     try:
         record = reservations.read_json_file_no_follow(reservations.job_record_path(REPO_ROOT, job_id))
     except Exception:
@@ -2007,6 +2122,11 @@ def _job_record_from_reservation_key(
     *,
     metadata: dict | None = None,
 ) -> dict | None:
+    if CODEX_RUNTIME is not None:
+        for record in CODEX_RUNTIME.records():
+            if record.get("reservation_key") == reservation_key_value:
+                return record
+        return None
     jobs_root = reservations.repo_job_state_root(REPO_ROOT)
     if not jobs_root.exists():
         return None
@@ -2035,7 +2155,8 @@ def _repo_reservation_candidates() -> list[dict]:
     registry_status, _registry_error, rows = _load_reservation_rows(scope="mine")
     if registry_status != "ok":
         return []
-    return [rows[key] for key in sorted(rows)]
+    return [rows[key] for key in sorted(rows)
+            if CODEX_RUNTIME is None or CODEX_RUNTIME.can_view(rows[key].get("job_id"))]
 
 
 def _resolve_job_target(job_id: str | None, reservation_key_value: str | None) -> tuple[dict | None, str, list[dict]]:
@@ -2127,10 +2248,15 @@ def _write_repo_job_record(job_record: dict) -> None:
     job_id = job_record.get("job_id")
     if not reservations.is_job_id(job_id):
         raise ValueError("job record has invalid job_id")
-    reservations.atomic_write_json(
-        reservations.job_record_path(REPO_ROOT, str(job_id)),
-        job_record,
-    )
+    if CODEX_RUNTIME is not None:
+        job_record = CODEX_RUNTIME.persist(job_record)
+    try:
+        reservations.atomic_write_json(reservations.job_record_path(REPO_ROOT, str(job_id)), job_record)
+    except OSError:
+        if CODEX_RUNTIME is None:
+            raise
+        # The protected transaction is authoritative. A failed display mirror
+        # cannot undo a saved completion or disable lifecycle management.
 
 
 def _signal_managed_process(metadata: dict, *, signal_name: str = "TERM") -> tuple[bool, str]:
@@ -2156,7 +2282,7 @@ def _owned_lifecycle_refusal(action: str, job_record: dict, reason: str, *, proc
         reservations.is_reservation_key(reservation_key_value)
         and str(reservation_key_value) in HEARTBEAT_MANAGER.owned_keys()
     )
-    healthy = HEARTBEAT_MANAGER.is_healthy()
+    healthy = _job_checkins_healthy(reservation_key_value)
     return _json_tool_response({
         "status": "refused",
         "action": action,
@@ -2166,7 +2292,7 @@ def _owned_lifecycle_refusal(action: str, job_record: dict, reason: str, *, proc
         "reservation_key": job_record.get("reservation_key"),
         "owned_by_current_server": owned,
         "heartbeat_manager_healthy": healthy,
-        "heartbeat_manager_reason": HEARTBEAT_MANAGER.health_reason(),
+        "heartbeat_manager_reason": _job_checkins_reason(reservation_key_value),
         "process": process,
         "allowed_actions": ["status", "stop", "retry", "finish"] if owned and healthy else ["status"],
         "server_instance_id": SERVER_INSTANCE_ID,
@@ -2686,8 +2812,16 @@ def _finish_owned_job(job_record: dict) -> str:
     reservation_key_value = str(metadata["reservation_key"])
     inspection = _inspect_reservation_process(metadata)
     if inspection["status"] == "gone":
-        HEARTBEAT_MANAGER.unregister(reservation_key_value)
+        if CODEX_RUNTIME is not None:
+            finished = dict(job_record, job_lifecycle="finished", next_poll_after=None)
+            _write_repo_job_record(finished)  # Result/event commit precedes resource release.
+        if CODEX_RUNTIME is None:
+            HEARTBEAT_MANAGER.unregister(reservation_key_value)
         removed, remove_reason = _remove_owned_finished_reservation(job_record, metadata)
+        if CODEX_RUNTIME is not None and removed:
+            HEARTBEAT_MANAGER.unregister(reservation_key_value)
+            job_record = dict(finished, active_reservation=False)
+            _write_repo_job_record(job_record)
         response = json.loads(_job_status_response(action="status", job_record=job_record))
         response.update({
             "status": "finished" if removed else "refused",
@@ -2864,6 +2998,7 @@ def _compact_not_due_response(*, action: str, job_record: dict, due_at: datetime
         "reservation_key": job_record.get("reservation_key"),
         "job_role": job_record.get("job_role"),
         "job_lifecycle": "running",
+        "last_status_checked_at": job_record.get("last_status_checked_at"),
         "poll_interval_sec": _job_poll_interval(job_record),
         "next_poll_after": job_record.get("next_poll_after"),
         "seconds_until_due": seconds_until_due,
@@ -2901,6 +3036,8 @@ def _job_status_response(
 ) -> str:
     early_reason = _nonempty_text(early_poll_reason)
     local_outcome = _read_outcome_record(job_record)
+    if CODEX_RUNTIME is not None:
+        local_outcome = local_outcome or job_record.get("outcome")
     if (
         action == "status"
         and allow_compact_early
@@ -2922,7 +3059,7 @@ def _job_status_response(
         _, _, rows = _load_reservation_rows(scope="all")
         reservation = rows.get(str(reservation_key_value))
     owned = bool(reservation and reservation.get("owned_by_current_server"))
-    healthy = HEARTBEAT_MANAGER.is_healthy()
+    healthy = _job_checkins_healthy(reservation_key_value)
     allowed_actions = (
         ["status", "stop", "retry", "finish", "update_cadence"]
         if owned and healthy
@@ -2936,36 +3073,61 @@ def _job_status_response(
     job_lifecycle = "running"
     outcome = local_outcome
     terminal_lifecycle = _job_lifecycle_from_outcome(outcome)
+    if CODEX_RUNTIME is not None:
+        job_lifecycle = terminal_lifecycle or "launch_outcome_unknown"
+        if job_record.get("job_lifecycle") == "finished":
+            job_lifecycle = "finished"
     metadata = None
     if not active_reservation:
-        if terminal_lifecycle is None:
+        if CODEX_RUNTIME is not None and job_record.get("job_lifecycle") == "finished":
+            job_lifecycle = "finished"
+        elif terminal_lifecycle is None:
             job_lifecycle = "process_gone_unknown_outcome"
         else:
             job_lifecycle = terminal_lifecycle
     if reservation is not None:
         metadata = _read_reservation_metadata(str(reservation_key_value))
-        if metadata is not None and isinstance(metadata.get("remote_pid"), int):
+        if metadata is not None and (CODEX_RUNTIME is not None or isinstance(metadata.get("remote_pid"), int)):
             inspection = _inspect_reservation_process(metadata)
             remote_inspection_performed = True
             process.update(inspection)
+            if CODEX_RUNTIME is not None and inspection["status"] == "alive" and terminal_lifecycle is None:
+                job_lifecycle = "running"
+            if CODEX_RUNTIME is not None and inspection["status"] == "unknown" and terminal_lifecycle is None:
+                job_lifecycle = "launch_outcome_unknown"
+                reason = inspection.get("reason", "job inspection is uncertain")
             if inspection["status"] == "gone":
                 outcome = _read_outcome_record(job_record)
                 terminal_lifecycle = _job_lifecycle_from_outcome(outcome)
                 if terminal_lifecycle is None:
                     job_lifecycle = "process_gone_unknown_outcome"
+                    if CODEX_RUNTIME is not None:
+                        reason = "Process is gone; its verified final result is not available yet."
                 else:
                     job_lifecycle = terminal_lifecycle
+    if CODEX_RUNTIME is not None and terminal_lifecycle is not None:
+        job_record = dict(job_record, job_lifecycle=terminal_lifecycle, outcome=outcome,
+                          next_poll_after=None, last_status_checked_at=reservations.iso_timestamp())
+        _write_repo_job_record(job_record)
     if (
         terminal_lifecycle is not None
         and active_reservation
         and owned
         and healthy
         and metadata is not None
+        and (CODEX_RUNTIME is None or process.get("status") == "gone")
     ):
         reservation_key_text = str(metadata["reservation_key"])
-        HEARTBEAT_MANAGER.unregister(reservation_key_text)
+        if CODEX_RUNTIME is not None:
+            job_record = dict(job_record, job_lifecycle=terminal_lifecycle, outcome=outcome,
+                              next_poll_after=None, last_status_checked_at=reservations.iso_timestamp())
+            _write_repo_job_record(job_record)
+        else:
+            HEARTBEAT_MANAGER.unregister(reservation_key_text)
         removed, _remove_reason = _remove_owned_finished_reservation(job_record, metadata)
         if removed:
+            if CODEX_RUNTIME is not None:
+                HEARTBEAT_MANAGER.unregister(reservation_key_text)
             now = reservations.iso_timestamp()
             updated = dict(job_record)
             updated["active_reservation"] = False
@@ -2978,7 +3140,8 @@ def _job_status_response(
             try:
                 _write_repo_job_record(updated)
             except Exception:
-                pass
+                if CODEX_RUNTIME is not None:
+                    raise
             job_record = updated
             active_reservation = False
             reservation = None
@@ -2996,16 +3159,28 @@ def _job_status_response(
         updated = dict(job_record)
         updated["next_poll_after"] = return_next_poll_after
         updated["last_status_checked_at"] = reservations.iso_timestamp()
+        if CODEX_RUNTIME is not None:
+            updated["last_process_observation"] = process
+            updated["job_lifecycle"] = "running"
+            updated["reason"] = ""
         if early_reason is not None:
             updated["last_early_poll_reason"] = early_reason
             updated["last_early_poll_at"] = updated["last_status_checked_at"]
         try:
-            reservations.atomic_write_json(
-                reservations.job_record_path(REPO_ROOT, str(job_record["job_id"])),
-                updated,
-            )
+            _write_repo_job_record(updated)
         except Exception:
-            pass
+            if CODEX_RUNTIME is not None:
+                raise
+        if CODEX_RUNTIME is not None:
+            job_record = updated
+    if CODEX_RUNTIME is not None and job_lifecycle in {"launch_outcome_unknown", "process_gone_unknown_outcome"}:
+        updated = dict(job_record, job_lifecycle=job_lifecycle, reason=reason,
+                       last_status_checked_at=reservations.iso_timestamp(),
+                       next_poll_after=None if job_lifecycle == "process_gone_unknown_outcome"
+                       else _next_poll_after(_job_poll_interval(job_record)))
+        _write_repo_job_record(updated)
+        return_next_poll_after = updated.get("next_poll_after")
+        job_record = updated
     response = {
         "status": "ok" if action == "status" else "refused",
         "action": action,
@@ -3022,11 +3197,12 @@ def _job_status_response(
         "reservation_identity_mismatch": bool(job_record.get("reservation_identity_mismatch")),
         "reservation_state": None if reservation is None else reservation.get("reservation_state"),
         "job_lifecycle": job_lifecycle,
+        "last_status_checked_at": job_record.get("last_status_checked_at"),
         "outcome": outcome,
         "owned_by_current_server": owned,
         "heartbeat": None if reservation is None else reservation.get("heartbeat"),
         "heartbeat_manager_healthy": healthy,
-        "heartbeat_manager_reason": HEARTBEAT_MANAGER.health_reason(),
+        "heartbeat_manager_reason": _job_checkins_reason(reservation_key_value),
         "process": process,
         "allowed_actions": allowed_actions,
         "job_role": job_record.get("job_role"),
@@ -3075,7 +3251,12 @@ if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "--safe-run":
 
 from mcp.server.fastmcp import FastMCP
 
-mcp = FastMCP("gpu-cluster", instructions=(
+mcp = FastMCP("gpu-cluster", json_response=True, stateless_http=True, instructions=(
+    ("Codex shared mode: scheduled checks run in backend code. "
+     "Short polling updates are private and do not wake an idle model. "
+     "Completion and persistent problems return to the launching conversation automatically. "
+     "Use list_gpu_jobs for your jobs and manage_gpu_job(detail='full') or action='logs' for explicit diagnostics. "
+     "Choose an early inspection only when there is a reason. " if CODEX_RUNTIME_ROOT is not None else "") +
     "GPU cluster management server. Provides tools to check GPU availability "
     "across configured hosts, run approved Python files on specific GPUs, "
     "identify which processes own which GPUs, and signal only GPU_MCP_USER "
@@ -3091,6 +3272,7 @@ mcp = FastMCP("gpu-cluster", instructions=(
 
 
 @mcp.tool()
+@_codex_request
 def preview_policy_reload():
     """Validate changed gpu-mcp.toml and preview an explicit policy reload.
 
@@ -3149,6 +3331,7 @@ def preview_policy_reload():
 
 
 @mcp.tool()
+@_codex_request
 def reload_policy(token: str):
     """Activate a previously previewed and human-approved policy reload."""
     global ACTIVE_POLICY_HASH
@@ -3257,6 +3440,7 @@ def reload_policy(token: str):
 
 
 @mcp.tool()
+@_codex_request
 def reject_policy_reload(token: str):
     """Discard a previously previewed policy reload token without changing policy."""
     if not isinstance(token, str) or not token:
@@ -3695,7 +3879,24 @@ def _manage_gpu_job_impl(
             "reservation_key": reservation_key,
             "server_instance_id": SERVER_INSTANCE_ID,
         })
-    if normalized_action in {"stop", "retry", "finish", "update_cadence"} and not HEARTBEAT_MANAGER.is_healthy():
+    if job_id is not None:
+        build = _build_manager().read(job_id)
+        if build is not None:
+            if reservation_key is not None and reservation_key != build.get("reservation_key"):
+                return _json_tool_response({"status": "refused", "reason": "build reservation does not match job_id"})
+            try:
+                return _json_tool_response(_build_manager().manage(
+                    build, normalized_action, cadence_hint_sec=cadence_hint_sec,
+                    expected_duration_sec=expected_duration_sec, reason=reason,
+                    early_poll_reason=early_poll_reason))
+            except (ValueError, RuntimeError, OSError) as exc:
+                return _json_tool_response({"status": "refused", "job_id": job_id, "reason": str(exc)})
+    if CODEX_RUNTIME is not None:
+        job_record, resolved_by, candidates = _resolve_job_target(job_id, reservation_key)
+        health_key = job_record.get('reservation_key') if job_record else reservation_key
+    else:
+        health_key = reservation_key
+    if normalized_action in {"stop", "retry", "finish", "update_cadence"} and not _job_checkins_healthy(health_key):
         return _json_tool_response({
             "status": "refused",
             "action": normalized_action,
@@ -3703,10 +3904,11 @@ def _manage_gpu_job_impl(
             "job_id": job_id,
             "reservation_key": reservation_key,
             "heartbeat_manager_healthy": False,
-            "heartbeat_manager_reason": HEARTBEAT_MANAGER.health_reason(),
+            "heartbeat_manager_reason": HEARTBEAT_MANAGER.health_reason(health_key if CODEX_RUNTIME is not None else None),
             "server_instance_id": SERVER_INSTANCE_ID,
         })
-    job_record, resolved_by, candidates = _resolve_job_target(job_id, reservation_key)
+    if CODEX_RUNTIME is None:
+        job_record, resolved_by, candidates = _resolve_job_target(job_id, reservation_key)
     if candidates:
         return _json_tool_response({
             "status": "ambiguous_target",
@@ -3753,8 +3955,17 @@ def manage_gpu_job(
     cadence_hint_sec: Optional[int] = None,
     reason: Optional[str] = None,
     early_poll_reason: Optional[str] = None,
+    detail: str = "summary",
+    log_tail_lines: int = 50,
+    notification_id: Optional[str] = None,
+    notify_after_sec: Optional[int] = None,
 ):
     """Inspect or change a managed GPU job.
+
+    With the Codex launcher, scheduled checks are automatic. detail='full'
+    exposes saved diagnostics; action='logs' reads a bounded tail, and
+    action='notifications' inspects delivery state. These reads remain scoped
+    to the launching conversation. Recurring status calls are unnecessary.
 
     Use action="status" for lifecycle inspection. Before next_poll_after it
     returns a compact local response unless early_poll_reason explains why a
@@ -3766,6 +3977,49 @@ def manage_gpu_job(
     terminal status. It still requires ownership, a healthy heartbeat manager,
     and an exact process match.
     """
+    if detail not in {"summary", "full"}:
+        return _json_tool_response({"status": "refused", "reason": "detail must be summary or full"})
+    if CODEX_RUNTIME is not None and action in {"retry_notification", "watch"}:
+        record = CODEX_RUNTIME.read(job_id)
+        if action == "retry_notification":
+            event = CODEX_RUNTIME.store.event(notification_id)
+            if record is None or event is None or event["job_id"] != job_id or event["attempt_id"] != record["active_attempt_id"]:
+                return _json_tool_response({"status": "refused", "reason": "notification unavailable to this session"})
+            CODEX_RUNTIME.store.retry_notification(notification_id, CODEX_RUNTIME.origin().thread_id, reason or "")
+            CODEX_RUNTIME._delivery_after.pop(notification_id, None)
+            return _json_tool_response({"status": "ok", "job_id": job_id, "reason": "Notification retry queued; the previous delivery may have been accepted."})
+        seconds, error = _validate_cadence_hint(notify_after_sec)
+        if record is None or error or seconds is None or not _nonempty_text(reason):
+            return _json_tool_response({"status": "refused", "reason": error or "watch requires notify_after_sec and a message in reason"})
+        if record.get("job_lifecycle") in {"succeeded", "failed", "finished"}:
+            return _json_tool_response({"status": "refused", "reason": "a completed job cannot have a future watch"})
+        watch = {"key": secrets.token_hex(12), "at": _next_poll_after(seconds),
+                 "attempt_id": record["active_attempt_id"], "message": reason[:1000]}
+        record = dict(record, watches=record.get("watches", []) + [watch])
+        CODEX_RUNTIME.persist(record)
+        return _json_tool_response({"status": "ok", "job_id": job_id, "watch": watch})
+    if CODEX_RUNTIME is not None and action in {"logs", "notifications"}:
+        record = CODEX_RUNTIME.read(job_id)
+        if record is None:
+            return _json_tool_response({"status": "refused", "reason": "job unavailable to this session"})
+        if action == "notifications":
+            events = [e for e in CODEX_RUNTIME.store.events(origin=CODEX_RUNTIME.origin().thread_id)
+                      if e["job_id"] == job_id]
+            return _json_tool_response({"status": "ok", "job_id": job_id, "events": events})
+        if isinstance(log_tail_lines, bool) or not isinstance(log_tail_lines, int) or not 1 <= log_tail_lines <= 200:
+            return _json_tool_response({"status": "refused", "reason": "log_tail_lines must be 1 through 200"})
+        path = _validate_output_path(record.get("output_file"))
+        if path.is_symlink():
+            return _json_tool_response({"status": "refused", "reason": "refusing a symlinked job log"})
+        import collections
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            with os.fdopen(os.open(path, flags), errors="replace") as log:
+                tail = "".join(collections.deque(log, maxlen=log_tail_lines))[-32000:]
+        except OSError as exc:
+            return _json_tool_response({"status": "refused", "job_id": job_id, "reason": str(exc)})
+        return _json_tool_response({"status": "ok", "job_id": job_id, "log_tail": tail,
+                                   "provisional": record.get("job_lifecycle") not in {"succeeded", "failed"}})
     kwargs = {
         "action": action,
         "job_id": job_id,
@@ -3825,6 +4079,14 @@ def list_gpu_reservations(scope: str = "mine", fresh: bool = False):
     })
 
 
+def _validated_job_title(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or len(value.strip()) > 120 or any(not c.isprintable() for c in value):
+        raise ValueError('job_title must be a single line of at most 120 characters')
+    return value.strip() or None
+
+
 def _run_python_on_gpu_impl(
     host: str,
     gpu_index: int,
@@ -3838,6 +4100,7 @@ def _run_python_on_gpu_impl(
     smoke_job_id: Optional[str] = None,
     smoke_cadence_representative: bool = False,
     smoke_skip_reason: Optional[str] = None,
+    job_title: Optional[str] = None,
 ):
     """Launch an approved Python file as a managed GPU job.
 
@@ -3856,12 +4119,13 @@ def _run_python_on_gpu_impl(
         smoke_cadence_representative: Compatibility/provenance flag recorded with smoke
             evidence. It does not select cadence; use cadence_hint_sec for that.
         smoke_skip_reason: Optional reason to launch a main job without smoke evidence.
+        job_title: Short task purpose for the human monitor; does not affect execution.
 
     Returns:
         JSON managed job handle.
     """
     _apply_test_controls_from_file()
-    if not HEARTBEAT_MANAGER.is_healthy():
+    if CODEX_RUNTIME is None and not HEARTBEAT_MANAGER.is_healthy():
         return _launch_refusal(
             "heartbeat manager is unhealthy; new launches are unsafe",
             heartbeat_manager_healthy=False,
@@ -3878,6 +4142,10 @@ def _run_python_on_gpu_impl(
         return _launch_refusal("async_mode must be a boolean", gpu_index=gpu_index)
     if output_file is not None and not isinstance(output_file, str):
         return _launch_refusal("output_file must be a string path", gpu_index=gpu_index)
+    try:
+        job_title = _validated_job_title(job_title)
+    except ValueError as exc:
+        return _launch_refusal(str(exc), host=host, gpu_index=gpu_index)
     resolved_job_role, job_role_defaulted, role_error = _resolve_job_role(job_role, async_mode)
     if role_error:
         return _launch_refusal(role_error, host=host, gpu_index=gpu_index)
@@ -3966,6 +4234,10 @@ def _run_python_on_gpu_impl(
     except ValueError as e:
         message = str(e)
         return _launch_refusal(message, host=host, gpu_index=gpu_index)
+
+    if CODEX_RUNTIME is not None and not _job_checkins_healthy(reservation_key_value):
+        return _launch_refusal('reservation check-in manager is unavailable; new launches are unsafe',
+                               host=canonical_host, gpu_index=gpu_index)
 
     try:
         _prepare_output_parent(out_path)
@@ -4078,6 +4350,8 @@ def _run_python_on_gpu_impl(
         "cadence_basis": cadence_basis,
         "phase7_poll_discipline": phase7_inputs_present,
     })
+    if job_title is not None:
+        job_record['job_title'] = job_title
     if smoke_job_id is not None:
         job_record["smoke_job_id"] = smoke_job_id
     if smoke_cadence_representative:
@@ -4089,7 +4363,8 @@ def _run_python_on_gpu_impl(
     if cadence_hint is not None:
         job_record["cadence_hint_sec"] = cadence_hint
     try:
-        reservations.atomic_write_json(reservations.job_record_path(REPO_ROOT, job_id), job_record)
+        job_record = _register_codex_job(job_record)
+        _write_repo_job_record(job_record)
     except Exception as e:
         reservations.remove_reservation_if_launch_failed(
             registry_root=registry_root,
@@ -4213,6 +4488,8 @@ def _run_python_on_gpu_impl(
         "async_mode_requested": async_mode_requested,
         "outcome_file": str(outcome_path),
     })
+    if CODEX_RUNTIME is not None:
+        job_record["job_lifecycle"] = "running"
     launched_metadata = dict(initial_metadata)
     launched_metadata.update({
         "remote_pid": int(pid_value),
@@ -4221,7 +4498,7 @@ def _run_python_on_gpu_impl(
         "last_heartbeat_at": reservations.iso_timestamp(),
     })
     try:
-        reservations.atomic_write_json(reservations.job_record_path(REPO_ROOT, job_id), job_record)
+        _write_repo_job_record(job_record)
         HEARTBEAT_MANAGER.update_owned_metadata(reservation_key_value, {
             "remote_pid": int(pid_value),
             "remote_start_time": remote_start_time,
@@ -4274,6 +4551,65 @@ def _run_python_on_gpu_impl(
     )
 
 
+def _build_manager():
+    return gpu_mcp_builds.BuildManager(sys.modules[__name__])
+
+
+@mcp.tool()
+@_requires_active_policy
+def list_gpu_jobs():
+    """List only this Codex session's managed jobs, including CPU builds and completed jobs."""
+    if CODEX_RUNTIME is not None:
+        records = CODEX_RUNTIME.records()
+    else:
+        records = [_read_repo_job_record(p.parent.name)
+                   for p in reservations.repo_job_state_root(REPO_ROOT).glob("job-*/job.json")]
+        records = [r for r in records if r and r.get("server_instance_id") == SERVER_INSTANCE_ID]
+    return _json_tool_response({"status": "ok", "jobs": [
+        {k: r.get(k) for k in ("job_id", "active_attempt_id", "job_kind", "job_lifecycle",
+                               "host", "gpu_index", "output_file", "next_poll_after", "last_status_checked_at")}
+        for r in records]})
+
+
+@mcp.tool()
+@_requires_active_policy
+def build_python_artifact(
+    host: str,
+    script_path: str,
+    artifact_path: str,
+    args: Optional[list[str]] = None,
+    build_mode: str = "cpu_only",
+    gpu_index: Optional[int] = None,
+    output_file: Optional[str] = None,
+    expected_duration_sec: Optional[int] = None,
+    cadence_hint_sec: Optional[int] = None,
+    job_title: Optional[str] = None,
+):
+    """Build an artifact from an approved Python file, separately from GPU execution.
+
+    Use normal local tools for local CPU-only builds when appropriate. This tool
+    provides managed remote CPU or reserved GPU builds, not mandatory artifact
+    provenance. Ordinary GPU jobs can load artifacts built by either route.
+    Requires approved build_enabled=true and bubblewrap on the chosen host.
+    cpu_only (default) denies GPU access and makes no GPU availability queries
+    or reservations; it can still produce a CUDA-target artifact. gpu_assisted
+    requires gpu_index and obtains a normal GPU reservation. No automatic mode
+    escalation occurs. Compiler subprocesses run inside the build boundary with
+    the repository's approved write roots. The script writes artifact_path
+    (also provided as GPU_MCP_ARTIFACT_PATH); loading/execution is a separate job.
+    Returns a managed handle; use manage_gpu_job with its explicit job_id for
+    status/stop/retry/finish/cadence. Duration is descriptive. Cadence accepts any
+    positive interval; short builds need no separate smoke or repeated polling.
+    Supply a short ``job_title`` describing the task for the human monitor.
+    """
+    try:
+        return _json_tool_response(_build_manager().launch(
+            host, script_path, artifact_path, args, build_mode, gpu_index,
+            output_file, expected_duration_sec, cadence_hint_sec, job_title=job_title))
+    except (ValueError, RuntimeError, OSError) as exc:
+        return _json_tool_response({"status": "refused", "reason": str(exc)})
+
+
 @mcp.tool()
 @_requires_active_policy
 def run_python_on_gpu(
@@ -4289,6 +4625,7 @@ def run_python_on_gpu(
     smoke_job_id: Optional[str] = None,
     smoke_cadence_representative: bool = False,
     smoke_skip_reason: Optional[str] = None,
+    job_title: Optional[str] = None,
 ):
     """Launch an approved Python file as a managed GPU job and return its handle.
 
@@ -4301,6 +4638,7 @@ def run_python_on_gpu(
     interval with no policy cap; without it, smoke defaults to five minutes and
     main or one-off to one hour. ``expected_duration_sec`` is descriptive only.
     Either compatibility value of ``async_mode`` returns a managed handle.
+    Supply a short ``job_title`` describing the task for the human monitor.
     """
     kwargs = {
         "host": host,
@@ -4315,6 +4653,7 @@ def run_python_on_gpu(
         "smoke_job_id": smoke_job_id,
         "smoke_cadence_representative": smoke_cadence_representative,
         "smoke_skip_reason": smoke_skip_reason,
+        "job_title": job_title,
     }
     _phase7_trace_tool_call("run_python_on_gpu", kwargs)
     response = _run_python_on_gpu_impl(**kwargs)
@@ -4374,6 +4713,14 @@ if __name__ == "__main__":
     signal_lib.signal(signal_lib.SIGTERM, _stop_heartbeat_and_exit)
     signal_lib.signal(signal_lib.SIGINT, _stop_heartbeat_and_exit)
     try:
-        mcp.run(transport="stdio")
+        if CODEX_RUNTIME_ROOT is not None:
+            from gpu_mcp_codex_runtime import CodexRuntime
+            from gpu_mcp_codex_host import run_shared
+            CODEX_RUNTIME = CodexRuntime(sys.modules[__name__], CODEX_RUNTIME_ROOT)
+            run_shared(sys.modules[__name__], CODEX_LISTEN_FD)
+        else:
+            mcp.run(transport="stdio")
     finally:
+        if CODEX_RUNTIME is not None:
+            CODEX_RUNTIME.stop()
         HEARTBEAT_MANAGER.stop()

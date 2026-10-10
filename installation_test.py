@@ -101,16 +101,24 @@ def _validate_server_path(repo: Path, mcp_root: Path, config_path: Path) -> dict
         raise ValueError(f"{MCP_SERVER_NAME} missing from repo-local Codex config")
     args = [str(arg) for arg in server.get("args", [])]
     expected_server = (mcp_root / "gpu_mcp_server.py").resolve()
-    if str(expected_server) not in args:
-        raise ValueError(f"{MCP_SERVER_NAME} must point at {expected_server}")
+    launcher = (mcp_root / "gpu_mcp_codex_launcher.py").resolve()
+    shared = str(launcher) in args
+    if str(expected_server) not in args and not shared:
+        raise ValueError(f"{MCP_SERVER_NAME} must point at {launcher} or {expected_server}")
+    if shared:
+        for filename in ("gpu_mcp_codex_launcher.py", "gpu_mcp_codex_state.py", "gpu_mcp_codex_runtime.py",
+                         "gpu_mcp_codex_daemon.py", "gpu_mcp_codex_host.py", "gpu_mcp_codex_versions.py"):
+            if not (mcp_root / filename).is_file():
+                raise ValueError(f"shared Codex runtime is incomplete: {filename}")
     if "--config" not in args:
         raise ValueError(f"{MCP_SERVER_NAME} args must include --config")
     actual_config = Path(args[args.index("--config") + 1]).resolve()
     if actual_config != config_path.resolve():
         raise ValueError(f"{MCP_SERVER_NAME} --config points at {actual_config}")
     return {
-        "server_path": str(expected_server),
+        "server_path": str(launcher if shared else expected_server),
         "config_path": str(actual_config),
+        "mode": "codex_shared" if shared else "legacy_stdio",
     }
 
 
@@ -368,6 +376,17 @@ def run_installation_check(
                 )
             )
 
+    try:
+        registration = _load_codex_config(repo_path).get("mcp_servers", {}).get(MCP_SERVER_NAME, {})
+        shared_mode = any(Path(str(arg)).name == "gpu_mcp_codex_launcher.py" for arg in registration.get("args", []))
+    except (OSError, ValueError):
+        shared_mode = False  # The config check above already reports this failure.
+    if shared_mode:
+        dependency_probe = command_runner([str(python_path), "-c", "import uvicorn; import websocket"], timeout=30)
+        checks.append(_check("shared_codex_dependencies", "pass" if dependency_probe.returncode == 0 else "fail",
+            "shared Codex transport dependencies are available" if dependency_probe.returncode == 0 else
+            "server Python needs uvicorn and websocket-client", next_action="install the dependencies in pyproject.toml",
+            details={"stderr": dependency_probe.stderr}))
     static_failed = any(check["status"] == "fail" for check in checks)
 
     if static_failed:

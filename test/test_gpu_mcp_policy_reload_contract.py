@@ -283,6 +283,7 @@ def test_all_operational_tools_share_bootstrap_capability_gate(
         server.manage_gpu_job(),
         server.list_gpu_reservations(),
         server.run_python_on_gpu(host="gpu-a", gpu_index=0, script_path="jobs/ok.py"),
+        server.build_python_artifact(host="gpu-a", script_path="jobs/ok.py", artifact_path="results/library.so"),
         server.cluster_info(),
     ]
 
@@ -483,6 +484,7 @@ def test_normal_tools_refuse_when_policy_file_is_stale(monkeypatch, repo_fixture
         server.check_gpu_processes(),
         server.kill_gpu_process(host="gpu-a", pid=123),
         server.run_python_on_gpu(host="gpu-a", gpu_index=0, script_path="jobs/ok.py"),
+        server.build_python_artifact(host="gpu-a", script_path="jobs/ok.py", artifact_path="results/library.so"),
     ]
 
     for result in results:

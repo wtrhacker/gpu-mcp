@@ -44,11 +44,62 @@ Run a focused file while developing:
 pytest test/test_gpu_mcp_server_contract.py
 ```
 
+Artifact builds have local contracts in `test/test_gpu_mcp_builds.py` and short
+live Codex probes in `test/test_codex_build_battlefield.py`. The latter use
+GPT-5.5 medium and launch a fresh MCP server, so no interactive restart is needed:
+
+```bash
+GPU_MCP_RUN_BUILD_BATTLEFIELD_TESTS=1 pytest -q test/test_codex_build_battlefield.py -k cpu_artifact
+GPU_MCP_RUN_BUILD_BATTLEFIELD_TESTS=1 GPU_MCP_BUILD_TEST_HOST=your-host GPU_MCP_BUILD_TEST_GPU=0 python -m pytest -q test/test_codex_build_battlefield.py -k torch_artifact
+```
+
+Choose an available, approved host/GPU and run pytest with the Python environment
+that has the required framework and complete CUDA development toolkit. Remote
+tests use real shared GPU reservations. Fixture logs, transcripts and artifacts
+remain under `test_mcp_repos/gpu-mcp-build-battlefield-*`.
+`test/test_build_remote_acceptance.py` offers direct server acceptance with
+`GPU_MCP_RUN_BUILD_REMOTE_TESTS=1`; it is also skipped by default.
+
 Run live repo-local Codex probes:
 
 ```bash
 GPU_MCP_RUN_CODEX_EXEC_TESTS=1 pytest -m codex_exec test/test_codex_repo_local_mcp.py
 ```
+
+Shared Codex ownership and monitoring have independent local contracts plus an
+opt-in GPT-5.5-medium daemon/terminal suite:
+
+```bash
+pytest -q test/test_gpu_mcp_codex_state.py test/test_gpu_mcp_codex_shared.py test/test_gpu_mcp_codex_delivery.py test/test_gpu_mcp_codex_transport.py
+GPU_MCP_RUN_CODEX_SHARED_TESTS=1 pytest -q test/test_codex_shared_monitoring.py
+```
+
+See [the shared monitoring test guide](CODEX_SHARED_MONITORING.md) for fixture
+boundaries, native terminal evidence and the earlier-design compatibility audit.
+
+Private polling and temporary verification retries have local contracts and
+neutral GPT-5.5-medium acceptance:
+
+```bash
+pytest -q test/test_gpu_mcp_codex_polling.py test/test_gpu_mcp_codex_delivery.py
+GPU_MCP_RUN_CODEX_SHARED_TESTS=1 pytest -q test/test_codex_private_polling.py
+```
+
+Existing-repo upgrades and slow shared HTTP calls have focused regressions:
+
+```bash
+pytest -q test/test_gpu_mcp_codex_upgrade.py test/test_gpu_mcp_codex_concurrency.py
+```
+
+They use temporary registrations, policies and jobs. They check preserved
+approvals and active GPU/CPU job refusal, and reproduce health starvation while
+another request is doing slow work. They do not launch models, SSH or GPU jobs.
+
+The `/monitor` frontend has focused local checks in
+`test/test_gpu_mcp_codex_cli.py`. A separate native case verifies that a human
+canary never reaches the model. The [true live manual procedure](TRUE_LIVE_SHARED_MONITORING.md)
+prepares two hidden, delayed jobs for human-opened sessions. Keep run reports and
+captured outputs local; do not commit them.
 
 Run the real battlefield suite:
 
@@ -63,6 +114,11 @@ See the constants and environment overrides at the top of
 
 ## Skipped By Default
 
+- `test/test_codex_shared_monitoring.py` requires
+  `GPU_MCP_RUN_CODEX_SHARED_TESTS=1`. It uses GPT-5.5 medium, the existing Codex
+  daemon, disposable conversations and isolated CPU builds. It does not restart
+  the daemon or launch GPU jobs.
+
 - `test/test_codex_repo_local_mcp.py` has three live `codex exec` tests skipped
   unless `GPU_MCP_RUN_CODEX_EXEC_TESTS=1` is set. Its pure local config tests
   still run by default.
@@ -70,6 +126,11 @@ See the constants and environment overrides at the top of
   `GPU_MCP_RUN_REAL_BATTLEFIELD_TESTS=1` is set. It intentionally uses real
   Codex, SSH, non-local hosts from the bootstrap inventory, and shared `/net`
   repos.
+
+- `test/test_codex_build_battlefield.py` requires
+  `GPU_MCP_RUN_BUILD_BATTLEFIELD_TESTS=1`; remote cases also require an explicit
+  host/GPU. `test/test_build_remote_acceptance.py` separately requires
+  `GPU_MCP_RUN_BUILD_REMOTE_TESTS=1`.
 
 `pytest.ini` registers the `contract`, `codex_exec`, and `real_battlefield`
 markers, sets `test/` as the test root, excludes `STALE/`, and uses strict
@@ -149,6 +210,13 @@ behavior.
   remote-control API blocks, timeout boundaries, protected policy mutation,
   raw remote-command rejection, and safe kill behavior.
 
+- `test/test_gpu_mcp_builds.py`: ADR 0007 build policy, native compilation,
+  filesystem/device boundaries, artifact outputs and managed lifecycle.
+- `test/test_codex_build_battlefield.py`: short GPT-5.5-medium live MCP
+  build/load checks; recipes are in `test/build_jobs/`.
+- `test/test_build_remote_acceptance.py`: opt-in direct server/SSH acceptance
+  for framework packaging and optional application coupling.
+
 ## ADR Coverage
 
 The active ADRs are source context, not a separate test backlog. ADR 0001 maps
@@ -159,3 +227,19 @@ because automated tests cannot represent human judgment. ADR 0003 is covered
 by staged-runner server contracts and real battlefield acceptance. Older
 AI-native planning catalogs have been moved to `STALE/` and are no longer the
 authoritative map of current tests.
+
+ADR 0007 is covered by build contracts, the policy-reload capability gate,
+existing policy-hook/Stop regressions, and opt-in build/load acceptance.
+The [build guide](../docs/builds.md) describes supported workflows and limits.
+
+## Native keyboard monitor
+
+The keyboard entry uses ordinary Codex, with setup handled by the installer.
+Run its focused checks without repeating backend acceptance:
+
+```bash
+python -m pytest -q test/test_gpu_mcp_codex_editor.py
+GPU_MCP_RUN_CODEX_SHARED_TESTS=1 python -m pytest -q test/test_codex_shared_monitoring.py -k native_editor
+```
+
+See [the shared monitoring guide](CODEX_SHARED_MONITORING.md).

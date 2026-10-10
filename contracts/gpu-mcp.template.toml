@@ -4,6 +4,8 @@
 
 schema_version = 1
 repo_root = "{{REPO_ROOT_ABS}}"
+# Optional managed compilation; changing this requires the normal policy approval.
+build_enabled = false
 
 nodes = [
   "{{GPU_HOST_1}}",

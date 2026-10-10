@@ -41,7 +41,7 @@ For a new single-checkout installation:
 git clone https://github.com/wtrhacker/gpu-mcp.git "$GPU_MCP_ROOT"
 python3 -m venv "$GPU_MCP_ROOT/.venv"
 GPU_MCP_SERVER_PYTHON="$GPU_MCP_ROOT/.venv/bin/python"
-"$GPU_MCP_SERVER_PYTHON" -m pip install "mcp>=1.28,<2" fabric paramiko
+"$GPU_MCP_SERVER_PYTHON" -m pip install "mcp>=1.28,<2" fabric paramiko uvicorn websocket-client
 ```
 
 For an existing or separately deployed runtime, set
@@ -50,7 +50,7 @@ install the runtime dependencies into that interpreter:
 
 ```bash
 GPU_MCP_SERVER_PYTHON=/absolute/path/to/python
-"$GPU_MCP_SERVER_PYTHON" -m pip install "mcp>=1.28,<2" fabric paramiko
+"$GPU_MCP_SERVER_PYTHON" -m pip install "mcp>=1.28,<2" fabric paramiko uvicorn websocket-client
 ```
 
 The current server targets MCP Python SDK v1. Always keep the explicit
@@ -146,13 +146,17 @@ Do not substitute another checkout for the installed runtime.
 
 The agent will create the repo-local MCP registration and policy candidate,
 then ask the human to review the raw policy preview before activation.
+It also configures the native keyboard monitor once. New terminal sessions load
+that setup automatically; users keep ordinary `codex` / `codex resume`. Ctrl+G
+offers the monitor and normal prompt editing. See
+[the monitor guide](docs/codex-monitoring.md).
 
 ## Updating the runtime
 
 For a single-checkout installation:
 
 1. Review and update the checkout using your normal Git workflow.
-2. Re-run `"$GPU_MCP_SERVER_PYTHON" -m pip install "mcp>=1.28,<2" fabric paramiko`.
+2. Re-run `"$GPU_MCP_SERVER_PYTHON" -m pip install "mcp>=1.28,<2" fabric paramiko uvicorn websocket-client`.
 3. Run the import check above and the relevant tests.
 4. Restart Codex so it launches the updated process.
 
@@ -161,6 +165,15 @@ For a separate deployment, use the local synchronization procedure from
 synchronizing, refresh dependencies, verify the deployed files, and restart
 Codex. Never derive the deployment source or destination from the current
 working directory alone.
+
+Updating the runtime does not rewrite existing research-repo registrations.
+For a Codex repo still pointing to `gpu_mcp_server.py`, the installer runs
+`gpu_mcp_codex_upgrade.py --config /absolute/repo/gpu-mcp.toml`, then adds
+`--apply` after reviewing its plan. The helper preserves the policy approval and
+other settings, saves a backup and refuses to switch unfinished legacy jobs.
+After those jobs finish, apply it and resume the same Codex conversation.
+The [migration guide](docs/codex-monitoring.md#migration-and-upgrades) includes
+the complete commands and keyboard-monitor activation for existing terminals.
 
 ## MCP startup checklist
 

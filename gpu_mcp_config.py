@@ -22,6 +22,7 @@ class GpuMcpPolicy:
     allowed_gpu_names: tuple[str, ...]
     min_free_memory_mib: int
     sync_timeout_sec: int
+    build_enabled: bool = False
 
 
 @dataclass(frozen=True)
@@ -151,6 +152,9 @@ def load_policy_snapshot(config_path: str | Path) -> PolicySnapshot:
         raise ConfigError("write_roots must not be empty")
     if not output_roots:
         raise ConfigError("output_roots must not be empty")
+    build_enabled = raw.get("build_enabled", False)
+    if not isinstance(build_enabled, bool):
+        raise ConfigError("build_enabled must be a boolean")
 
     policy = GpuMcpPolicy(
         config_path=config,
@@ -168,6 +172,7 @@ def load_policy_snapshot(config_path: str | Path) -> PolicySnapshot:
             raw.get("sync_timeout_sec", 30),
             name="sync_timeout_sec",
         ),
+        build_enabled=build_enabled,
     )
     return PolicySnapshot(
         policy=policy,

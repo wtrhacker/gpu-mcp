@@ -22,8 +22,11 @@ talk to the AI normally; it uses these functions when it needs a GPU.
 - **Silence is not mistaken for an idle GPU.** If a heartbeat stops, GPU MCP
   checks whether the original program is still running before freeing the GPU.
 - **Long jobs are not forgotten.** Each job has an ID, a saved outcome, and a
-  planned check time. The optional Codex hook reminds the AI when a check is due
-  or a result appears, without constant polling.
+  planned check time. The shared Codex backend checks quietly and sends useful
+  events to the conversation that launched the job.
+- **Conversations keep their own jobs.** Codex sessions in one repository share
+  a backend while each sees and manages only its own jobs. A separate human
+  terminal monitor can show the repository's jobs.
 - **Stopping is deliberate.** GPU MCP first shows the process owner, command,
   GPU, and start time. It stops the process only on a second call with the same
   fingerprint, after confirming that nothing changed.
@@ -38,7 +41,9 @@ talk to the AI normally; it uses these functions when it needs a GPU.
 | `check_gpus` | Shows which GPUs are busy, their memory use, and GPU MCP reservations. |
 | `check_gpu_processes` | Shows the programs currently using the GPUs. |
 | `run_python_on_gpu` | Reserves one GPU and starts an allowed Python file. It returns a job ID. |
+| `build_python_artifact` | Builds a reusable artifact on a configured host, using CPU only or a reserved GPU. Optional policy capability. |
 | `manage_gpu_job` | Checks, retries, stops, or finishes a job using its job ID. |
+| `list_gpu_jobs` | Lists this Codex conversation's running and completed jobs, including CPU builds. |
 | `list_gpu_reservations` | Shows which GPUs have been claimed by GPU MCP jobs. |
 | `kill_gpu_process` | Inspects one process, returns its fingerprint, and stops it only after a matching second call. |
 | `preview_policy_reload` | Shows exactly what a proposed permission change would do. |
@@ -51,6 +56,12 @@ For example, you can ask:
 Find a free GPU, run jobs/train_model.py, follow the job until it finishes,
 and tell me where the output was written.
 ```
+
+Compilation and execution can be separate. Local CPU builds can use normal
+local tools. For remote CPU or GPU-assisted builds, the optional
+[`build_python_artifact` tool](docs/builds.md) allows compiler subprocesses inside
+a confined build environment. A later ordinary GPU job loads the resulting
+library or package; it need not have been built through MCP.
 
 ## How does the human stay in control?
 
@@ -66,8 +77,14 @@ before every operation, checks the Python file, watches where it writes, and
 confirms a program's identity before stopping it. If the permission file
 changes, GPU work pauses until the new version is shown and approved.
 
-The hook only supplies reminders. `manage_gpu_job` performs the real status
-check, reports the result, and releases the GPU.
+In the [shared Codex integration](docs/codex-monitoring.md), backend code performs
+routine checks and saves completion before releasing the GPU. The hook retains
+policy approval checks. Direct stdio clients retain the earlier hook reminders
+and agent-requested status checks.
+
+Existing Codex projects can use the [registration upgrader](docs/codex-monitoring.md#migration-and-upgrades)
+to enable shared monitoring without recreating their GPU policy or its approval.
+After the upgrade, keep using ordinary `codex` and `codex resume`.
 
 This reduces mistakes; it does not make unknown Python safe. A launched file
 still has the normal access of the user running it.

@@ -3,11 +3,15 @@ from __future__ import annotations
 """Shared stdlib guard logic for GPU MCP Python job execution."""
 
 import ast
+import atexit
 import builtins
 import io
 import os
 import shlex
+import shutil
+import stat
 import sys
+import tempfile
 from pathlib import Path
 
 
@@ -404,10 +408,91 @@ def _open_is_write(mode: object, flags: object) -> bool:
     return False
 
 
-def make_safe_run_audit_hook(write_roots: list[Path]):
+def _write_path_allowed(path: object, roots: list[Path]) -> bool:
+    # The standard Linux null device discards output; it is not a data write
+    # outside the project. Torch/dill legitimately probes it with r+b mode.
+    if isinstance(path, (str, bytes, os.PathLike)) and os.fsdecode(path) == "/dev/null":
+        try:
+            device = os.stat(path, follow_symlinks=False)
+            if stat.S_ISCHR(device.st_mode) and device.st_rdev == os.makedev(1, 3):
+                return True
+        except OSError:
+            pass
+    return path_under_roots(path, roots)
+
+
+def _temporary_path(path: object, dir_fd: object = None) -> Path | None:
+    """Resolve a deletion/rename entry without following its final symlink.
+
+    shutil.rmtree uses directory descriptors for symlink-safe cleanup. Resolve
+    those descriptors too; checking only the relative filename would allow an
+    outside directory to be mistaken for the current working directory.
+    """
+    if not isinstance(path, (str, bytes, os.PathLike)):
+        return None
+    try:
+        candidate = Path(os.fsdecode(path))
+        if not candidate.is_absolute():
+            if dir_fd in (None, -1):
+                base = Path.cwd()
+            else:
+                if not isinstance(dir_fd, int) or not stat.S_ISDIR(os.fstat(dir_fd).st_mode):
+                    return None
+                base = Path(os.readlink(f"/proc/self/fd/{dir_fd}"))
+                if not base.is_absolute():
+                    return None
+            candidate = base / candidate
+        if candidate.name in ("", ".", ".."):
+            return candidate.resolve(strict=False)
+        return candidate.parent.resolve(strict=False) / candidate.name
+    except (OSError, TypeError, ValueError, RuntimeError):
+        return None
+
+
+def _temporary_operation_allowed(event: str, args: tuple, temporary_root: Path | None) -> bool:
+    if temporary_root is None:
+        return False
+
+    def inside(path: object, dir_fd: object = None) -> bool:
+        resolved = _temporary_path(path, dir_fd)
+        return resolved is not None and resolved.is_relative_to(temporary_root)
+
+    if event in {"os.remove", "os.rmdir", "shutil.rmtree"} and args:
+        return inside(args[0], args[1] if len(args) > 1 else None)
+    if event == "os.rename" and len(args) >= 2:
+        return (inside(args[0], args[2] if len(args) > 2 else None)
+                and inside(args[1], args[3] if len(args) > 3 else None))
+    return False
+
+
+def _prepare_temporary_root(write_roots: list[Path]) -> Path | None:
+    """Create a fresh private directory under an already approved write root."""
+    if not write_roots:
+        return None
+    root = write_roots[0].expanduser().resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    temporary_root = Path(tempfile.mkdtemp(prefix=f".gpu-mcp-tmp-{os.getpid()}-", dir=root)).resolve()
+    os.environ["GPU_MCP_TEMP_ROOT"] = str(temporary_root)
+    os.environ["TMPDIR"] = str(temporary_root)
+    # tempfile may have cached /tmp before the guard was installed.
+    tempfile.tempdir = str(temporary_root)
+    return temporary_root
+
+
+def make_safe_run_audit_hook(write_roots: list[Path], *, temporary_root: Path | None = None):
+    # Capture the directory once. An environment change never grants more
+    # permissions, and replacing a path with a symlink cannot move this root.
+    temporary_root = None if temporary_root is None else temporary_root.resolve()
+    if temporary_root is not None and not any(
+        temporary_root != root.expanduser().resolve()
+        and temporary_root.is_relative_to(root.expanduser().resolve())
+        for root in write_roots
+    ):
+        raise ValueError("Temporary cleanup root must be a strict child of an approved write root")
     def hook(event: str, args: tuple) -> None:
         if event in FORBIDDEN_AUDIT_EVENTS or event.startswith("subprocess."):
-            raise PermissionError(f"GPU MCP blocked runtime event: {event}")
+            if not _temporary_operation_allowed(event, args, temporary_root):
+                raise PermissionError(f"GPU MCP blocked runtime event: {event}")
         if event == "import" and args:
             module_name = str(args[0])
             issue = _runtime_import_rejection_issue(module_name)
@@ -415,7 +500,7 @@ def make_safe_run_audit_hook(write_roots: list[Path]):
                 raise PermissionError(f"GPU MCP blocked runtime import: {module_name}")
         if event == "open" and len(args) >= 3:
             path, mode, flags = args[0], args[1], args[2]
-            if _open_is_write(mode, flags) and not path_under_roots(path, write_roots):
+            if _open_is_write(mode, flags) and not _write_path_allowed(path, write_roots):
                 raise PermissionError(f"GPU MCP blocked write outside approved roots: {path}")
         if event in {"os.open", "os.mkdir"} and len(args) >= 4:
             dir_fd = args[3]
@@ -439,19 +524,19 @@ def install_preopen_write_guards(write_roots: list[Path]) -> None:
     original_os_open = os.open
 
     def guarded_builtin_open(file, mode="r", buffering=-1, encoding=None, errors=None, newline=None, closefd=True, opener=None):
-        if _open_is_write(mode, None) and not path_under_roots(file, write_roots):
+        if _open_is_write(mode, None) and not _write_path_allowed(file, write_roots):
             raise PermissionError(f"GPU MCP blocked write outside approved roots: {file}")
         return original_builtin_open(file, mode, buffering, encoding, errors, newline, closefd, opener)
 
     def guarded_io_open(file, mode="r", buffering=-1, encoding=None, errors=None, newline=None, closefd=True, opener=None):
-        if _open_is_write(mode, None) and not path_under_roots(file, write_roots):
+        if _open_is_write(mode, None) and not _write_path_allowed(file, write_roots):
             raise PermissionError(f"GPU MCP blocked write outside approved roots: {file}")
         return original_io_open(file, mode, buffering, encoding, errors, newline, closefd, opener)
 
     def guarded_os_open(path, flags, mode=0o777, *, dir_fd=None):
         if _open_is_write(None, flags) and dir_fd is not None:
             raise PermissionError(f"GPU MCP blocked dir_fd write: {path}")
-        if _open_is_write(None, flags) and not path_under_roots(path, write_roots):
+        if _open_is_write(None, flags) and not _write_path_allowed(path, write_roots):
             raise PermissionError(f"GPU MCP blocked write outside approved roots: {path}")
         if dir_fd is None:
             return original_os_open(path, flags, mode)
@@ -492,7 +577,17 @@ def run_job(
     if issues:
         print(_script_rejection_message(script, issues), file=sys.stderr)
         return 126
-    sys.addaudithook(make_safe_run_audit_hook(write_roots))
+    temporary_root = _prepare_temporary_root(write_roots)
+    completed = [False]
+    if temporary_root is not None:
+        def cleanup_temporary_root():
+            if completed[0]:
+                shutil.rmtree(temporary_root, ignore_errors=True)
+        # Register before user libraries, allowing their shutdown handlers to
+        # finish before successful-job scratch is removed. Retain failed-job
+        # scratch for diagnosis; the job's other outputs are never removed.
+        atexit.register(cleanup_temporary_root)
+    sys.addaudithook(make_safe_run_audit_hook(write_roots, temporary_root=temporary_root))
     install_preopen_write_guards(write_roots)
     sys.argv = [str(script)] + [str(arg) for arg in job_args]
     sys.path.append(str(script.parent))
@@ -506,7 +601,13 @@ def run_job(
                 "__cached__": None,
             },
         )
+        completed[0] = True
+    except SystemExit as exc:
+        completed[0] = exc.code in (None, 0)
+        raise
     finally:
+        if not completed[0] and temporary_root is not None:
+            print(f"GPU MCP retained temporary files: {temporary_root}", file=sys.stderr)
         try:
             sys.path.remove(str(script.parent))
         except ValueError:

@@ -757,9 +757,12 @@ def test_phase2_heartbeat_once_updates_owned_metadata(repo_fixture, tmp_path, mo
         gpu_index=0,
         script_path="jobs/ok.py",
         output_file=".gpu_mcp_logs/job.log",
+        job_title="Compare learning rates, seed 3",
     ))
 
     assert launched["status"] == "launched"
+    record = json.loads(server.reservations.job_record_path(repo_fixture, launched['job_id']).read_text())
+    assert record['job_title'] == 'Compare learning rates, seed 3'
     assert server.HEARTBEAT_MANAGER.owned_keys() == ["gpu-a.gpu0"]
     assert server.HEARTBEAT_MANAGER.heartbeat_once(
         "gpu-a.gpu0",
@@ -769,6 +772,19 @@ def test_phase2_heartbeat_once_updates_owned_metadata(repo_fixture, tmp_path, mo
     metadata = json.loads((registry / "gpu-a.gpu0" / "metadata.json").read_text())
     assert metadata["last_heartbeat_at"] == "2026-05-30T13:00:00Z"
     assert metadata["heartbeat_interval_sec"] == server.reservations.DEFAULT_HEARTBEAT_INTERVAL_SEC
+
+
+@pytest.mark.parametrize('title', [True, 'two\nlines', 'x' * 121], ids=['non_string', 'multiline', 'too_long'])
+def test_invalid_human_title_refuses_before_gpu_acquisition(repo_fixture, tmp_path, monkeypatch, title):
+    config = _write_config(repo_fixture)
+    registry = tmp_path / 'reservations'
+    monkeypatch.setenv('GPU_MCP_TEST_RESERVATION_ROOT', str(registry))
+    server = _import_server_with_config(monkeypatch, config)
+    launched = json.loads(server.run_python_on_gpu(host='gpu-a', gpu_index=0,
+                                                  script_path='jobs/ok.py', job_title=title))
+    assert launched['status'] == 'refused' and 'job_title' in launched['reason']
+    assert server.HEARTBEAT_MANAGER.owned_keys() == []
+    assert not (registry / 'gpu-a.gpu0').exists()
 
 
 def test_phase2_status_works_while_heartbeat_unhealthy_and_mutations_refuse(

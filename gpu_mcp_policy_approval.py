@@ -31,6 +31,7 @@ def policy_summary(policy: GpuMcpPolicy) -> dict[str, Any]:
         "allowed_gpu_names": list(policy.allowed_gpu_names),
         "min_free_memory_mib": policy.min_free_memory_mib,
         "sync_timeout_sec": policy.sync_timeout_sec,
+        "build_enabled": policy.build_enabled,
     }
 
 
@@ -136,7 +137,7 @@ def diff_policy_summary(old: GpuMcpPolicy, new: GpuMcpPolicy) -> list[str]:
             diffs.append(f"added {key[:-1] if key.endswith('s') else key} {item}")
         for item in sorted(old_values - new_values):
             diffs.append(f"removed {key[:-1] if key.endswith('s') else key} {item}")
-    for key in ("min_free_memory_mib", "sync_timeout_sec"):
+    for key in ("min_free_memory_mib", "sync_timeout_sec", "build_enabled"):
         if old_summary[key] != new_summary[key]:
             diffs.append(f"changed {key} from {old_summary[key]} to {new_summary[key]}")
     return diffs or ["no safety-relevant policy changes"]

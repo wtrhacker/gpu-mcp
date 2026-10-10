@@ -136,6 +136,7 @@ def validate_repo_local_codex_config(repo: str | Path, config_path: str | Path) 
             "server_name": name,
             "config_path": str(actual_config),
             "tool_timeout_sec": tool_timeout_sec,
+            "mode": "codex_shared" if any(Path(arg).name == "gpu_mcp_codex_launcher.py" for arg in args) else "legacy_stdio",
         }
     raise DoctorError(f"repo-local Codex config must register {MCP_SERVER_NAME} with --config")
 

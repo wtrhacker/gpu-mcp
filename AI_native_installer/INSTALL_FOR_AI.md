@@ -28,7 +28,8 @@ control host. Do not copy it into every research repository.
 Before editing the research repository, establish all of these values:
 
 1. `GPU_MCP_ROOT`: the installed control-side runtime containing
-   `gpu_mcp_server.py`, `gpu_mcp_policy_hook.py`, and `installation_test.py`.
+   `gpu_mcp_server.py`, `gpu_mcp_codex_launcher.py`, `gpu_mcp_policy_hook.py`,
+   and `installation_test.py`.
 2. `GPU_MCP_SERVER_PYTHON`: the control-host interpreter that launches the MCP
    server and can import MCP SDK v1, Fabric, and Paramiko.
 3. `GPU_JOB_PYTHON`: the interpreter used for launched jobs. Its absolute path
@@ -56,6 +57,7 @@ Substitute the confirmed absolute paths and perform equivalent read-only checks:
 
 ```bash
 test -f /absolute/gpu-mcp-runtime/gpu_mcp_server.py
+test -f /absolute/gpu-mcp-runtime/gpu_mcp_codex_launcher.py
 test -f /absolute/gpu-mcp-runtime/gpu_mcp_policy_hook.py
 test -x /absolute/path/to/server-python
 
@@ -65,6 +67,8 @@ from importlib.metadata import version
 import fabric
 import mcp.server.fastmcp
 import paramiko
+import uvicorn
+import websocket
 
 mcp_version = version("mcp")
 assert int(mcp_version.split(".", 1)[0]) == 1, mcp_version
@@ -96,6 +100,10 @@ The human must choose the hostnames and complete interactive SSH authentication
 or host-trust prompts. Do not create or install SSH credentials silently.
 
 ## Step 1: Confirm the research repository
+
+If the repository already has an approved `gpu-mcp.toml` and a direct GPU MCP
+registration, use [Upgrading an existing repository](#upgrading-an-existing-repository)
+below. Do not recreate its policy, SSH setup or approval history.
 
 Resolve the human-provided repository root and confirm that it is the directory
 to authorize. The future `gpu-mcp.toml` must live directly in this directory,
@@ -143,13 +151,13 @@ with the confirmed absolute value:
 [mcp_servers.gpu-cluster-mcp]
 command = "/ABSOLUTE/GPU_MCP_SERVER_PYTHON"
 args = [
-  "/ABSOLUTE/GPU_MCP_ROOT/gpu_mcp_server.py",
+  "/ABSOLUTE/GPU_MCP_ROOT/gpu_mcp_codex_launcher.py",
   "--config",
   "/ABSOLUTE/RESEARCH_REPO/gpu-mcp.toml",
 ]
 cwd = "/ABSOLUTE/RESEARCH_REPO"
 enabled = true
-startup_timeout_sec = 20
+startup_timeout_sec = 30
 tool_timeout_sec = 360
 
 [mcp_servers.gpu-cluster-mcp.env]
@@ -176,6 +184,13 @@ approval_mode = "approve"
 [mcp_servers.gpu-cluster-mcp.tools.list_gpu_reservations]
 approval_mode = "approve"
 
+[mcp_servers.gpu-cluster-mcp.tools.list_gpu_jobs]
+approval_mode = "approve"
+
+# The tool still requires the separately approved build_enabled policy capability.
+[mcp_servers.gpu-cluster-mcp.tools.build_python_artifact]
+approval_mode = "approve"
+
 [mcp_servers.gpu-cluster-mcp.tools.preview_policy_reload]
 approval_mode = "approve"
 
@@ -194,6 +209,13 @@ than the policy's `sync_timeout_sec`.
 Config comes first because the server can start without active policy authority.
 A missing, invalid, or unapproved policy places it in `bootstrap_pending`
 quarantine while leaving the three policy recovery tools available.
+
+The Codex launcher automatically starts or connects to one backend for this
+repository. Sessions retain separate job access through native Codex thread
+identity. Users do not start an HTTP service manually. Keep the existing policy
+hook for approval checks; its recurring job reminders and Stop wait are bypassed
+for this registration. See [Codex monitoring](../docs/codex-monitoring.md) for the
+human viewer, daemon requirements and migration from direct stdio registration.
 
 ## Step 4: Install or verify the global companion controls
 
@@ -259,9 +281,30 @@ This file is only a candidate. Writing it does not grant authority. It must be a
 normal file, not a symlink, and every relative root resolves under the
 repository root according to policy validation rules.
 
+## Step 5a: Configure the human keyboard monitor
+
+Configure the native editor entry once using the installed runtime and server
+Python. The helper previews the exact shell files, preserves an existing editor,
+backs up replaced files and installs one managed block without changing `codex`:
+
+```bash
+/ABSOLUTE/GPU_MCP_SERVER_PYTHON /ABSOLUTE/GPU_MCP_ROOT/gpu_mcp_codex_terminal_setup.py --preview
+/ABSOLUTE/GPU_MCP_SERVER_PYTHON /ABSOLUTE/GPU_MCP_ROOT/gpu_mcp_codex_terminal_setup.py
+```
+
+Show the concrete global configuration change before applying it. Use the user's
+login shell; bash, zsh and fish are supported. The installer performs this step,
+so the human does not need to choose or export `VISUAL`/`EDITOR` manually.
+
+New terminal sessions load the setting automatically. The current Codex process
+keeps its inherited environment; open a new terminal for first activation. Keep
+ordinary `codex` and `codex resume`. Ctrl+G opens a chooser for the repo monitor
+or normal prompt editing. Escape returns to Codex; monitor data never becomes
+draft text. Other applications retain the previous editor.
+
 ## Step 6: Restart Codex and establish trust
 
-Restart Codex from `RESEARCH_REPO` after changing the MCP command, arguments,
+Start Codex in the new terminal from `RESEARCH_REPO` after changing the MCP command, arguments,
 environment, hook, or project configuration. Trust the project when prompted,
 then inspect and trust the exact global hook definition.
 
@@ -331,6 +374,44 @@ all deployment paths explicit:
 proof. A live GPU launch proof is optional and must use an explicitly selected
 host and harmless probe. The full battlefield suite is maintainer acceptance
 testing, not a required step for every research repository.
+
+## Upgrading an existing repository
+
+Confirm the installed runtime and interpreter from the repository's existing
+registration. Update that runtime first; do not substitute another checkout.
+For an already-approved policy, preview the supported registration upgrade:
+
+```bash
+/ABSOLUTE/GPU_MCP_SERVER_PYTHON /ABSOLUTE/GPU_MCP_ROOT/gpu_mcp_codex_upgrade.py \
+  --config /ABSOLUTE/RESEARCH_REPO/gpu-mcp.toml
+```
+
+`ready` means the direct registration can be switched. Apply the same command
+with `--apply` within the human's authorized upgrade scope. It saves a backup
+and changes only the server entrypoint. The policy, its approval history,
+environment and existing tool approval modes remain unchanged. Skip the initial
+policy-preview/approval steps when the policy has not changed.
+
+`blocked` lists unfinished jobs, including CPU builds that hold no GPU booking.
+Keep their original server connected until they finish, and avoid new launches
+during the upgrade. Do not force adoption or remove their reservations.
+`already_shared` needs no registration change. Unsupported registrations or
+policy drift require reviewing the specific reported condition.
+
+Run the terminal setup preview/apply commands in Step 5 if the monitor has not
+been installed. New terminals load it automatically. In an existing bash/zsh
+terminal, quit Codex and source `~/.config/gpu-mcp/codex-terminal-env.sh` once;
+fish uses `source ~/.config/gpu-mcp/codex-terminal-env.fish`.
+
+Have the human resume the same conversation with ordinary `codex resume`, then
+verify one read-only GPU MCP call. A resumed conversation retains its native
+ownership for future shared-backend jobs. Old untagged jobs are not reassigned.
+Saved tool approvals still apply; a noninteractive `codex exec` with approval
+policy `never` can reject a tool that an interactive session would prompt for.
+Do not broaden those approvals to make a probe pass.
+
+No daemon restart, package pin, global feature change or unscoped MCP reload is
+part of this upgrade.
 
 ## Failure map
 
