@@ -92,6 +92,11 @@ reservation and PID. This handles a delayed control-side filesystem view without
 rerunning successful work. Invalid or unavailable results remain uncertain;
 SSH verification continues with bounded retries. Reconciliation clears old
 uncertainty text and updates the process observation used by log diagnostics.
+Before sending a pending uncertainty alert, delivery checks the job once more.
+A result recovered in that check cancels the alert. A newer process observation
+replaces an unsent, obsolete uncertainty message; accepted messages stay in the
+history. A genuinely unavailable result still alerts its owner and keeps its
+reservation.
 Launch tools accept an optional, single-line `job_title` of at most 120
 characters, such as “Learning-rate sweep, seed 3”. This labels the human view;
 it does not alter the command, polling, permissions or scientific outcome.

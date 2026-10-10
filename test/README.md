@@ -102,6 +102,24 @@ The producer-read cases model a negative control-side lookup after the execution
 host has published its result. They verify the generated reader locally and
 never connect to SSH or launch GPU work.
 
+`test/test_gpu_mcp_completion_delivery.py` runs notification delivery while
+result verification is pending. It checks a result that becomes available
+before the next monitor pass, obsolete process observations, and an alert that
+must remain actionable when the result is genuinely missing.
+
+Run the direct remote completion checks on explicitly selected SSH hosts:
+
+```bash
+GPU_MCP_LIVE_OUTCOME_HOSTS=host_a,host_b pytest -q -s test/test_gpu_mcp_remote_completion_live.py
+```
+
+These checks use the real guarded runner, supervisor, SSH process inspection and
+execution-host reader in separate shared-filesystem fixtures. The controller's
+result lookup stays unavailable, and one case discards the first valid reply.
+The scripts only sleep and exit; their reservation registry is private to the
+test. No CUDA work or Codex turn runs, and the human demo fixture is unchanged.
+Delivery is captured locally; this does not retest native conversation wake-up.
+
 The `/monitor` frontend has focused local checks in
 `test/test_gpu_mcp_codex_cli.py`. A separate native case verifies that a human
 canary never reaches the model. The [true live manual procedure](TRUE_LIVE_SHARED_MONITORING.md)

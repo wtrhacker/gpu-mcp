@@ -207,6 +207,10 @@ class JobStore:
                 db.execute("UPDATE events SET state='resolved',error='resolved by a newer observation' "
                            "WHERE job_id=? AND attempt_id=? AND kind IN (?,?) AND state!='accepted'",
                            (job_id, attempt, *sorted(UNCERTAIN_STATES)))
+            else:
+                db.execute("UPDATE events SET state='resolved',error='replaced by a newer process observation' "
+                           "WHERE job_id=? AND attempt_id=? AND kind IN (?,?) AND kind!=? AND state!='accepted'",
+                           (job_id, attempt, *sorted(UNCERTAIN_STATES), state))
             if state in TERMINAL_STATES and not record.get("active_reservation"):
                 db.execute("UPDATE events SET state='resolved',error='job management completed' "
                            "WHERE job_id=? AND attempt_id=? AND kind IN ('monitor_failure','lease_failure') "

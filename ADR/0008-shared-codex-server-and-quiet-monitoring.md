@@ -227,6 +227,13 @@ committing it. This avoids waiting for a control-side NFS lookup to refresh.
 Unavailable or invalid replies retain uncertainty and its existing retry/alert
 rules. Successful reconciliation clears stale uncertainty text and saves the
 latest process observation for subsequent diagnostics.
+Recheck an unsent uncertainty event before delivery: the monitor and delivery
+threads may observe different stages of result availability. Cancel the alert
+when the new check verifies a result or restores known process state. Resolve
+an unsent uncertainty event when a newer observation changes its kind, so the
+owner receives the current problem once. Retain accepted messages as history.
+An unavailable or invalid result still alerts and remains reserved; a delivery
+acknowledgement that is uncertain is not blindly resent.
 
 ### Private events and visible alerts
 

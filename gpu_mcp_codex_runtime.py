@@ -425,6 +425,19 @@ class CodexRuntime:
                     continue
                 previous_state = latest["state"]
                 try:
+                    if (latest['kind'] in UNCERTAIN_STATES and latest['state'] in {'pending', 'archived'}
+                            and record.get('job_kind', 'gpu') == 'gpu'
+                            and not self.server._stale_policy_refusal()):
+                        # The monitor and delivery run independently. A result
+                        # may have become readable since the failed check.
+                        # Verify once more before waking the owner with that
+                        # older observation, using the same identity/lease rules.
+                        with self.acting_as(Origin(record['origin_thread_id'])), self.operation(record):
+                            self.server._manage_gpu_job_impl(action='status', job_id=record['job_id'],
+                                early_poll_reason='Verify the result before delivering an uncertainty alert.')
+                        latest = self.store.event(event['event_id'])
+                        if latest is None or latest['state'] not in DELIVERABLE_STATES:
+                            continue
                     result = self.daemon.deliver(latest, self.server.REPO_ROOT, before_send=lambda:
                         self.store.delivery(event["event_id"], "sending"))
                     if result == 'pending' and latest['kind'] == 'poll':
