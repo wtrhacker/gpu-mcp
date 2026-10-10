@@ -92,6 +92,7 @@ raise SystemExit({exit_code})
 def stage_demo(repo, plan, *, durations=None):
     """Update fixture jobs/inputs only. Never approve policy or start a backend."""
     repo = Path(repo).resolve()
+    reservations.ensure_repo_job_state_root(repo)
     now = datetime.now(timezone.utc)
     round_name = 'demo_' + now.strftime('%Y%m%dT%H%M%SZ') + '_' + secrets.token_hex(2)
     plan = dict(plan, round=int(plan.get('round', 0)) + 1, round_prepared_at=now.isoformat(),

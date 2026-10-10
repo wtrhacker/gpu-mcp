@@ -120,6 +120,25 @@ The scripts only sleep and exit; their reservation registry is private to the
 test. No CUDA work or Codex turn runs, and the human demo fixture is unchanged.
 Delivery is captured locally; this does not retest native conversation wake-up.
 
+`test/test_gpu_mcp_launch_state_paths.py` checks that a file or symlink blocking
+managed-job state is refused before a new GPU booking or SSH launch. Retry keeps
+its prior attempt and reservation when setup is blocked.
+`test/test_gpu_mcp_process_exit_race.py` checks a process exiting between `ps`
+and fingerprint inspection, including zombie, owner-change, surviving-process
+and unavailable-probe cases. These facts do not permit guessing success.
+
+Run the prepared human fixture through the actual native permission boundary:
+
+```bash
+GPU_MCP_RUN_MANUAL_SANDBOX_TESTS=1 pytest -q -s test/test_manual_shared_monitoring_native.py
+```
+
+This uses the same `prepare` function, public workflow inputs and original A/B
+smoke scripts, with Codex's blind filesystem profile active. Both real scripts
+must succeed, release their private test reservations and emit only their own
+completion. No model or CUDA computation runs. This checks a boundary that
+isolated backend fixtures and direct script execution do not cover.
+
 The `/monitor` frontend has focused local checks in
 `test/test_gpu_mcp_codex_cli.py`. A separate native case verifies that a human
 canary never reaches the model. The [true live manual procedure](TRUE_LIVE_SHARED_MONITORING.md)

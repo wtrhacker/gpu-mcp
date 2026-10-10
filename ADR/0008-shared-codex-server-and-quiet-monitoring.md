@@ -234,6 +234,13 @@ an unsent uncertainty event when a newer observation changes its kind, so the
 owner receives the current problem once. Retain accepted messages as history.
 An unavailable or invalid result still alerts and remains reserved; a delivery
 acknowledgement that is uncertain is not blindly resent.
+Prepare managed-job state directory roots before applying native blind test
+permissions. Cleanup empties job history while preserving the directory targets.
+Approved shared backends prepare the roots at startup; launch and retry reject a
+file or symlink obstruction before booking a new GPU or changing an attempt.
+If a process disappears between its liveness and fingerprint probes, perform
+one bounded liveness recheck. Proven disappearance permits normal result
+verification; an alive or uninspectable process does not permit release.
 
 ### Private events and visible alerts
 

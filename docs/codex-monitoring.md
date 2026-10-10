@@ -97,6 +97,13 @@ A result recovered in that check cancels the alert. A newer process observation
 replaces an unsent, obsolete uncertainty message; accepted messages stay in the
 history. A genuinely unavailable result still alerts its owner and keeps its
 reservation.
+Approved backends prepare the managed-job state directory roots at startup.
+Launch and retry check them again before starting an attempt. A file or link
+blocking state storage causes a setup refusal, rather than a new unknown launch
+and reservation. Blind test fixtures also prepare these directory targets before
+native sandbox use and retain them during cleanup. If fingerprint inspection
+fails as a process exits, a bounded second liveness check can establish that
+exit; a surviving or uninspectable process remains conservative.
 Launch tools accept an optional, single-line `job_title` of at most 120
 characters, such as “Learning-rate sweep, seed 3”. This labels the human view;
 it does not alter the command, polling, permissions or scientific outcome.

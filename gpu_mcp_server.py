@@ -1903,12 +1903,28 @@ def _inspect_reservation_process(metadata: dict) -> dict:
         )
         observed_fingerprint = _host_run(host, env_cmd, timeout=1)
         if observed_fingerprint is None:
+            # ps may have observed the supervisor just before it exited. A
+            # missing /proc environment alone is ambiguous; recheck the PID
+            # before turning that normal exit into an identity warning.
+            rechecked = _host_run(host, ps_cmd, timeout=2)
+            if ((rechecked is not None and not rechecked.strip())
+                    or (rechecked is None and _ps_exit_indicates_process_missing(_host_run_error(host, ps_cmd)))):
+                return {"status": "gone", "reason": "process exited during fingerprint inspection", "remote_pid": pid}
+            fresh_fields = rechecked.split(None, 3) if rechecked else []
+            if len(fresh_fields) == 4 and (
+                fresh_fields[1] != metadata.get('owner_user') or 'Z' in fresh_fields[2]
+                or (expected_start and fresh_fields[3].strip() != str(expected_start).strip())
+            ):
+                return {"status": "gone", "reason": "original process changed during fingerprint inspection", "remote_pid": pid}
             reservation_key_value = metadata.get("reservation_key")
             current_owner_start_match = (
                 metadata.get("server_instance_id") == SERVER_INSTANCE_ID
                 and reservations.is_reservation_key(reservation_key_value)
                 and str(reservation_key_value) in HEARTBEAT_MANAGER.owned_keys()
                 and bool(expected_start)
+                and len(fresh_fields) == 4
+                and fresh_fields[1] == metadata.get('owner_user')
+                and fresh_fields[3].strip() == str(expected_start).strip()
             )
             if current_owner_start_match:
                 gpu_index, gpu_memory = _process_gpu_usage(host, pid, timeout=1)
@@ -2523,6 +2539,10 @@ def _start_managed_attempt(
     next_poll_after: str,
     async_mode_requested: bool,
 ) -> str:
+    try:
+        reservations.ensure_repo_job_state_root(REPO_ROOT)
+    except (OSError, ValueError) as exc:
+        return _owned_lifecycle_refusal('retry', job_record, str(exc))
     job_id = str(job_record["job_id"])
     poll_interval_sec = _job_poll_interval(job_record)
     reservation_key_value = str(metadata["reservation_key"])
@@ -4299,8 +4319,11 @@ def _run_python_on_gpu_impl(
 
     try:
         _prepare_output_parent(out_path)
-    except ValueError as e:
+        reservations.ensure_repo_job_state_root(REPO_ROOT)
+    except (OSError, ValueError) as e:
         return _launch_refusal(str(e), host=canonical_host, gpu_index=gpu_index, reservation_key=reservation_key_value)
+    if CODEX_RUNTIME is not None:
+        CODEX_RUNTIME.health.pop('launch_state', None)
 
     job_id = reservations.generate_job_id()
     attempt_id = reservations.generate_attempt_id()

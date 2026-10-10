@@ -34,6 +34,12 @@ The preparation command creates neutral job names, separate logs, bounded hidden
 delays, a repo-local shared MCP registration, human-only prompts/start commands,
 and a permission profile denying reads to `jobs`, `.human-test`, `logs` and
 `.gpu_mcp_state`. It never starts a model session, approves policy or launches a job.
+Preparation creates `.gpu_mcp_state/jobs` as empty real directories before the
+blind profile is used. Keep these directory roots during cleanup. A missing
+denied path can temporarily appear as a read-only file on the host while a
+native sandbox command runs, which blocks an executor trying to create job
+state beneath it. Verify directory types as well as empty job history before
+opening a new experiment.
 
 The same absolute fixture path must exist on both execution hosts. Review and
 approve its policy through the normal preview/reload boundary. Use the current

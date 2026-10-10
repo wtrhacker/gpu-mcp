@@ -150,6 +150,21 @@ def repo_job_state_root(repo_root: str | Path) -> Path:
     return Path(repo_root).expanduser().resolve() / REPO_JOB_STATE_RELATIVE
 
 
+def ensure_repo_job_state_root(repo_root: str | Path) -> Path:
+    """Prepare real directory targets before launch or agent sandbox setup.
+
+    A denied but absent path may be materialized as a file by a sandbox. Do not
+    overwrite that obstruction or follow a link: fail before a job is launched.
+    """
+    root = repo_job_state_root(repo_root)
+    for path in (root.parent, root):
+        _assert_no_symlink_ancestors(path)
+        if path.exists() and not path.is_dir():
+            raise ValueError(f"Managed-job state path must be a directory: {path}")
+        path.mkdir(mode=0o700, exist_ok=True)
+    return root
+
+
 def job_record_path(repo_root: str | Path, job_id: str) -> Path:
     if not is_job_id(job_id):
         raise ValueError("job_id has invalid format")

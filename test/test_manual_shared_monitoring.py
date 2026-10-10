@@ -25,7 +25,7 @@ def test_preparation_is_hidden_neutral_and_does_not_launch_jobs(tmp_path):
     result = create(tmp_path)
     repo = Path(result['repo'])
     assert result['jobs_launched'] is False
-    assert not (repo / '.gpu_mcp_state').exists()
+    assert list((repo / '.gpu_mcp_state/jobs').iterdir()) == []
     plan = json.loads((repo / '.human-test/plan.json').read_text())
     assert plan['resource_selection'] == 'agent'
     assert plan['cases']['a']['delay_sec'] >= 140
@@ -156,3 +156,21 @@ def test_observer_tracks_both_stages_in_each_conversation(tmp_path):
     assert {name: expected['script_name'] for name, expected in observation_targets(plan)} == {
         'a_smoke': 'smoke_a.py', 'a_main': 'experiment_a.py',
         'b_smoke': 'smoke_b.py', 'b_main': 'experiment_b.py'}
+
+
+def test_preparation_creates_directory_targets_before_codex_denies_them(tmp_path):
+    repo = Path(create(tmp_path)['repo'])
+    assert (repo / '.gpu_mcp_state').is_dir()
+    assert (repo / '.gpu_mcp_state/jobs').is_dir()
+    assert list((repo / '.gpu_mcp_state/jobs').iterdir()) == []
+
+
+def test_new_round_recreates_empty_state_directories_after_cleanup(tmp_path):
+    import shutil
+    repo = Path(create(tmp_path)['repo'])
+    state = repo / '.gpu_mcp_state'
+    if state.exists():
+        shutil.rmtree(state)
+    plan = json.loads((repo / '.human-test/plan.json').read_text())
+    stage_demo(repo, plan)
+    assert (state / 'jobs').is_dir()

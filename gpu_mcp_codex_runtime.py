@@ -53,6 +53,13 @@ class CodexRuntime:
         self.request_shutdown = None
         self.health = {"monitor": "ready", "delivery": "ready"}
         self.validate_policy(server.CONFIG_POLICY)
+        if server.CONFIG_POLICY is not None:
+            try:
+                reservations.ensure_repo_job_state_root(server.REPO_ROOT)
+            except (OSError, ValueError) as exc:
+                # Historical job diagnostics remain available. Launch performs
+                # this check again before booking or contacting an executor.
+                self.health['launch_state'] = str(exc)
         for name in ('run_python_on_gpu', 'build_python_artifact', 'manage_gpu_job'):
             tool = server.mcp._tool_manager.get_tool(name)
             if tool is not None and not tool.description.startswith(MONITORING_GUIDANCE):
