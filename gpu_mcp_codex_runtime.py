@@ -261,6 +261,36 @@ class CodexRuntime:
             compact['management_complete'] = payload.get('active_reservation') is False
         return json.dumps(compact)
 
+    def _recover_previous_job(self, record):
+        if record.get("job_kind", "gpu") != "gpu":
+            return False
+        with self.acting_as(Origin(record["origin_thread_id"])), self.operation(record) as latest:
+            if (latest["active_attempt_id"] != record["active_attempt_id"]
+                    or latest["server_instance_id"] != record["server_instance_id"]):
+                return True
+            outcome = self.server._read_outcome_record(latest) or latest.get("outcome")
+            lifecycle = self.server._job_lifecycle_from_outcome(outcome)
+            if lifecycle is None:
+                return False
+            if (latest.get("job_lifecycle") != lifecycle or latest.get("outcome") != outcome
+                    or latest.get("next_poll_after") is not None):
+                latest = dict(latest, job_lifecycle=lifecycle, outcome=outcome, next_poll_after=None)
+                self.server._write_repo_job_record(latest)
+            if not latest.get("active_reservation", bool(latest.get("reservation_key"))):
+                return True
+            metadata = self.server._read_reservation_metadata(latest.get("reservation_key"))
+            if (metadata is not None and self.server._job_record_matches_current_metadata(latest, metadata)
+                    and not self.server._metadata_stale(metadata)):
+                return True
+            identity = (latest["job_id"], latest["active_attempt_id"])
+            if self._release_after.get(identity, 0) > time.monotonic():
+                return True
+            response = json.loads(self.server._manage_gpu_job_impl(action="status", job_id=latest["job_id"]))
+            if response.get("status") in {"error", "refused"}:
+                raise RuntimeError(response.get("reason", "completed job recovery failed"))
+            self._release_after[identity] = time.monotonic() + 30
+            return True
+
     def monitor_once(self):
         if self.server._stale_policy_refusal():
             self.health["monitor"] = "policy requires activation or reload"
@@ -271,12 +301,19 @@ class CodexRuntime:
         now = self.server.datetime.now(self.server.timezone.utc)
         for record in self.store.records():
             state = record.get("job_lifecycle", "running")
-            # Never adopt or mutate a previous server instance's reservation.
+            # Recover verified completions without adopting an older backend's
+            # live jobs, heartbeats, stop/retry authority or reservation owner.
             if record.get("server_instance_id") != self.server.SERVER_INSTANCE_ID:
-                if state not in TERMINAL_STATES:
-                    self.store.notice(record, "backend_restarted",
-                        "The owning backend stopped. Its reservation has not been adopted. Inspect this job before recovery.",
-                        key=self.server.SERVER_INSTANCE_ID)
+                if state in TERMINAL_STATES and not record.get("active_reservation", bool(record.get("reservation_key"))):
+                    continue
+                try:
+                    recovered = self._recover_previous_job(record)
+                    if not recovered and state not in TERMINAL_STATES:
+                        self.store.notice(record, "backend_restarted",
+                            "The owning backend stopped. Its reservation has not been adopted. Inspect this job before recovery.",
+                            key=self.server.SERVER_INSTANCE_ID)
+                except Exception as exc:
+                    self.alert(record, "monitor_failure", "Completed job recovery failed: " + str(exc))
                 continue
             if state == "launching" and self._calls:
                 continue

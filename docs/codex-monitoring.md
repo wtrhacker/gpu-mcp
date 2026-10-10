@@ -140,7 +140,12 @@ pagination is supported. A lost acknowledgement is not blindly resent.
 Archived conversations stay archived. Their events are retained, and delivery
 can resume after the human unarchives the conversation. Events are never sent
 to another session. A backend restart preserves results and events but does not
-adopt another server instance's GPU leases. Recovery is shown explicitly.
+adopt another server instance's GPU leases. It saves verified GPU-job completions and
+recovers their orphaned reservations once stale, with process-gone proof and a
+locked identity/heartbeat check. Alive or uncertain processes stay reserved.
+Completion clears the saved check time; recovery updates the booking state and
+resolves any pending restart alert for that job. Direct stdio status calls use
+the same safe stale cleanup and persist terminal state.
 
 ## Human terminal monitor
 

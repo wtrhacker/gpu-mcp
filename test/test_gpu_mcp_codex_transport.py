@@ -169,6 +169,7 @@ def test_monitor_pty_renders_and_escape_leaves_backend_running(backend):
     before = request(info, '/human/snapshot', human=True)
     selected = before['jobs'][1]
     selected_log = Path(selected['output_file']).stem + ' private log'
+    beta_job = next(r['job_id'] for r in before['jobs'] if Path(r['output_file']).stem == 'beta')
     master, slave = pty.openpty()
     process = subprocess.Popen([sys.executable, str(SOURCE / "gpu_mcp_codex_monitor.py"),
         "--config", str(policy), "--state-base", str(base)], stdin=slave, stdout=slave, stderr=slave,
@@ -188,8 +189,11 @@ def test_monitor_pty_renders_and_escape_leaves_backend_running(backend):
     try:
         await_text(b'GPU MCP Monitor')
         start = len(capture)
-        os.write(master, b'/beta\r')
-        await_text(b'beta', start)
+        os.write(master, b'/beta\r\x1bOC')
+        # Curses can echo each search character in separate cursor updates.
+        # Verify the filtered job in Details rather than the raw input echo.
+        await_text(beta_job.encode(), start)
+        os.write(master, b'\x1bOD')
         # Search text is handled inside the human viewer, then cleared there.
         os.write(master, b'/\x15\r')
         os.write(master, b'\x1bOB')  # Actual application-mode Down arrow.

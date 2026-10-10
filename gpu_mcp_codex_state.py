@@ -211,6 +211,9 @@ class JobStore:
                 db.execute("UPDATE events SET state='resolved',error='job management completed' "
                            "WHERE job_id=? AND attempt_id=? AND kind IN ('monitor_failure','lease_failure') "
                            "AND state IN ('pending','archived')", (job_id, attempt))
+                db.execute("UPDATE events SET state='resolved',error='completed job recovered' "
+                           "WHERE job_id=? AND attempt_id=? AND kind='backend_restarted' "
+                           "AND state IN ('pending','archived')", (job_id, attempt))
             if state in TERMINAL_STATES | UNCERTAIN_STATES:
                 payload = event_payload(record)
                 episode = record.get('verification_pending_since', '') if state in UNCERTAIN_STATES else ''

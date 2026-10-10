@@ -140,6 +140,12 @@ The backend owns reservations on behalf of all its jobs; session ownership
 restricts which agent can access each job. Backend process ownership and
 conversation ownership remain separate checks. A backend restart does not
 automatically adopt or renew reservations created by a previous server instance.
+It does reconcile verified GPU-job completions from that instance. Save the result and
+its owner event first, then recover a matching stale reservation only after
+process-gone proof and a locked reread of the job, attempt, process identity,
+owner and heartbeat. A missing or replaced reservation is recorded as inactive
+for the old job. Alive or uncertain processes retain their reservations and
+require explicit recovery; the new backend gains no stop or retry authority.
 
 This boundary covers GPU MCP interfaces and delivered context. Shared workspace
 files and out-of-band access to the local daemon are separate trust boundaries;

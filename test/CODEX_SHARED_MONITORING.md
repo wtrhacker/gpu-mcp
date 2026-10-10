@@ -14,6 +14,7 @@ fixtures or required inputs to this suite.
 | --- | --- |
 | `test_gpu_mcp_codex_state.py` | Native identity, immutable ownership, GPU/CPU result-event transactions, injected event-write failure, restart persistence, attempt conflicts and per-job locks. |
 | `test_gpu_mcp_codex_shared.py` | Real server tools with controlled process facts: foreign reads/mutations, listings, smoke/PID boundaries, fixed stale timing, quiet checks, result-before-release, CPU builds, concurrency, policy drift and scoped alerts. |
+| `test_gpu_mcp_restart_recovery.py` | Fresh server imports with old completed GPU jobs: direct/shared status, automatic owner recovery, cached results, missing/replaced bookings, fresh/alive/uncertain reservations, transaction failures, locked identity races and a new booking's heartbeat after recovery. |
 | `test_gpu_mcp_codex_delivery.py` | Queued delivery shape, archived/unloaded threads, acknowledgement reconciliation, private success/visible failure instructions and display adaptation. |
 | `test_gpu_mcp_codex_transport.py` | Actual localhost backends and stdio gateways, automatic reuse, separate repo identity, native request metadata, agent/human authentication, read-only snapshots and PTY monitor closure. |
 | `test_gpu_mcp_codex_concurrency.py` | A slow synchronous tool or human snapshot cannot block health/other calls; native caller context and tool schemas survive HTTP offloading. |
@@ -34,6 +35,17 @@ the existing daemon and disposable threads; it does not restart the daemon,
 change global Codex configuration, or edit the real repository policy.
 
 ## Running the Tests
+
+The completed-orphan regression uses temporary reservations and real server
+re-imports. It launches no models, GPU computation or SSH work:
+
+```bash
+pytest -q test/test_gpu_mcp_restart_recovery.py
+```
+
+It covers both legacy JSON persistence and the shared backend's protected
+result/event transaction. Recovery must preserve the launching conversation
+and old server ID, without adopting a heartbeat or stop/retry authority.
 
 Run local contracts with the runtime Python:
 

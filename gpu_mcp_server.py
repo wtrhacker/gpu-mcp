@@ -1947,9 +1947,10 @@ def _cleanup_stale_gone_reservation(reservation_key_value: str, metadata: dict) 
             if not _metadata_stale(latest):
                 return False, {"status": "alive", "reason": "heartbeat refreshed during cleanup"}
             if (
-                latest.get("job_id") != metadata.get("job_id")
-                or latest.get("remote_pid") != metadata.get("remote_pid")
-                or latest.get("server_instance_id") != metadata.get("server_instance_id")
+                any(latest.get(field) != metadata.get(field) for field in (
+                    "job_id", "attempt_id", "remote_pid", "server_instance_id",
+                    "repo", "owner_user", "process_fingerprint", "remote_start_time", "remote_boot_id",
+                ))
                 or not _metadata_matches_reservation_key(reservation_key_value, latest)
             ):
                 return False, {"status": "alive", "reason": "metadata changed during cleanup"}
@@ -3097,7 +3098,7 @@ def _job_status_response(
                 job_lifecycle = "launch_outcome_unknown"
                 reason = inspection.get("reason", "job inspection is uncertain")
             if inspection["status"] == "gone":
-                outcome = _read_outcome_record(job_record)
+                outcome = _read_outcome_record(job_record) or local_outcome
                 terminal_lifecycle = _job_lifecycle_from_outcome(outcome)
                 if terminal_lifecycle is None:
                     job_lifecycle = "process_gone_unknown_outcome"
@@ -3105,28 +3106,40 @@ def _job_status_response(
                         reason = "Process is gone; its verified final result is not available yet."
                 else:
                     job_lifecycle = terminal_lifecycle
-    if CODEX_RUNTIME is not None and terminal_lifecycle is not None:
-        job_record = dict(job_record, job_lifecycle=terminal_lifecycle, outcome=outcome,
-                          next_poll_after=None, last_status_checked_at=reservations.iso_timestamp())
-        _write_repo_job_record(job_record)
+    if terminal_lifecycle is not None:
+        job_lifecycle = terminal_lifecycle
+        if job_record.get("repo_local_record", True):
+            job_record = dict(job_record, job_lifecycle=terminal_lifecycle, outcome=outcome,
+                              active_reservation=active_reservation, next_poll_after=None,
+                              last_status_checked_at=reservations.iso_timestamp())
+            # Save completion (and the shared owner event) before either owned
+            # release or recovery of a stale reservation from an older server.
+            _write_repo_job_record(job_record)
     if (
         terminal_lifecycle is not None
         and active_reservation
-        and owned
-        and healthy
         and metadata is not None
-        and (CODEX_RUNTIME is None or process.get("status") == "gone")
     ):
         reservation_key_text = str(metadata["reservation_key"])
-        if CODEX_RUNTIME is not None:
-            job_record = dict(job_record, job_lifecycle=terminal_lifecycle, outcome=outcome,
-                              next_poll_after=None, last_status_checked_at=reservations.iso_timestamp())
-            _write_repo_job_record(job_record)
-        else:
-            HEARTBEAT_MANAGER.unregister(reservation_key_text)
-        removed, _remove_reason = _remove_owned_finished_reservation(job_record, metadata)
+        removed = False
+        if owned and healthy and (CODEX_RUNTIME is None or process.get("status") == "gone"):
+            if CODEX_RUNTIME is None:
+                HEARTBEAT_MANAGER.unregister(reservation_key_text)
+            removed, _remove_reason = _remove_owned_finished_reservation(job_record, metadata)
+        elif (
+            not owned
+            and job_record.get("repo_local_record", True)
+            and _job_record_matches_current_metadata(job_record, metadata)
+            and metadata.get("repo") == str(REPO_ROOT)
+            and metadata.get("remote_pid") == job_record.get("remote_pid")
+            and all(not job_record.get(field) or job_record[field] == metadata.get(field)
+                    for field in ("process_fingerprint", "remote_start_time", "remote_boot_id"))
+            and _metadata_stale(metadata)
+            and process.get("status") == "gone"
+        ):
+            removed, _inspection = _cleanup_stale_gone_reservation(reservation_key_text, metadata)
         if removed:
-            if CODEX_RUNTIME is not None:
+            if CODEX_RUNTIME is not None and owned:
                 HEARTBEAT_MANAGER.unregister(reservation_key_text)
             now = reservations.iso_timestamp()
             updated = dict(job_record)
