@@ -81,14 +81,16 @@ def repo_choices(config=None, base=None):
     return choices
 
 
-def choose(screen, policies, base):
+def choose(screen, policies, base, *, allow_edit=True):
     from gpu_mcp_codex_monitor import connect_viewer, view
     from gpu_mcp_monitor_display import safe_text
     curses.curs_set(0)
     curses.set_escdelay(25)
     screen.keypad(True)
     rows = [(f'Monitor jobs — {policy.parent}', policy) for policy in policies]
-    rows += [('Edit prompt in your text editor', 'edit'), ('Cancel', None)]
+    if allow_edit:
+        rows.append(('Edit prompt in your text editor', 'edit'))
+    rows.append(('Cancel', None))
     selected, error = 0, ''
     while True:
         screen.timeout(-1)

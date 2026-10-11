@@ -146,25 +146,50 @@ Do not substitute another checkout for the installed runtime.
 
 The agent will create the repo-local MCP registration and policy candidate,
 then ask the human to review the raw policy preview before activation.
-It also configures the native keyboard monitor once. New terminal sessions load
-that setup automatically; users keep ordinary `codex` / `codex resume`. Ctrl+G
-offers the monitor and normal prompt editing. See
+It also configures the keyboard monitor. On Linux with tmux 3.2+, Ctrl+G opens
+the monitor in existing tmux/Byobu panes immediately. Outside tmux, new shells
+load the native monitor/editor setting. Users keep ordinary `codex` / `codex
+resume`. See
 [the monitor guide](docs/codex-monitoring.md).
 
 ## Updating the runtime
 
-For a single-checkout installation:
+Pulling or copying code updates the runtime files. Existing research projects
+also retain their own registration, approvals and running backend. Use this
+upgrade sequence:
 
-1. Review and update the checkout using your normal Git workflow.
-2. Re-run `"$GPU_MCP_SERVER_PYTHON" -m pip install "mcp>=1.28,<2" fabric paramiko uvicorn websocket-client`.
-3. Run the import check above and the relevant tests.
-4. Restart Codex so it launches the updated process.
+1. Finish active jobs through their owning backend before replacing execution
+   code. Updating files does not update an already-running Python process.
+2. Update the path actually named by each project's `.codex/config.toml`. For a
+   separate home deployment, follow `LOCAL_DEPLOYMENT.md` and preserve runtime
+   state, environments, host configuration and credentials.
+3. Refresh dependencies in the registered server interpreter:
+   `"$GPU_MCP_SERVER_PYTHON" -m pip install "mcp>=1.28,<2" fabric paramiko uvicorn websocket-client`.
+   Run the import check above; the full maintainer test suite is not a per-user
+   upgrade requirement.
+4. Migrate older direct registrations with `gpu_mcp_codex_upgrade.py`, as
+   described below. Check the tool approval entries against Step 3 of the
+   [installer guide](AI_native_installer/INSTALL_FOR_AI.md). Existing explicit
+   restrictions must be preserved; missing entries for newly installed tools
+   can be approved together during setup instead of at each first call.
+5. Run `gpu_mcp_codex_terminal_setup.py --preview`, then apply it. This activates
+   Ctrl+G in existing tmux/Byobu panes and configures the native editor route for
+   new shells elsewhere.
+6. For a shared backend whose code changed, use
+   `gpu_mcp_codex_launcher.py --config /absolute/repo/gpu-mcp.toml --stop-if-idle`.
+   It refuses active jobs or requests. Resume Codex to refresh the tool catalog
+   and let the configured launcher start the updated backend.
 
-For a separate deployment, use the local synchronization procedure from
-`LOCAL_DEPLOYMENT.md`. It must preserve runtime state and environments. After
-synchronizing, refresh dependencies, verify the deployed files, and restart
-Codex. Never derive the deployment source or destination from the current
-working directory alone.
+GPU policy approval is separate from tool-call approval. An unchanged
+`gpu-mcp.toml` keeps its approval. Optional artifact builds require the separately
+approved `build_enabled` setting. MPS extends `run_python_on_gpu` and
+`manage_gpu_job`, so it needs their refreshed schemas rather than new tool names;
+its execution host also needs the [MPS requirements](docs/mps.md).
+Keep `reload_policy` at `approval_mode = "prompt"`.
+
+This process does not require restarting or pinning the shared Codex daemon.
+GPU MCP needs that daemon available for private result delivery, but does not
+own its installation or update channel.
 
 Updating the runtime does not rewrite existing research-repo registrations.
 For a Codex repo still pointing to `gpu_mcp_server.py`, the installer runs

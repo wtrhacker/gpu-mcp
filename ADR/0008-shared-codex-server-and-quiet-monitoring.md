@@ -3,13 +3,15 @@
 ## Status
 
 Accepted design, 2026-10-06. The shared backend, ownership boundary, quiet
-monitoring and terminal viewer are implemented. The selected human entry uses
-Codex's native external-editor keyboard action, with one-time installer setup.
+monitoring and terminal viewer are implemented. Ctrl+G uses the native external
+editor, or a direct popup in existing Linux tmux/Byobu panes, with installer setup.
 Users keep ordinary `codex` and `codex resume`. An exact plugin `/monitor`
 command remains unresolved; the tested frontend wrapper is a prototype.
 Implementation and compatibility evidence are recorded separately from the initial probe.
 Amended on 2026-10-09: normal polling results reach the owner privately, pending
 idle updates are combined, and transient verification has a ten-second alert grace.
+Amended on 2026-10-11: tmux/Byobu receives a foreground-Codex shortcut so existing
+panes do not depend on inherited editor variables.
 
 An isolated live probe against Codex CLI and app-server 0.160.1 demonstrated
 shared HTTP MCP access, native caller identity, private model context, and
@@ -357,6 +359,18 @@ previous editor and applying the setting automatically in new terminals. No
 daemon restart, skill prompt or model decision is needed to open the view.
 Keyboard acceptance must cover draft preservation, private display data,
 selection/Escape and operation while another task is active.
+
+An existing tmux shell does not reread its startup file when another Codex
+conversation starts. Repeated failures exposed this gap in the editor-only
+activation path. On Linux with tmux 3.2+, the installer now activates a direct
+Ctrl+G popup in existing panes and persists it in tmux and Byobu configuration.
+The dispatcher verifies the foreground Codex process group, including npm's
+Node parent. Other applications receive Ctrl+G normally. Custom bindings are
+preserved. The popup reuses the same human viewer without inserting text or
+touching the Codex draft, GPU policy, backend ownership or daemon lifecycle.
+The native editor route remains available outside tmux. Tests install the
+shortcut after a frontend has started with both editor variables absent, and
+exercise real popup navigation, Escape and draft preservation in Codex.
 
 A small PTY wrapper was tested as a prototype: typed `/monitor` opens the human
 viewer, and Escape restores the conversation. Native tests verified human-only

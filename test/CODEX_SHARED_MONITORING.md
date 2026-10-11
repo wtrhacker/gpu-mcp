@@ -25,6 +25,7 @@ fixtures or required inputs to this suite.
 | `test_gpu_mcp_codex_versions.py` | Reachable-daemon checks, differing CLI/daemon versions without lifecycle mutations, and refusal of the retired global pin helper. |
 | `test_gpu_mcp_codex_cli.py` | Exact local command interception, unchanged ordinary/slash/pasted input, terminal restoration and child survival without monitor data reaching Codex stdin. |
 | `test_gpu_mcp_codex_editor.py` | Native helper draft preservation, agent-call refusal, original editor delegation, retained chooser selection and idempotent terminal setup. |
+| `test_gpu_mcp_codex_tmux.py` | Existing panes without editor variables, standalone/npm foreground detection, tmux and Byobu configuration, custom-key preservation, real popup paging/logs and unchanged underlying input. An opt-in real Codex TUI check preserves an unsent draft. |
 | `test_gpu_mcp_codex_monitor.py` | Left/Right pages, retained job identity, scrolling, history-search editing/Unicode/cancel, standalone arguments, explicit roles, display-only log progress and reservation filtering. |
 | `test_gpu_mcp_monitor_display.py` | Runtime versus submission time, title fallback, arguments, reservation/role facts, metadata search, numeric bars with phase labels and malformed progress rejection. |
 | `test_codex_shared_monitoring.py` | Opt-in GPT-5.5-medium calls, real CPU fixture builds, native conversation ownership, fork denial, private model context, native terminal captures, visible failure alerts and active-turn queuing. |
@@ -109,6 +110,25 @@ block these operations; rerun the same tests with the required permission rather
 than skipping the assertions or weakening the worker restrictions.
 
 ## Evidence and Limits
+
+The repeated Ctrl+G failure came from an existing tmux shell whose child Codex
+frontends inherited no editor setting. Earlier tests sourced the generated
+environment in a fresh shell, so they did not cover that activation gap. The
+tmux tests start the frontend first with `VISUAL` and `EDITOR` absent, install
+the shortcut afterward, then press Ctrl+G through a real attached tmux client.
+They inspect private fixture logs, close with Escape and prove the popup's input
+and data did not reach the underlying frontend. Source paths containing spaces
+and apostrophes exercise the actual tmux/shell quoting.
+
+```bash
+python -m pytest -q test/test_gpu_mcp_codex_tmux.py
+GPU_MCP_RUN_NATIVE_TMUX_TEST=1 python -m pytest -q test/test_gpu_mcp_codex_tmux.py -k native
+```
+
+The native case uses GPT-5.5 medium, submits no prompt and starts Codex with
+`--no-daemon` in a disposable tmux server. It does not change the user's daemon,
+sessions or GPU jobs. The normal cases use named fixture executables and an
+actual Node child process; they are process/terminal contracts, not model tests.
 
 The human contrast run exposed identity/late-result faults that prior fixtures
 masked. `test_gpu_mcp_codex_uncertainty.py` reproduces those faults through the

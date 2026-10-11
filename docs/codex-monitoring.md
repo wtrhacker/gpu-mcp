@@ -173,18 +173,29 @@ the same safe stale cleanup and persist terminal state.
 
 ## Human terminal monitor
 
-GPU MCP works through ordinary `codex` and `codex resume`. The selected entry
-uses Codex's native Ctrl+G action. The installer configures its helper once:
+GPU MCP works through ordinary `codex` and `codex resume`. The installer
+configures the Ctrl+G monitor once:
 
 ```bash
 /absolute/path/to/server-python \
   /absolute/gpu-mcp-runtime/gpu_mcp_codex_terminal_setup.py
 ```
 
-New terminal sessions load this automatically. Users do not need to export
-editor variables or change the Codex launch command. The current Codex process
-retains its old environment, so first activation needs a new terminal session.
-It does not require a daemon restart.
+On Linux with tmux 3.2 or later, setup installs and activates a tmux shortcut,
+including Byobu's user configuration when present. Ctrl+G opens the human
+monitor in a popup when the foreground application is Codex. It recognizes both
+the standalone binary and npm's `node` launcher. Other applications receive their
+normal Ctrl+G. Existing custom bindings are reported rather than overwritten.
+
+This shortcut works in already-running panes, including Codex processes that
+started without `VISUAL` or `EDITOR`. It does not restart Codex, its daemon or
+GPU jobs. Escape closes the popup and restores the same draft. Popup contents
+are not inserted into the prompt or the underlying pane's transcript.
+
+Outside tmux, new shells load the native external-editor helper automatically.
+That route offers both the monitor and normal prompt editing. An already-running
+shell or Codex process keeps its inherited environment; starting another Codex
+conversation does not refresh it. Use `--no-tmux` to configure only this route.
 
 An existing shell can load the installed setting without opening a new terminal.
 Quit Codex, run the following once, then use `codex resume`:
@@ -194,9 +205,9 @@ Quit Codex, run the following once, then use `codex resume`:
 codex resume
 ```
 
-Fish uses `source ~/.config/gpu-mcp/codex-terminal-env.fish`. Restarting Codex
-alone does not reload its parent shell's environment. The installer writes the
-setting; it cannot change an already-running shell or frontend's environment.
+Fish uses `source ~/.config/gpu-mcp/codex-terminal-env.fish`. This one-time reload
+applies to existing shells outside the tmux integration. Existing tmux/Byobu
+panes use the activated popup shortcut without loading editor variables.
 
 Press Ctrl+G, select the repository's monitor and press Enter. The existing
 viewer uses Left/Right to move through Jobs, Details, Logs and Events without
@@ -419,8 +430,8 @@ Quit and resume the same conversation after applying the upgrade. This refreshes
 its MCP command and tool catalog while retaining conversation history. An
 already-running legacy MCP process cannot change executable in place. The helper
 does not issue a global MCP reload, restart the daemon or adopt old jobs. Run the
-terminal setup helper once if the keyboard monitor was not installed; new
-terminals then load it automatically.
+terminal setup helper after updating the runtime. It installs the editor route
+for new shells and activates the popup in existing tmux/Byobu panes.
 
 Keep the global policy hook. A shared launcher registration disables its
 recurring repo-wide job reminders and Stop wait; policy drift and approval

@@ -283,9 +283,9 @@ repository root according to policy validation rules.
 
 ## Step 5a: Configure the human keyboard monitor
 
-Configure the native editor entry once using the installed runtime and server
-Python. The helper previews the exact shell files, preserves an existing editor,
-backs up replaced files and installs one managed block without changing `codex`:
+Configure Ctrl+G using the installed runtime and server Python. The helper
+previews shell and tmux/Byobu files, preserves an existing editor, backs up
+replaced files and installs managed blocks without changing `codex`:
 
 ```bash
 /ABSOLUTE/GPU_MCP_SERVER_PYTHON /ABSOLUTE/GPU_MCP_ROOT/gpu_mcp_codex_terminal_setup.py --preview
@@ -296,7 +296,13 @@ Show the concrete global configuration change before applying it. Use the user's
 login shell; bash, zsh and fish are supported. The installer performs this step,
 so the human does not need to choose or export `VISUAL`/`EDITOR` manually.
 
-New terminal sessions load the setting automatically. The current Codex process
+On Linux with tmux 3.2+, setup also activates a popup shortcut in the live tmux
+server. This works in existing panes with missing editor variables. It detects
+the actual foreground Codex process, including npm's Node launcher, and passes
+Ctrl+G through to other applications. Do not overwrite a reported custom key
+binding. `--no-tmux` selects only the native editor route.
+
+Outside tmux, new terminal sessions load the setting automatically. The current Codex process
 keeps its inherited environment; open a new terminal for first activation. Keep
 ordinary `codex` and `codex resume`. Ctrl+G opens a chooser for the repo monitor
 or normal prompt editing. Escape returns to Codex; monitor data never becomes
@@ -398,10 +404,11 @@ during the upgrade. Do not force adoption or remove their reservations.
 `already_shared` needs no registration change. Unsupported registrations or
 policy drift require reviewing the specific reported condition.
 
-Run the terminal setup preview/apply commands in Step 5 if the monitor has not
-been installed. New terminals load it automatically. In an existing bash/zsh
-terminal, quit Codex and source `~/.config/gpu-mcp/codex-terminal-env.sh` once;
-fish uses `source ~/.config/gpu-mcp/codex-terminal-env.fish`.
+Run the terminal setup preview/apply commands in Step 5 after synchronizing its
+helper files. The tmux/Byobu shortcut activates for existing panes immediately.
+Outside tmux, new shells load the native editor setting automatically; an
+existing bash/zsh shell can source `~/.config/gpu-mcp/codex-terminal-env.sh` once.
+Fish uses `source ~/.config/gpu-mcp/codex-terminal-env.fish`.
 
 Have the human resume the same conversation with ordinary `codex resume`, then
 verify one read-only GPU MCP call. A resumed conversation retains its native
