@@ -154,31 +154,30 @@ resume`. See
 
 ## Updating the runtime
 
-Pulling or copying code updates the runtime files. Existing research projects
-also retain their own registration, approvals and running backend. Use this
-upgrade sequence:
+Finish active jobs, then pull or copy the new code into the installed GPU MCP
+folder, keeping local state, environments and credentials. Run:
 
-1. Finish active jobs through their owning backend before replacing execution
-   code. Updating files does not update an already-running Python process.
-2. Update the path actually named by each project's `.codex/config.toml`. For a
-   separate home deployment, follow `LOCAL_DEPLOYMENT.md` and preserve runtime
-   state, environments, host configuration and credentials.
-3. Refresh dependencies in the registered server interpreter:
-   `"$GPU_MCP_SERVER_PYTHON" -m pip install "mcp>=1.28,<2" fabric paramiko uvicorn websocket-client`.
-   Run the import check above; the full maintainer test suite is not a per-user
-   upgrade requirement.
-4. Migrate older direct registrations with `gpu_mcp_codex_upgrade.py`, as
-   described below. Check the tool approval entries against Step 3 of the
-   [installer guide](AI_native_installer/INSTALL_FOR_AI.md). Existing explicit
-   restrictions must be preserved; missing entries for newly installed tools
-   can be approved together during setup instead of at each first call.
-5. Run `gpu_mcp_codex_terminal_setup.py --preview`, then apply it. This activates
-   Ctrl+G in existing tmux/Byobu panes and configures the native editor route for
-   new shells elsewhere.
-6. For a shared backend whose code changed, use
-   `gpu_mcp_codex_launcher.py --config /absolute/repo/gpu-mcp.toml --stop-if-idle`.
-   It refuses active jobs or requests. Resume Codex to refresh the tool catalog
-   and let the configured launcher start the updated backend.
+```bash
+bash ~/gpu-mcp/upgrade.sh
+```
+
+Use the actual installed path if it differs. The command finds existing
+registrations for that installation, checks their Python dependencies, migrates
+older registrations, adds missing tool approval entries, installs Ctrl+G and
+refreshes outdated idle GPU MCP backends. It saves configuration backups and
+preserves explicit tool restrictions. It never stops active jobs; finish any
+reported jobs and rerun. Repeating a completed upgrade is safe.
+
+Quit and resume existing Codex conversations once to refresh their MCP tools.
+New sessions use the update automatically. Ctrl+G activates immediately in
+supported tmux/Byobu panes; outside tmux, open a fresh terminal for the installed
+editor setting. Continue using ordinary `codex` and `codex resume`.
+
+Optional: `bash ~/gpu-mcp/upgrade.sh --preview` shows the plan without changes.
+Use `--repo /absolute/research-repo` to select a single project or one absent
+from saved Codex and GPU MCP records. Other installed GPU MCP copies are left
+alone. Unsupported custom registrations and unapproved policy changes are
+reported for review. The full maintainer test suite is not an upgrade step.
 
 GPU policy approval is separate from tool-call approval. An unchanged
 `gpu-mcp.toml` keeps its approval. Optional artifact builds require the separately
@@ -191,14 +190,8 @@ This process does not require restarting or pinning the shared Codex daemon.
 GPU MCP needs that daemon available for private result delivery, but does not
 own its installation or update channel.
 
-Updating the runtime does not rewrite existing research-repo registrations.
-For a Codex repo still pointing to `gpu_mcp_server.py`, the installer runs
-`gpu_mcp_codex_upgrade.py --config /absolute/repo/gpu-mcp.toml`, then adds
-`--apply` after reviewing its plan. The helper preserves the policy approval and
-other settings, saves a backup and refuses to switch unfinished legacy jobs.
-After those jobs finish, apply it and resume the same Codex conversation.
-The [migration guide](docs/codex-monitoring.md#migration-and-upgrades) includes
-the complete commands and keyboard-monitor activation for existing terminals.
+The [migration guide](docs/codex-monitoring.md#migration-and-upgrades) explains
+discovery, safety checks and the lower-level helpers for custom installations.
 
 ## MCP startup checklist
 

@@ -118,6 +118,11 @@ that the AI uses. If yours does, record those paths and the copy command in
 `LOCAL_DEPLOYMENT.md`. Git ignores that file so private machine details stay
 local.
 
+Already installed? Finish active jobs, update the installed folder and run
+`bash ~/gpu-mcp/upgrade.sh`. It handles dependencies, existing Codex
+registrations and Ctrl+G setup. Resume existing conversations once afterward.
+See [upgrading](INSTALL.md#updating-the-runtime) for details.
+
 For deeper detail, see [test/README.md](test/README.md), the [design
 decisions](ADR/), and the [official Codex MCP
 documentation](https://developers.openai.com/codex/mcp/).

@@ -83,3 +83,52 @@ new model-behavior claim.
 | ADR 0006 | Process facts remain separate from scientific decisions; retry and follow-up remain agent choices. |
 | ADR 0007 | MPS supervision does not enable compiler or user subprocess escapes; control authority stays outside job write roots. |
 | ADR 0008 | Immutable session ownership, private concise updates, independent human inspection, archived/uncertain delivery rules and automatic backend checks. |
+
+## Human-observed Codex Run
+
+Prepare the task in an existing approved demonstration repository:
+
+```bash
+python test/manual_mps.py --repo /absolute/demo-repo
+```
+
+Preparation adds a new script and task manifest with a unique run ID. It prints
+the one-line prompt to paste into a new Codex session in that repository. It
+does not launch jobs, start an agent, edit policy, erase old runs or change the
+repository's blind-access permissions. Keep the existing GPT-5.5 medium setting.
+The agent reads the manifest; fixture source stays behind the existing access
+rule. A rerun gets new output/log paths instead of reusing the retry marker.
+
+The fixture performs small real PyTorch CUDA matrix products with pauses. This
+is a behavior demonstration, not a performance benchmark. Both smoke cases run
+for eight seconds after CUDA startup. Main uses one GPU, four cases and two
+concurrent slots:
+
+| Case | Designed behavior |
+| --- | --- |
+| baseline | Runs for six minutes so independent work survives the failure and retry. |
+| contrast | Fails after about 45 seconds on its first invocation; an explicit retry runs for 90 seconds and succeeds. |
+| replicate | Waits for a slot, then succeeds after 90 seconds. |
+| confirm | Waits for a slot, then succeeds after two minutes. |
+
+Times start after each case initializes CUDA; queue, startup and notification
+delays add to wall-clock time. The task authorizes one evidence-based recovery
+attempt, but the MCP never schedules retries itself. No script launches a
+subprocess. Retrying contrast preserves its first failure and creates a second
+artifact directory as well as the MCP's separate attempt log. Once all current
+cases succeed, the parent succeeds and releases its single reservation.
+
+Watch Ctrl+G's Jobs and Runs pages for queued/running cases, the isolated
+failure, retry history and the final GPU release. Select a case for Details and
+Logs; Left/Right changes pages and `c` returns to parent details. Case logs carry
+numeric progress lines and each attempt publishes a closed checkpoint. The
+agent should receive the failure, inspect that case, request its retry and
+report final results while the healthy sibling keeps running. An intentional
+case-stop exercise can be requested separately while a long case is live; it is
+not part of this all-cases-success ending.
+
+`test_manual_mps.py` verifies preparation does not alter policy/permissions or
+overwrite an earlier run, and verifies the failure/second-invocation sequence
+with a simulated clock and CUDA module. That local check is not evidence of
+CUDA, native notification delivery or model behavior. Record those observations
+from the human run separately; reports and generated artifacts remain ignored.

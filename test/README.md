@@ -44,6 +44,17 @@ Run a focused file while developing:
 pytest test/test_gpu_mcp_server_contract.py
 ```
 
+The one-command upgrade has local contracts for discovery, policy preservation,
+custom tool restrictions, idempotence, dependency checks and busy-backend races:
+
+```bash
+pytest -q test/test_gpu_mcp_upgrade.py test/test_gpu_mcp_codex_upgrade.py
+```
+
+The fixtures use temporary registrations and simulated backend replies; they
+do not restart the user's daemon or install packages in their Python. The shell
+entrypoint is also exercised from an installation path containing spaces.
+
 MPS sweeps have real-process local contracts and separate opt-in CUDA/OpenMM
 and PyTorch acceptance. See [the MPS test guide](MPS.md) for commands, failure
 injection, hardware requirements and earlier ADR compatibility.

@@ -401,8 +401,34 @@ Existing jobs without native Codex ownership are not silently assigned to a new
 conversation. Drain them through their original server before switching that
 repository to the launcher.
 
-For an existing Codex project, the installed upgrade helper replaces the direct
-entrypoint with its sibling shared launcher. Preview the change, then apply it:
+After updating the installed folder, existing users can run one command:
+
+```bash
+bash ~/gpu-mcp/upgrade.sh
+```
+
+It finds registrations that point to this installation using the approved
+policy store, saved Codex projects and shared-backend records. It does not scan
+all home directories or repoint other installations. `--repo /absolute/repo`
+selects a project explicitly; `--preview` performs read-only planning.
+
+The command checks dependencies in the registered Python, adds missing standard
+tool approval entries, migrates direct registrations, installs the Ctrl+G
+terminal setup and refreshes outdated idle GPU MCP backends. Explicit tool
+restrictions and allowlists are preserved. Policy reload keeps its human prompt
+or an existing denial. Unchanged policy files and their approval history are
+not rewritten. Configuration changes are backed up; repeating the command is
+safe. Package installation runs only when the import/version checks need it.
+
+Backend refresh uses the existing startup lock and stop-if-idle admission check.
+A job arriving after the preview prevents shutdown. Registration and policy
+hashes are checked again before writing, including after dependency installation.
+An active outdated backend must finish its work before upgrade; an already
+current backend can keep running. The script does not kill processes, restart
+the Codex daemon, change its features or change its update channel.
+
+The smaller registration-only helper remains available for custom installers.
+It replaces the direct entrypoint with its sibling shared launcher:
 
 ```bash
 /absolute/path/to/server-python \
@@ -413,7 +439,7 @@ entrypoint with its sibling shared launcher. Preview the change, then apply it:
   --config /absolute/research-repo/gpu-mcp.toml --apply
 ```
 
-The installer runs this upgrade for already-configured repositories. It verifies
+This lower-level helper verifies
 the existing policy approval, changes only the server-script argument, saves a
 backup and preserves other servers, timeouts, environment and tool approvals.
 The policy file and approval history are not rewritten. Repeating it after a
@@ -429,16 +455,16 @@ is gone and reread unchanged metadata under the shared lock.
 Quit and resume the same conversation after applying the upgrade. This refreshes
 its MCP command and tool catalog while retaining conversation history. An
 already-running legacy MCP process cannot change executable in place. The helper
-does not issue a global MCP reload, restart the daemon or adopt old jobs. Run the
-terminal setup helper after updating the runtime. It installs the editor route
-for new shells and activates the popup in existing tmux/Byobu panes.
+does not issue a global MCP reload, restart the daemon or adopt old jobs.
+`upgrade.sh` already installs the editor route for new shells and activates the
+popup in existing tmux/Byobu panes. Outside tmux, use a fresh terminal once.
 
 Keep the global policy hook. A shared launcher registration disables its
 recurring repo-wide job reminders and Stop wait; policy drift and approval
 checks remain active. This behavior is Codex-only. `claude-version/` is unchanged.
 
 A live backend with different code refuses reconnection instead of being replaced
-over active jobs. After draining it, the human can stop the idle backend:
+over active jobs. `upgrade.sh` handles its idle refresh. For manual maintenance:
 
 ```bash
 /absolute/path/to/server-python \

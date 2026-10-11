@@ -385,27 +385,32 @@ testing, not a required step for every research repository.
 
 Confirm the installed runtime and interpreter from the repository's existing
 registration. Update that runtime first; do not substitute another checkout.
-For an already-approved policy, preview the supported registration upgrade:
+For an already-approved policy, use the combined upgrade command:
 
 ```bash
-/ABSOLUTE/GPU_MCP_SERVER_PYTHON /ABSOLUTE/GPU_MCP_ROOT/gpu_mcp_codex_upgrade.py \
-  --config /ABSOLUTE/RESEARCH_REPO/gpu-mcp.toml
+bash /ABSOLUTE/GPU_MCP_ROOT/upgrade.sh --repo /ABSOLUTE/RESEARCH_REPO --preview
+bash /ABSOLUTE/GPU_MCP_ROOT/upgrade.sh --repo /ABSOLUTE/RESEARCH_REPO
 ```
 
-`ready` means the direct registration can be switched. Apply the same command
-with `--apply` within the human's authorized upgrade scope. It saves a backup
-and changes only the server entrypoint. The policy, its approval history,
-environment and existing tool approval modes remain unchanged. Skip the initial
-policy-preview/approval steps when the policy has not changed.
+Omit `--repo` to discover existing registrations for this installed folder from
+approved-policy records, Codex project history and shared-backend records. Apply
+within the human's authorized upgrade scope. The command checks dependencies in
+each registered interpreter, migrates direct registrations, installs missing
+tool approval entries from Step 3, configures Ctrl+G and stops only outdated idle
+GPU MCP backends. It saves backups. Explicit prompt/deny settings, allowlists,
+environment, other MCP servers and timeouts stay intact. A permissive
+`reload_policy` entry is corrected to `prompt`; a denial is preserved.
+Skip policy-preview/approval when the policy has not changed: neither its file
+nor its approval history is rewritten.
 
-`blocked` lists unfinished jobs, including CPU builds that hold no GPU booking.
+An unfinished-job error includes CPU builds that hold no GPU booking.
 Keep their original server connected until they finish, and avoid new launches
 during the upgrade. Do not force adoption or remove their reservations.
-`already_shared` needs no registration change. Unsupported registrations or
-policy drift require reviewing the specific reported condition.
+Unsupported registrations or policy drift require reviewing the reported
+condition. Other runtime copies are not repointed or updated implicitly.
 
-Run the terminal setup preview/apply commands in Step 5 after synchronizing its
-helper files. The tmux/Byobu shortcut activates for existing panes immediately.
+The command includes the terminal setup from Step 5; do not repeat it manually.
+The tmux/Byobu shortcut activates for existing panes immediately.
 Outside tmux, new shells load the native editor setting automatically; an
 existing bash/zsh shell can source `~/.config/gpu-mcp/codex-terminal-env.sh` once.
 Fish uses `source ~/.config/gpu-mcp/codex-terminal-env.fish`.
