@@ -148,6 +148,40 @@ def test_actual_http_tool_calls_are_scoped_and_human_auth_is_separate(backend):
     assert denied.value.code == 401
 
 
+def test_mps_case_tools_and_human_logs_use_the_actual_shared_http_routes(backend):
+    policy, base, info = backend
+    origin, foreign = Origin(str(uuid.uuid4())), Origin(str(uuid.uuid4()))
+    record = record_for(policy, dict(info, state_base=str(base)), origin, label='mps_http')
+    case_log = policy.parent / 'logs/mps_case.log'
+    case_log.write_text('selected MPS case log\n')
+    store = JobStore(runtime_root(policy, base=base))
+    record.update(job_kind='mps', job_lifecycle='finished', outcome=None, max_concurrent=2,
+                  ready_file=str(policy.parent / '.gpu_mcp_state/mps-ready'),
+                  cases=[{'case_id':'alpha','attempt_id':'case-attempt-abc123','state':'succeeded',
+                          'process':None,'script_path':str(policy.parent / 'jobs/task.py'),
+                          'args':[], 'output_file':str(case_log), 'attempts':[]}])
+    store.save(record, origin=origin)
+    schemas = rpc(info, 'tools/list')['result']['tools']
+    launch = next(t for t in schemas if t['name'] == 'run_python_on_gpu')['inputSchema']
+    assert {'mps','runs','max_concurrent'} <= set(launch['properties'])
+    assert 'script_path' not in launch.get('required', [])
+    for action in ('status','logs','stop','retry'):
+        refused = tool(info, 'manage_gpu_job', {'job_id':record['job_id'],'case_id':'alpha','action':action}, foreign.thread_id)
+        assert refused == {'status':'refused','reason':'job unavailable to this session'}
+    result = tool(info, 'manage_gpu_job', {'job_id':record['job_id'],'case_id':'alpha','action':'logs'}, origin.thread_id)
+    assert result['log_tail'] == 'selected MPS case log\n'
+    assert 'cases' not in result['saved_job']
+    result = tool(info, 'manage_gpu_job', {'job_id':record['job_id'],'case_id':'alpha','action':'status'}, origin.thread_id)
+    assert result['case']['state'] == 'succeeded' and result['job_lifecycle'] == 'finished'
+    before = store.records()
+    human = request(info, f"/human/jobs/{record['job_id']}/logs?case_id=alpha", human=True)
+    assert human['tail'] == 'selected MPS case log\n'
+    assert store.records() == before
+    with pytest.raises(urllib.error.HTTPError) as denied:
+        request(info, f"/human/jobs/{record['job_id']}/logs?case_id=alpha")
+    assert denied.value.code == 401
+
+
 def test_stdio_connection_close_keeps_backend_alive_and_job_history(backend):
     policy, base, info = backend
     process = subprocess.Popen([sys.executable, str(SOURCE / "gpu_mcp_codex_launcher.py"),

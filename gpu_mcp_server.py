@@ -1075,11 +1075,11 @@ class HeartbeatManager:
             self._owned[reservation_key_value]["last_attempt_monotonic"] = time.monotonic()
             return True
 
-    def update_owned_metadata(self, reservation_key_value: str, updates: dict[str, object]) -> None:
+    def update_owned_metadata(self, reservation_key_value: str, updates: dict[str, object], *, expected_identity=None) -> None:
         with self._lock:
             if reservation_key_value not in self._owned:
                 raise PermissionError("current server does not own this reservation")
-            self._merge_owned_metadata(reservation_key_value, updates)
+            self._merge_owned_metadata(reservation_key_value, updates, expected_identity=expected_identity)
             if "heartbeat_interval_sec" in updates:
                 self._owned[reservation_key_value]["interval_sec"] = int(updates["heartbeat_interval_sec"])
 
@@ -1121,7 +1121,7 @@ class HeartbeatManager:
             },
         )
 
-    def _merge_owned_metadata(self, reservation_key_value: str, updates: dict[str, object]) -> None:
+    def _merge_owned_metadata(self, reservation_key_value: str, updates: dict[str, object], *, expected_identity=None) -> None:
         registry_root = reservations.reservation_registry_root()
         metadata_path = reservations.reservation_dir(registry_root, reservation_key_value) / "metadata.json"
         with reservations.cleanup_finalization_guard(registry_root, reservation_key_value):
@@ -1130,6 +1130,8 @@ class HeartbeatManager:
                 raise ValueError("metadata JSON must be an object")
             if metadata.get("server_instance_id") != SERVER_INSTANCE_ID:
                 raise PermissionError("current server does not own this reservation")
+            if expected_identity is not None and (metadata.get('job_id'), metadata.get('attempt_id')) != expected_identity:
+                raise PermissionError('reservation belongs to a different job or attempt')
             metadata.update(updates)
             reservations.atomic_write_json(metadata_path, metadata)
             item = self._owned.get(reservation_key_value)
@@ -1833,6 +1835,13 @@ def _inspect_reservation_process(metadata: dict) -> dict:
     precise fake process-table facts; production uses conservative ps/nvidia-smi
     probes and treats missing identity as unknown rather than available.
     """
+    if metadata.get("job_kind") == "mps":
+        try:
+            observed = _mps_manager().rpc('inspect_reference', metadata['mps_ref'])
+            return {'status': observed['state'], 'reason': observed.get('reason', 'MPS group inspection'),
+                    'remote_pid': metadata.get('remote_pid')}
+        except Exception as exc:
+            return {'status': 'unknown', 'reason': str(exc)[:500], 'remote_pid': metadata.get('remote_pid')}
     if metadata.get("job_kind") == "build":
         try:
             observed = _build_manager().rpc("status", metadata["build_spec"])
@@ -2072,6 +2081,9 @@ def _empty_status_response(*, action: str, reason: str) -> str:
 def _read_repo_job_record(job_id: str) -> dict | None:
     if CODEX_RUNTIME is not None:
         return CODEX_RUNTIME.read(job_id)
+    mps = _mps_manager().read(job_id)
+    if mps is not None:
+        return mps
     try:
         record = reservations.read_json_file_no_follow(reservations.job_record_path(REPO_ROOT, job_id))
     except Exception:
@@ -2093,6 +2105,10 @@ def _job_record_matches_current_metadata(record: dict, metadata: dict | None) ->
 
 
 def _read_outcome_record(job_record: dict) -> dict | None:
+    if job_record.get('job_kind') == 'mps':
+        # Repo outcome files are readiness only for this protected supervisor.
+        protected = _mps_manager().read(job_record.get('job_id'))
+        return _matching_outcome_record(protected, protected.get('outcome')) if protected else None
     job_id = job_record.get("job_id")
     attempt_id = job_record.get("active_attempt_id")
     if not reservations.is_job_id(job_id) or not reservations.is_attempt_id(attempt_id):
@@ -3097,6 +3113,8 @@ def _job_status_response(
     early_poll_reason: str | None = None,
     allow_compact_early: bool = False,
 ) -> str:
+    if job_record.get('job_kind') == 'mps':
+        return _json_tool_response(_mps_manager().manage(job_record, action, early_poll_reason=early_poll_reason))
     early_reason = _nonempty_text(early_poll_reason)
     local_outcome = _read_outcome_record(job_record)
     if CODEX_RUNTIME is not None:
@@ -3836,6 +3854,23 @@ def kill_gpu_process(
             reason="host must be one of the configured GPU MCP NODES",
         )
 
+    # MPS clients require CUDA teardown before OS signalling. Even legacy
+    # callers must use the managed sweep rather than this stateless escape.
+    for path in (() if CODEX_RUNTIME is not None else reservations.reservation_registry_root().glob('*.gpu*/metadata.json')):
+        try:
+            metadata = reservations.read_json_file_no_follow(path)
+            if metadata.get('job_kind') != 'mps' or metadata.get('host') != _canonical_policy_host(host):
+                continue
+            observed = _mps_manager().rpc('inspect_reference', metadata['mps_ref'])
+            processes = [observed.get(k) for k in ('parent', 'daemon', 'server')]
+            processes += [c.get('process') for c in observed.get('cases', [])]
+            if any(p and p['pid'] == pid_int for p in processes):
+                return _kill_process_response(status='refused', host=host, pid=pid_int,
+                    reason='MPS processes require manage_gpu_job(action="stop") for safe CUDA teardown')
+        except (ValueError, RuntimeError, OSError):
+            return _kill_process_response(status='refused', host=host, pid=pid_int,
+                reason='MPS process ownership could not be established; use managed job controls')
+
     try:
         signal_name, signal_number = _normalize_kill_signal(signal)
     except ValueError as e:
@@ -3997,6 +4032,13 @@ def _manage_gpu_job_impl(
             "server_instance_id": SERVER_INSTANCE_ID,
         })
     if job_record is not None:
+        if job_record.get('job_kind') == 'mps':
+            try:
+                return _json_tool_response(_mps_manager().manage(job_record, normalized_action,
+                    reason=reason, cadence_hint_sec=cadence_hint_sec, early_poll_reason=early_poll_reason,
+                    expected_duration_sec=expected_duration_sec))
+            except (ValueError, RuntimeError, OSError) as exc:
+                return _json_tool_response({'status': 'refused', 'job_id': job_record['job_id'], 'reason': str(exc)})
         if normalized_action == "stop":
             return _stop_owned_job(normalized_action, job_record)
         if normalized_action == "retry":
@@ -4037,6 +4079,7 @@ def manage_gpu_job(
     log_tail_lines: int = 50,
     notification_id: Optional[str] = None,
     notify_after_sec: Optional[int] = None,
+    case_id: Optional[str] = None,
 ):
     """Inspect or change a managed GPU job.
 
@@ -4054,9 +4097,43 @@ def manage_gpu_job(
     scientific decisions, including action="stop". Stopping does not require
     terminal status. It still requires ownership, a healthy heartbeat manager,
     and an exact process match.
+
+    For MPS sweeps, case_id selects one declared run for status/logs/stop/retry.
+    Retry is explicit, preserves previous attempts and rejoins the bounded
+    queue. Without case_id, stop targets the whole group; retry requires a case.
     """
     if detail not in {"summary", "full"}:
         return _json_tool_response({"status": "refused", "reason": "detail must be summary or full"})
+    mps = _mps_manager().read(job_id) if job_id else None
+    if mps is not None and action not in {'watch', 'retry_notification'}:
+        if reservation_key is not None and reservation_key != mps.get('reservation_key'):
+            return _json_tool_response({'status': 'refused', 'reason': 'reservation does not match the sweep'})
+        if action == 'notifications':
+            if CODEX_RUNTIME is None:
+                return _json_tool_response({'status': 'refused', 'reason': 'notifications require the Codex shared backend'})
+            return _json_tool_response({'status': 'ok', 'job_id': job_id, 'events': [e for e in
+                CODEX_RUNTIME.store.events(origin=CODEX_RUNTIME.origin().thread_id) if e['job_id'] == job_id]})
+        if action == 'logs':
+            selected = next((c for c in mps.get('cases', []) if c['case_id'] == case_id), None) if case_id else None
+            if case_id and selected is None:
+                return _json_tool_response({'status': 'refused', 'reason': 'case unavailable in this sweep'})
+            if isinstance(log_tail_lines, bool) or not isinstance(log_tail_lines, int) or not 1 <= log_tail_lines <= 200:
+                return _json_tool_response({'status': 'refused', 'reason': 'log_tail_lines must be 1 through 200'})
+            path = _validate_output_path((selected or mps)['output_file'])
+            try:
+                from gpu_mcp_codex_host import read_human_log_tail
+                tail = ''.join(read_human_log_tail(path).splitlines(keepends=True)[-log_tail_lines:])
+                return _json_tool_response({'status': 'ok', 'job_id': job_id, 'case_id': case_id, 'log_tail': tail})
+            except OSError as exc:
+                return _json_tool_response({'status': 'refused', 'reason': str(exc)})
+        try:
+            return _json_tool_response(_mps_manager().manage(mps, action, case_id=case_id,
+                reason=reason, cadence_hint_sec=cadence_hint_sec, early_poll_reason=early_poll_reason,
+                expected_duration_sec=expected_duration_sec))
+        except (ValueError, RuntimeError, OSError) as exc:
+            return _json_tool_response({'status': 'refused', 'job_id': job_id, 'reason': str(exc)[:1000]})
+    if case_id is not None:
+        return _json_tool_response({'status': 'refused', 'reason': 'case_id requires an MPS sweep job'})
     if CODEX_RUNTIME is not None and action in {"retry_notification", "watch"}:
         record = CODEX_RUNTIME.read(job_id)
         if action == "retry_notification":
@@ -4636,6 +4713,11 @@ def _build_manager():
     return gpu_mcp_builds.BuildManager(sys.modules[__name__])
 
 
+def _mps_manager():
+    import gpu_mcp_mps
+    return gpu_mcp_mps.MpsManager(sys.modules[__name__])
+
+
 @mcp.tool()
 @_requires_active_policy
 def list_gpu_jobs():
@@ -4648,7 +4730,8 @@ def list_gpu_jobs():
         records = [r for r in records if r and r.get("server_instance_id") == SERVER_INSTANCE_ID]
     return _json_tool_response({"status": "ok", "jobs": [
         {k: r.get(k) for k in ("job_id", "active_attempt_id", "job_kind", "job_lifecycle",
-                               "host", "gpu_index", "output_file", "next_poll_after", "last_status_checked_at")}
+                               "host", "gpu_index", "output_file", "next_poll_after", "last_status_checked_at", "job_title",
+                               "case_counts", "max_concurrent")}
         for r in records]})
 
 
@@ -4696,7 +4779,7 @@ def build_python_artifact(
 def run_python_on_gpu(
     host: str,
     gpu_index: int,
-    script_path: str,
+    script_path: Optional[str] = None,
     args: Optional[list[str]] = None,
     async_mode: Optional[bool] = None,
     output_file: Optional[str] = None,
@@ -4707,6 +4790,10 @@ def run_python_on_gpu(
     smoke_cadence_representative: bool = False,
     smoke_skip_reason: Optional[str] = None,
     job_title: Optional[str] = None,
+    mps: bool = False,
+    runs: Optional[list[dict]] = None,
+    max_concurrent: Optional[int] = None,
+    mps_protocol: int = 2,
 ):
     """Launch an approved Python file as a managed GPU job and return its handle.
 
@@ -4720,7 +4807,29 @@ def run_python_on_gpu(
     main or one-off to one hour. ``expected_duration_sec`` is descriptive only.
     Either compatibility value of ``async_mode`` returns a managed handle.
     Supply a short ``job_title`` describing the task for the human monitor.
+    ``mps=true`` launches declared ``runs`` on one reserved GPU, with bounded
+    ``max_concurrent`` (default four). Each run declares script_path, args,
+    a distinct output_file, optional case_id and job_title. Normal case failures
+    preserve siblings; retries are never automatic. Scripts retain the
+    subprocess ban. Use manage_gpu_job(case_id=...) for individual controls.
     """
+    if not isinstance(mps, bool):
+        return _launch_refusal('mps must be a boolean')
+    if mps:
+        if script_path is not None or args is not None or async_mode is not None:
+            return _launch_refusal('MPS uses runs; do not mix single-script launch fields')
+        try:
+            return _json_tool_response(_mps_manager().launch(host, gpu_index, runs,
+                max_concurrent=4 if max_concurrent is None else max_concurrent, protocol=mps_protocol,
+                output_file=output_file, job_role=job_role, expected_duration_sec=expected_duration_sec,
+                cadence_hint_sec=cadence_hint_sec, smoke_job_id=smoke_job_id, smoke_skip_reason=smoke_skip_reason,
+                smoke_cadence_representative=smoke_cadence_representative, job_title=job_title))
+        except (ValueError, RuntimeError, OSError, TypeError) as exc:
+            return _launch_refusal(str(exc)[:1000], host=host, gpu_index=gpu_index)
+    if runs is not None or max_concurrent is not None or mps_protocol != 2:
+        return _launch_refusal('sweep fields require mps=true')
+    if not isinstance(script_path, str):
+        return _launch_refusal('ordinary GPU execution requires script_path')
     kwargs = {
         "host": host,
         "gpu_index": gpu_index,

@@ -9,6 +9,7 @@ from pathlib import Path
 import sys
 import textwrap
 import time
+from urllib.parse import urlencode
 
 from gpu_mcp_codex_launcher import alive, ensure_backend, read_info, request
 from gpu_mcp_codex_state import runtime_root
@@ -44,7 +45,8 @@ def view(screen, info, *, chooser=False):
             colors[name] = curses.color_pair(i)
     pages = ('jobs', 'details', 'logs', 'events')
     snapshot, selection, mode, logs = {}, None, 'jobs', ''
-    offsets = {'details': 0, 'logs': None, 'events': None}
+    case_selection, case_parent = None, None
+    offsets = {'details': 0, 'logs': None, 'events': None, 'runs': 0}
     logs_for = None
     reservations_only = False
     query, draft, cursor, searching, search_anchor = '', '', 0, False, None
@@ -76,10 +78,22 @@ def view(screen, info, *, chooser=False):
             selection = ids[0] if ids else None
         index = ids.index(selection) if selection else 0
         record = next((r for r in jobs if r['job_id'] == selection), None)
-        identity = (selection, record.get('active_attempt_id')) if record else None
+        pages = ('jobs', 'runs', 'details', 'logs', 'events') if record and record.get('job_kind') == 'mps' else ('jobs', 'details', 'logs', 'events')
+        if mode not in pages:
+            mode = 'jobs'
+        if case_parent != selection:
+            case_selection, case_parent = None, selection
+        cases = record.get('cases', []) if record else []
+        case_ids = [c['case_id'] for c in cases]
+        if case_selection not in case_ids:
+            case_selection = None
+        selected_case = next((c for c in cases if c['case_id'] == case_selection), None)
+        identity = (selection, record.get('active_attempt_id'), case_selection,
+                    selected_case.get('attempt_id') if selected_case else None) if record else None
         if mode == 'logs' and identity != logs_for:
             try:
-                result = request(info, f'/human/jobs/{selection}/logs', human=True, timeout=3)
+                suffix = '?' + urlencode({'case_id': case_selection}) if case_selection else ''
+                result = request(info, f'/human/jobs/{selection}/logs' + suffix, human=True, timeout=3)
                 logs = result.get('tail') or result.get('error') or 'No log text.'
             except Exception as exc:
                 logs = 'Cannot read log: ' + str(exc)
@@ -94,6 +108,7 @@ def view(screen, info, *, chooser=False):
              + (' | GPU reservations only' if reservations_only else ''))
         help_text = ('Enter apply  Esc cancel  Ctrl+U clear' if searching else
                      '←→ pages  ↑↓ select/scroll  / search  v GPU  r refresh  Esc close'
+                     + ('  c parent/case' if cases else '')
                      + ('  b repos' if chooser else ''))
         line(height - 2, help_text)
         issue = error or next((f'{name}: {value}' for name, value in health.items()
@@ -148,6 +163,10 @@ def view(screen, info, *, chooser=False):
                         card[-1] = card[-1][:max(0, width - 15)] + ' … (Details)'
                 if item.get('gpu_index') is not None:
                     card.append(f"  Reservation: {row['reservation']}")
+                if item.get('job_kind') == 'mps':
+                    counts = item.get('case_counts', {})
+                    card.append('  Runs: ' + ', '.join(f'{v} {k}' for k, v in counts.items() if v)
+                                + f" | Limit: {item.get('max_concurrent')}")
                 if displayed.get('progress'):
                     value = progress_text(displayed['progress'], width=max(12, min(40, width - 12)))
                     if value != '—':
@@ -181,7 +200,11 @@ def view(screen, info, *, chooser=False):
             if not jobs:
                 line(5, 'No matching jobs.' if query or searching else 'No active GPU reservations.' if reservations_only else 'No saved jobs.')
         else:
-            if mode == 'events':
+            if mode == 'runs':
+                text = '\n'.join(('› ' if c['case_id'] == case_selection else '  ')
+                    + f"{c['case_id']}: {c.get('job_title') or Path(c['script_path']).name} | {c['state']}"
+                    + '\n    Args: ' + ' '.join(c.get('args', [])) for c in cases) or 'Cases are starting.'
+            elif mode == 'events':
                 events = [e for e in snapshot.get('events', []) if selection is None or e['job_id'] == selection]
                 text = '\n'.join(messages({'events': events})) or 'No events recorded.'
             elif not record:
@@ -197,22 +220,27 @@ def view(screen, info, *, chooser=False):
                     'completion_file_checked_at': observed.get('last_result_scan_at'),
                     'completion_file_visible': observed.get('result_file_visible'),
                 }.items() if value not in (None, '')}
-                detail = {'job_title': task_row(record)['title'], 'job_role': record.get('job_role'),
-                          'script_path': record.get('script_path'), 'args': record.get('args', []), **record}
+                detail = dict(selected_case) if selected_case else {k: v for k, v in record.items() if k != 'mps_spec'}
                 if diagnostics:
                     detail['monitoring'] = diagnostics
                 cached = progress_cache.get(identity)
                 if cached and cached['progress']:
                     detail['reported_progress'] = cached['progress']
                 text = json.dumps(detail, indent=2, ensure_ascii=False)
-            text_lines = [part for value in safe_text(text).splitlines()
-                          for part in textwrap.wrap(value, max(1, width - 1),
-                                                     replace_whitespace=False, drop_whitespace=False,
-                                                     break_on_hyphens=False) or ['']]
+            text_lines, selected_line = [], 0
+            for value in safe_text(text).splitlines():
+                if mode == 'runs' and value.startswith('› '):
+                    selected_line = len(text_lines)  # Before wrapping even a 64-character case ID.
+                text_lines.extend(textwrap.wrap(value, max(1, width - 1),
+                    replace_whitespace=False, drop_whitespace=False, break_on_hyphens=False) or [''])
             page_size = max(1, height - 8)
             max_offset = max(0, len(text_lines) - page_size)
+            if mode == 'runs' and case_selection:
+                offsets[mode] = max(0, min(offsets[mode], selected_line))
+                if selected_line >= offsets[mode] + page_size:
+                    offsets[mode] = selected_line - page_size + 1
             offset = max_offset if offsets[mode] is None else min(offsets[mode], max_offset)
-            line(4, task_row(record)['title'] if record else 'Repository', curses.A_BOLD)
+            line(4, (selected_case.get('job_title') or selected_case['case_id']) if selected_case else task_row(record)['title'] if record else 'Repository', curses.A_BOLD)
             line(5, (selection or 'Repository') + f' | Lines {offset + 1}–{min(offset + page_size, len(text_lines))}/{len(text_lines)}')
             for n, value in enumerate(text_lines[offset:offset + page_size]):
                 line(6 + n, value)
@@ -259,6 +287,15 @@ def view(screen, info, *, chooser=False):
         if key == ord('v'):
             reservations_only = not reservations_only
             mode = 'jobs'
+        if cases and key == ord('c'):
+            case_selection = None if case_selection else case_ids[0]
+            logs_for = None
+            offsets.update(details=0, logs=None)
+        if mode == 'runs' and case_ids and key in (curses.KEY_DOWN, ord('j'), curses.KEY_UP, ord('k')):
+            step = 1 if key in (curses.KEY_DOWN, ord('j')) else -1
+            index_case = case_ids.index(case_selection) if case_selection in case_ids else (-1 if step == 1 else len(case_ids))
+            case_selection = case_ids[max(0, min(len(case_ids) - 1, index_case + step))]
+            logs_for = None
         if key in (curses.KEY_LEFT, curses.KEY_RIGHT):
             step = 1 if key == curses.KEY_RIGHT else -1
             mode = pages[(pages.index(mode) + step) % len(pages)]
@@ -268,8 +305,8 @@ def view(screen, info, *, chooser=False):
         if ids and (key == ord('[') or mode == 'jobs' and key in (curses.KEY_UP, ord('k'))):
             selection = ids[max(index - 1, 0)]
         if selection != previous_selection:
-            offsets = {'details': 0, 'logs': None, 'events': None}
-        elif mode != 'jobs':
+            offsets = {'details': 0, 'logs': None, 'events': None, 'runs': 0}
+        elif mode not in ('jobs', 'runs'):
             if key in (curses.KEY_DOWN, ord('j'), curses.KEY_NPAGE):
                 offsets[mode] = min(max_offset, offset + (page_size if key == curses.KEY_NPAGE else 1))
             if key in (curses.KEY_UP, ord('k'), curses.KEY_PPAGE):
@@ -279,7 +316,7 @@ def view(screen, info, *, chooser=False):
             if key == curses.KEY_END:
                 offsets[mode] = None
         if key in (10, 13, curses.KEY_ENTER):
-            mode = 'details' if mode == 'jobs' else 'jobs'
+            mode = 'details' if mode in ('jobs', 'runs') else 'jobs'
         if key == ord("r"):
             refresh_at = 0
             logs_for = None

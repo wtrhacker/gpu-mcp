@@ -31,6 +31,7 @@ def code_hash() -> str:
              "gpu_mcp_codex_daemon.py", "gpu_mcp_codex_host.py", "gpu_mcp_build_worker.py",
              "gpu_mcp_policy_approval.py", "gpu_mcp_safe_runner.py", "gpu_mcp_codex_launcher.py")
     names += ("gpu_mcp_codex_versions.py",)
+    names += ("gpu_mcp_mps.py", "gpu_mcp_mps_worker.py")
     digest = hashlib.sha256()
     for name in names:
         digest.update(name.encode())

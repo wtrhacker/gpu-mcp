@@ -198,6 +198,16 @@ class JobStore:
             db.execute("INSERT INTO jobs VALUES (?,?,?,?) ON CONFLICT(job_id) DO UPDATE SET "
                        "record=excluded.record,updated_at=excluded.updated_at",
                        (job_id, owner, json.dumps(record), now))
+            if record.get('job_kind') == 'mps':
+                cases = {c['case_id']:c for c in record.get('cases', [])}
+                for event in db.execute("SELECT event_id,payload FROM events WHERE job_id=? "
+                        "AND kind LIKE 'case_failed.%' AND state IN ('pending','archived')", (job_id,)).fetchall():
+                    payload = json.loads(event['payload'])
+                    case = cases.get(payload.get('case_id'), {})
+                    if (case.get('attempt_id') != payload.get('case_attempt_id') or case.get('state') != 'failed'
+                            or payload.get('case_id') in record.get('case_retries_pending', {})):
+                        db.execute("UPDATE events SET state='superseded',error='case attempt changed' WHERE event_id=?",
+                                   (event['event_id'],))
             state = record.get("job_lifecycle")
             if state != 'running':
                 db.execute("UPDATE events SET state='superseded',error='job state changed' "
@@ -254,7 +264,7 @@ class JobStore:
             db.execute("UPDATE events SET state=?,error=?,updated_at=?,attempts=attempts+? WHERE event_id=?",
                        (state, error, reservations.iso_timestamp(), int(state == "sending"), event_id))
 
-    def notice(self, record: dict, kind: str, message: str, *, key: str):
+    def notice(self, record: dict, kind: str, message: str, *, key: str, details=None):
         """Save an owner notice without manufacturing a lifecycle transition."""
         with self.lock(record["job_id"]), self._connect() as db:
             row = db.execute("SELECT origin,record FROM jobs WHERE job_id=?", (record["job_id"],)).fetchone()
@@ -275,6 +285,8 @@ class JobStore:
                     payload['job_title'] = current['job_title']
             else:
                 payload = dict(event_payload(current), event_kind=kind, message=message[:1000])
+                if details:
+                    payload.update({k:v for k,v in details.items() if k in {'case_id','case_attempt_id','case_exit_code'}})
             event_id = hashlib.sha256(f"{record['job_id']}\0{record['active_attempt_id']}\0{kind}\0{key}".encode()).hexdigest()
             if kind != "milestone":
                 db.execute("UPDATE events SET state='superseded',error='newer notice for the same condition' "

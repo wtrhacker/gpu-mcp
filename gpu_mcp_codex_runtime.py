@@ -203,6 +203,8 @@ class CodexRuntime:
                            isinstance(host, str) and r.get("host") == self.server._canonical_policy_host(host)]
                     if not own:
                         raise SessionAccessError("process unavailable to this session")
+                    if own[0].get('job_kind') == 'mps':
+                        raise SessionAccessError('MPS processes require manage_gpu_job(action="stop") for safe CUDA teardown')
                     with self.operation(own[0]) as latest:
                         metadata, _ = self.server._owned_lifecycle_metadata(latest)
                         if (metadata is None or metadata.get("remote_pid") != pid or
@@ -231,6 +233,10 @@ class CodexRuntime:
         if tool == "manage_gpu_job" and detail == "full" and payload.get("job_id"):
             record = self.read(payload["job_id"])
             if record is not None:
+                if record.get('job_kind') == 'mps':
+                    record = {k:v for k,v in record.items() if k != 'mps_spec'}
+                    if payload.get('case_id') or payload.get('case'):
+                        record = {k:v for k,v in record.items() if k != 'cases'}
                 payload["saved_job"] = record
                 payload.setdefault("process", record.get("last_process_observation") or {
                     "remote_pid": record.get("remote_pid"), "process_fingerprint": record.get("process_fingerprint")})
@@ -251,7 +257,11 @@ class CodexRuntime:
                   "host", "gpu_index", "output", "output_file", "artifact", "next_poll_after",
                   "artifact_path", "smoke_evidence", "allowed_actions", "polling_state", "watch",
                   "last_status_checked_at", "remote_inspection_performed"}
+        fields.update({'case', 'case_counts', 'max_concurrent', 'request_id', 'active_reservation'})
         compact = {k: v for k, v in payload.items() if k in fields and v not in (None, "")}
+        if compact.get('case'):
+            compact['case'] = {k:v for k,v in compact['case'].items() if k in {
+                'case_id','attempt_id','job_title','state','exit_code','script_path','args','output_file','started_at','ended_at'}}
         if 'next_poll_after' in compact:
             compact['next_backend_check_at'] = compact.pop('next_poll_after')
         if payload.get("job_lifecycle") == "running" and payload.get("status") not in {"refused", "error"}:
@@ -269,6 +279,10 @@ class CodexRuntime:
         return json.dumps(compact)
 
     def _recover_previous_job(self, record):
+        if record.get('job_kind') == 'mps':
+            with self.acting_as(Origin(record['origin_thread_id'])), self.operation(record) as latest:
+                self.server._mps_manager().manage(latest, 'status', early_poll_reason='inspect MPS completion after backend restart')
+                return bool(self.store.get(record['job_id']).get('outcome'))
         if record.get("job_kind", "gpu") != "gpu":
             return False
         with self.acting_as(Origin(record["origin_thread_id"])), self.operation(record) as latest:
@@ -399,7 +413,11 @@ class CodexRuntime:
                         self._verification_retry_after.pop(signature_key, None)
                         if (checked.get('job_lifecycle') == 'running' and checked.get('last_status_checked_at')
                                 and checked['last_status_checked_at'] != record.get('last_status_checked_at')):
-                            self.store.notice(checked, 'poll', 'Process observed running.',
+                            text = 'Process observed running.'
+                            if checked.get('job_kind') == 'mps':
+                                counts = checked.get('case_counts', {})
+                                text = 'MPS sweep: ' + ', '.join(f'{v} {k}' for k, v in counts.items() if v) + '.'
+                            self.store.notice(checked, 'poll', text,
                                               key=checked['last_status_checked_at'])
             except Exception as exc:
                 self.alert(record, "monitor_failure", "Job check failed: " + str(exc))
@@ -427,13 +445,19 @@ class CodexRuntime:
                 if (record is None or record["active_attempt_id"] != event["attempt_id"]
                         or latest is None or latest["state"] not in DELIVERABLE_STATES):
                     continue
+                if latest['kind'].startswith('case_failed.'):
+                    payload = latest['payload']
+                    case = next((c for c in record.get('cases', []) if c['case_id'] == payload.get('case_id')), {})
+                    if (case.get('attempt_id') != payload.get('case_attempt_id') or case.get('state') != 'failed'
+                            or payload.get('case_id') in record.get('case_retries_pending', {})):
+                        continue  # Keep uncertain receipts inspectable; never enqueue an obsolete case observation.
                 if (latest['kind'] in UNCERTAIN_STATES and latest['state'] in {'pending', 'archived'}
                         and self.verification_age(record, latest) < VERIFICATION_GRACE_SEC):
                     continue
                 previous_state = latest["state"]
                 try:
                     if (latest['kind'] in UNCERTAIN_STATES and latest['state'] in {'pending', 'archived'}
-                            and record.get('job_kind', 'gpu') == 'gpu'
+                            and record.get('job_kind', 'gpu') in {'gpu', 'mps'}
                             and not self.server._stale_policy_refusal()):
                         # The monitor and delivery run independently. A result
                         # may have become readable since the failed check.

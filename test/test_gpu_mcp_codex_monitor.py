@@ -87,6 +87,57 @@ def test_left_right_browse_pages_and_retain_the_selected_job(human_view):
     assert set(calls) == {'/human/snapshot', '/human/jobs/job-beta/logs'}
 
 
+def test_mps_runs_select_independent_details_and_logs(human_view, monkeypatch):
+    snapshot, calls = human_view
+    record = snapshot['jobs'][0]
+    record.update(job_kind='mps', case_counts={'running':1,'failed':1}, max_concurrent=2,
+                  cases=[{'case_id': name, 'script_path':f'jobs/{name}.py',
+                          'attempt_id':f'case-attempt-{name}', 'state':'running',
+                          'job_title':f'Parameter case {name}', 'args':['--alpha',name],
+                          'output_file':f'logs/{name}.log'} for name in ('a','b')])
+    original = monitor.request
+    def request(info, path, **kwargs):
+        if '?case_id=' in path:
+            assert kwargs.get('human') and 'payload' not in kwargs
+            calls.append(path)
+            return {'tail':'selected case b CUDA progress'}
+        return original(info, path, **kwargs)
+    monkeypatch.setattr(monitor, 'request', request)
+    screen = Screen([curses.KEY_RIGHT, curses.KEY_DOWN, curses.KEY_DOWN, 10,
+                     curses.KEY_RIGHT, ord('c'), 27])
+    monitor.view(screen, {})
+    assert '[Runs]' in screen.frames[1]
+    assert '› b: Parameter case b' in screen.frames[3]
+    assert 'Parameter case b' in screen.frames[4]
+    assert 'selected case b CUDA progress' in screen.frames[5]
+    assert '/human/jobs/job-alpha/logs?case_id=b' in calls
+    assert '[Logs]' in screen.frames[6]
+    assert '/human/jobs/job-alpha/logs' in calls
+
+
+def test_runs_selection_remains_visible_beyond_one_screen(human_view):
+    snapshot, _ = human_view
+    snapshot['jobs'][0].update(job_kind='mps', cases=[
+        {'case_id':f'c{i}', 'script_path':f'jobs/c{i}.py', 'state':'waiting', 'args':['--case',str(i)]}
+        for i in range(30)])
+    screen = Screen([curses.KEY_RIGHT, *([curses.KEY_DOWN] * 25), 27])
+    monitor.view(screen, {})
+    assert '› c24:' in screen.frames[-1]
+
+
+def test_long_case_id_remains_selected_on_narrow_terminal(human_view):
+    snapshot, _ = human_view
+    snapshot['jobs'][0].update(job_kind='mps', cases=[
+        {'case_id':f'case_{i:03}_' + 'x'*55, 'script_path':'jobs/simulation.py', 'state':'waiting',
+         'args':['--parameters', 'long arguments '*10]} for i in range(12)])
+    class NarrowScreen(Screen):
+        def getmaxyx(self):
+            return 18, 35
+    screen = NarrowScreen([curses.KEY_RIGHT, *([curses.KEY_DOWN] * 10), 27])
+    monitor.view(screen, {})
+    assert '› case_009_' in screen.frames[-1]
+
+
 def test_logs_scroll_refresh_and_reordered_snapshot_keep_the_owner(human_view, monkeypatch):
     snapshot, calls = human_view
     original = monitor.request

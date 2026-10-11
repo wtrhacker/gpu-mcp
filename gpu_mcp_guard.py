@@ -563,10 +563,12 @@ def run_job(
     repo_root: Path,
     script_roots: list[Path],
     write_roots: list[Path],
+    captured_source: str | None = None,
 ) -> int:
     script = validate_python_script_path(job, repo_root=repo_root, script_roots=script_roots)
     try:
-        source = read_script_no_follow(script, script_roots=script_roots)
+        source = (read_script_no_follow(script, script_roots=script_roots)
+                  if captured_source is None else captured_source)
     except UnicodeDecodeError as e:
         print(_script_rejection_message(script, [f"could not decode script as text: {e}"]), file=sys.stderr)
         return 126

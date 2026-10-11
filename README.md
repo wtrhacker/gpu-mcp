@@ -63,6 +63,11 @@ local tools. For remote CPU or GPU-assisted builds, the optional
 a confined build environment. A later ordinary GPU job loads the resulting
 library or package; it need not have been built through MCP.
 
+For independent CUDA runs sharing one GPU, [managed MPS sweeps](docs/mps.md)
+add a bounded queue and separate case logs, status, stop and explicit retry.
+One failed run leaves healthy siblings running. Retries remain the agent's
+choice; scientific scripts retain the subprocess restriction.
+
 ## How does the human stay in control?
 
 Each research project has a small file named `gpu-mcp.toml`. It lists:

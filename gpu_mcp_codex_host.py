@@ -93,10 +93,16 @@ def make_app(server, credentials):
         record = await asyncio.to_thread(runtime.store.get, request.path_params["job_id"])
         if record is None:
             return JSONResponse({"error": "job unavailable"}, status_code=404)
+        case_id = request.query_params.get('case_id')
+        if case_id is not None:
+            case = next((c for c in record.get('cases', []) if c['case_id'] == case_id), None)
+            if record.get('job_kind') != 'mps' or case is None:
+                return JSONResponse({'error': 'case unavailable'}, status_code=404)
+            record = case
         path = await asyncio.to_thread(server._validate_output_path, record.get("output_file"))
         try:
             tail = await asyncio.to_thread(read_human_log_tail, path)
-            return JSONResponse({"job_id": record["job_id"], "tail": tail})
+            return JSONResponse({"job_id": request.path_params['job_id'], 'case_id': case_id, "tail": tail})
         except OSError as exc:
             return JSONResponse({"error": str(exc)}, status_code=404)
 

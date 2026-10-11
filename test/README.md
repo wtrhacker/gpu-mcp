@@ -44,6 +44,10 @@ Run a focused file while developing:
 pytest test/test_gpu_mcp_server_contract.py
 ```
 
+MPS sweeps have real-process local contracts and separate opt-in CUDA/OpenMM
+and PyTorch acceptance. See [the MPS test guide](MPS.md) for commands, failure
+injection, hardware requirements and earlier ADR compatibility.
+
 Artifact builds have local contracts in `test/test_gpu_mcp_builds.py` and short
 live Codex probes in `test/test_codex_build_battlefield.py`. The latter use
 GPT-5.5 medium and launch a fresh MCP server, so no interactive restart is needed:

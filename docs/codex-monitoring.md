@@ -127,6 +127,11 @@ calling conversation's jobs. `check_gpus` reports physical availability without
 foreign job details. In this integration, use an owned job's detailed status
 instead of the repo-wide `check_gpu_processes` tool.
 
+[Managed MPS sweeps](mps.md) use the same ownership and quiet monitoring.
+Counts summarize the parent; `case_id` selects a run for status, logs, stop or
+explicit retry. Ctrl+G adds a Runs page for the selected sweep, without putting
+case listings into another agent's context.
+
 ## Useful events and connection failures
 
 Before ending checks or releasing a GPU, the backend commits the result and its
