@@ -29,6 +29,67 @@ def wait(check, seconds=60):
     raise AssertionError('CUDA/MPS acceptance condition timed out')
 
 
+def test_human_demo_smoke_runs_real_cuda_and_keeps_case_diagnostics(monkeypatch):
+    host = os.environ['GPU_MCP_MPS_TEST_HOST']
+    root = ROOT / 'test_mcp_repos' / ('gpu-mcp-mps-demo-' + secrets.token_hex(5))
+    repo = root / 'repo'
+    for name in ('jobs', 'results', 'logs'):
+        (repo / name).mkdir(parents=True)
+    config = repo / 'gpu-mcp.toml'
+    config.write_text(f"schema_version=1\nrepo_root={str(repo)!r}\nnodes=[{host!r}]\n"
+                      "script_roots=['jobs']\nwrite_roots=['results']\noutput_roots=['logs']\n")
+    approval = root / 'approved.json'
+    approve_policy(load_policy(config), store_path=approval, approved_by='pytest',
+                   diff_summary=['isolated human demo smoke validation'])
+    for name in ('GPU_MCP_TEST_RESERVATION_ROOT', 'GPU_MCP_TEST_DISABLE_POLICY_APPROVAL',
+                 'GPU_MCP_TEST_MPS_DRIVER', 'GPU_MCP_CODEX_SHARED'):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv('GPU_MCP_TEST_POLICY_APPROVAL_STORE', str(approval))
+    monkeypatch.setenv('GPU_MCP_TEST_MPS_CONTROL_ROOT', str(root / 'control'))
+    server = _import_server_with_config(monkeypatch, config)
+    (repo / 'jobs/demo.py').write_bytes((ROOT / 'test/fixtures/mps_demo_case.py').read_bytes())
+    entries = [{'case_id': name, 'script_path': 'jobs/demo.py',
+                'args': ['--phase', 'smoke', '--case', name, '--seconds', '8', '--output-dir', 'results/' + name],
+                'output_file': 'logs/' + name + '.log'} for name in ('smoke-one', 'smoke-two')]
+    job = None
+    try:
+        inventory = json.loads(server.check_gpus(samples=1))
+        available = [g for g in inventory.get('gpus', []) if g.get('availability') == 'available']
+        assert available, inventory
+        selected = available[0]
+        launched = json.loads(server.run_python_on_gpu(host=host, gpu_index=selected['gpu_index'],
+            mps=True, max_concurrent=2, runs=entries, job_role='smoke', cadence_hint_sec=1,
+            job_title='Human MPS demo smoke validation'))
+        job = launched.get('job_id')
+        assert launched['status'] == 'launched', launched
+        def completed():
+            value = json.loads(server.manage_gpu_job(job_id=job, action='status', detail='full',
+                early_poll_reason='validate the repaired demo under the real guard and CUDA'))
+            return value if value.get('job_lifecycle') in {'succeeded', 'failed'} else None
+        final = wait(completed)
+        assert final['job_lifecycle'] == 'succeeded' and not final['active_reservation'], final
+        record = server._mps_manager().read(job)
+        for entry in entries:
+            case_id = entry['case_id']
+            result = json.loads((repo / 'results' / case_id / 'summary.json').read_text())
+            assert result['passed'] and result['value'] == 64 and result['attempt'] == 1
+            # Inspect the source host directly: this must work even before an
+            # NFS client exposes a remote-created log on the control machine.
+            case = next(c for c in record['cases'] if c['case_id'] == case_id)
+            log = server._mps_manager().rpc('logs', record['mps_spec'], request={
+                'case_id': case_id, 'case_attempt_id': case['attempt_id'], 'lines': 80})
+            assert case_id + ' completed:' in log['tail']
+        (root / 'acceptance.json').write_text(json.dumps({'job_id': job, 'final': final, 'cases': record['cases']}, indent=2))
+        print('Human MPS demo smoke evidence:', root)
+    finally:
+        if job:
+            saved = server._mps_manager().read(job)
+            if server._mps_manager().rpc('status', saved['mps_spec'])['state'] != 'gone':
+                server.manage_gpu_job(job_id=job, action='stop')
+                wait(lambda: server._mps_manager().rpc('status', saved['mps_spec'])['state'] == 'gone')
+        server.HEARTBEAT_MANAGER.stop()
+
+
 @pytest.mark.parametrize('framework', ['torch', 'openmm'])
 def test_cuda_failure_stop_retry_preserve_sibling_progress(monkeypatch, framework):
     host = os.environ['GPU_MCP_MPS_TEST_HOST']

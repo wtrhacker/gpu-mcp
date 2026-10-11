@@ -4119,12 +4119,10 @@ def manage_gpu_job(
                 return _json_tool_response({'status': 'refused', 'reason': 'case unavailable in this sweep'})
             if isinstance(log_tail_lines, bool) or not isinstance(log_tail_lines, int) or not 1 <= log_tail_lines <= 200:
                 return _json_tool_response({'status': 'refused', 'reason': 'log_tail_lines must be 1 through 200'})
-            path = _validate_output_path((selected or mps)['output_file'])
             try:
-                from gpu_mcp_codex_host import read_human_log_tail
-                tail = ''.join(read_human_log_tail(path).splitlines(keepends=True)[-log_tail_lines:])
+                tail = _mps_manager().log_tail(mps, case_id, log_tail_lines)
                 return _json_tool_response({'status': 'ok', 'job_id': job_id, 'case_id': case_id, 'log_tail': tail})
-            except OSError as exc:
+            except (OSError, ValueError, RuntimeError) as exc:
                 return _json_tool_response({'status': 'refused', 'reason': str(exc)})
         try:
             return _json_tool_response(_mps_manager().manage(mps, action, case_id=case_id,

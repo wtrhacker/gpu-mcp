@@ -5,13 +5,16 @@ from __future__ import annotations
 import argparse
 import curses
 import json
+import os
 from pathlib import Path
+import subprocess
 import sys
 import textwrap
 import time
+import tomllib
 from urllib.parse import urlencode
 
-from gpu_mcp_codex_launcher import alive, ensure_backend, read_info, request
+from gpu_mcp_codex_launcher import alive, read_info, request
 from gpu_mcp_codex_state import runtime_root
 from gpu_mcp_monitor_display import STATUS_COLORS, matches_job, messages, parse_log_progress, progress_text, safe_text, task_row
 
@@ -21,13 +24,39 @@ def connect_viewer(config, *, base=None):
     config = Path(config).expanduser().resolve()
     info = read_info(runtime_root(config, base=base))
     if not alive(info):
-        return ensure_backend(config, base=base)
+        return start_registered_backend(config, base=base)
     if info.get("config_path") != str(config):
         raise ValueError("the live backend belongs to another policy path")
     health = request(info, "/health", timeout=3)
     if health.get("server_instance_id") != info.get("server_instance_id"):
         raise ValueError("the live backend identity changed")
     return info
+
+
+def start_registered_backend(config, *, base=None):
+    """An idle repo must restart with its registered interpreter and job settings."""
+    registration = config.parent / '.codex/config.toml'
+    with registration.open('rb') as stream:
+        server = tomllib.load(stream).get('mcp_servers', {}).get('gpu-cluster-mcp', {})
+    args = server.get('args', [])
+    candidates = [p for p in args if isinstance(p, str) and Path(p).name == 'gpu_mcp_codex_launcher.py']
+    if (server.get('enabled', True) is False or len(candidates) != 1 or '--config' not in args
+            or args.index('--config') + 1 == len(args) or Path(args[args.index('--config') + 1]).resolve() != config):
+        raise ValueError('open this repository in Codex with its configured shared GPU MCP launcher')
+    python, entry = Path(server.get('command', '')), Path(candidates[0])
+    if not python.is_absolute() or not entry.is_absolute() or not python.is_file() or not entry.is_file():
+        raise ValueError('the registered GPU MCP interpreter or launcher is unavailable')
+    if base is None and '--state-base' in args:
+        base = args[args.index('--state-base') + 1]
+    program = ('import json,sys;sys.path.insert(0,sys.argv[1]);'
+               'from gpu_mcp_codex_launcher import ensure_backend;'
+               'print(json.dumps(ensure_backend(sys.argv[2],base=sys.argv[3] or None)))')
+    result = subprocess.run([str(python), '-B', '-c', program, str(entry.parent), str(config), str(base or '')],
+                            cwd=server.get('cwd') or config.parent,
+                            env=dict(os.environ, **server.get('env', {})), capture_output=True, text=True, timeout=30)
+    if result.returncode:
+        raise ValueError('GPU MCP startup failed: ' + result.stderr.strip()[-1000:])
+    return json.loads(result.stdout)
 
 
 def view(screen, info, *, chooser=False):

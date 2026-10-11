@@ -64,6 +64,22 @@ PyTorch NVML/CUDA device-count mismatch. Capability checks now inspect the
 binary and driver separately, and clients use the GPU UUID mask. These were
 implementation failures, not reasons to weaken the tests.
 
+The first human MPS demo exposed two additional gaps. Its checkpoint publisher
+used `Path.replace`, which passes the static source scan but violates the
+runtime guard's rename restriction. The initial demo tests executed the script
+without that guard. A subprocess regression now runs smoke, failure and retry
+through the actual audit hook; only CUDA and elapsed time are simulated. The
+fixture writes and closes files directly, preserving the guard's restrictions.
+
+The agent also received file-not-found replies for remote-created case logs
+that later became visible on the control machine. Local log fixtures had not
+covered this shared-filesystem delay. MPS diagnostic reads now fall back to a
+bounded, authenticated read on the execution host for missing or empty local
+logs. Tests hide the control-side file while a separate worker Python reads the
+real log, and require job/event state and ownership boundaries to stay intact.
+The remote reader accepts saved case paths only, rejects symlinks and non-regular
+files, and limits output to 200 lines and 32,000 bytes.
+
 Simulated teardown receipts prove ordering and ownership logic, not NVIDIA
 behavior. Real acceptance must demonstrate increasing GPU progress in the
 sibling after another case is stopped and retried. A passing tiny workload does
@@ -129,6 +145,16 @@ not part of this all-cases-success ending.
 
 `test_manual_mps.py` verifies preparation does not alter policy/permissions or
 overwrite an earlier run, and verifies the failure/second-invocation sequence
-with a simulated clock and CUDA module. That local check is not evidence of
-CUDA, native notification delivery or model behavior. Record those observations
-from the human run separately; reports and generated artifacts remain ignored.
+with a simulated clock and CUDA module, including real runtime-guard execution
+in subprocesses. The opt-in `test_human_demo_smoke_runs_real_cuda_and_keeps_case_diagnostics`
+executes the same fixture's two eight-second smoke cases on a real GPU and
+checks the execution-host log reader. Run that specific validation with:
+
+```bash
+GPU_MCP_RUN_MPS_REMOTE_TESTS=1 GPU_MCP_MPS_TEST_HOST=your-host \
+  python -m pytest -q -s test/test_mps_remote_acceptance.py -k human_demo_smoke
+```
+
+These checks do not establish native notification delivery or model behavior.
+Record those observations from the human run separately; reports and generated
+artifacts remain ignored.

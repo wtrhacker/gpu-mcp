@@ -120,6 +120,13 @@ They inspect private fixture logs, close with Escape and prove the popup's input
 and data did not reach the underlying frontend. Source paths containing spaces
 and apostrophes exercise the actual tmux/shell quoting.
 
+The first shortcut test used an unsplit window and missed a 95%-of-client popup
+covering neighboring splits. The real terminal cases now put Codex in the
+bottom-right of three splits with a top status bar, inspect the popup's actual
+PTY dimensions, and require it to fit inside that pane. Configured native editor
+handoffs remain native. Chooser regressions retain stopped repositories, and
+idle startup must use the repository's registered interpreter and job environment.
+
 ```bash
 python -m pytest -q test/test_gpu_mcp_codex_tmux.py
 GPU_MCP_RUN_NATIVE_TMUX_TEST=1 python -m pytest -q test/test_gpu_mcp_codex_tmux.py -k native

@@ -13,6 +13,53 @@ from gpu_mcp_codex_terminal_setup import BEGIN, install, plan
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_repo_chooser_keeps_stopped_backends(tmp_path, monkeypatch):
+    import json
+    import socket
+    import gpu_mcp_codex_editor as editor
+    current, stopped = tmp_path / 'current', tmp_path / 'stopped'
+    base = tmp_path / 'state'
+    for directory in (current, stopped, base / 'old'):
+        directory.mkdir(parents=True)
+    for repo in (current, stopped):
+        (repo / 'gpu-mcp.toml').write_text('schema_version=1\n')
+    (base / 'old/backend.json').write_text(json.dumps({
+        'hostname': socket.gethostname(), 'pid': 99999999,
+        'config_path': str(stopped / 'gpu-mcp.toml')}))
+    monkeypatch.chdir(current)
+    assert editor.repo_choices(base=base) == [current / 'gpu-mcp.toml', stopped / 'gpu-mcp.toml']
+
+
+def test_idle_monitor_uses_the_registered_interpreter_and_job_environment(tmp_path, monkeypatch):
+    import json
+    import types
+    import gpu_mcp_codex_monitor as monitor
+    repo = tmp_path / 'repo'
+    (repo / '.codex').mkdir(parents=True)
+    config = repo / 'gpu-mcp.toml'
+    config.write_text('')
+    runtime = tmp_path / 'runtime'
+    runtime.mkdir()
+    launcher = runtime / 'gpu_mcp_codex_launcher.py'
+    launcher.write_text('')
+    python = tmp_path / 'server-python'
+    python.write_text('')
+    (repo / '.codex/config.toml').write_text(
+        '[mcp_servers.gpu-cluster-mcp]\ncommand=' + json.dumps(str(python)) + '\nargs=' +
+        json.dumps([str(launcher), '--config', str(config)]) + '\n'
+        '[mcp_servers.gpu-cluster-mcp.env]\nGPU_MCP_PYTHON="/registered/job/python"\n')
+    calls = []
+    def launch(argv, **kw):
+        calls.append((argv, kw))
+        return types.SimpleNamespace(returncode=0, stdout='{"pid":321}', stderr='')
+    monkeypatch.setattr(monitor, 'read_info', lambda *a: None)
+    monkeypatch.setattr(monitor.subprocess, 'run', launch)
+    assert monitor.connect_viewer(config) == {'pid': 321}
+    assert calls[0][0][0] == str(python)
+    assert str(runtime) in calls[0][0]
+    assert calls[0][1]['env']['GPU_MCP_PYTHON'] == '/registered/job/python'
+
+
 def test_install_preserves_shell_settings_and_is_idempotent(tmp_path):
     rc = tmp_path / '.bashrc'
     original = "# User settings\nexport EDITOR='vim -n'\n"

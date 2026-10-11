@@ -6,9 +6,9 @@ import time
 
 
 def publish(path, value):
-    temporary = path.with_suffix('.tmp')
-    temporary.write_text(json.dumps(value, indent=2) + '\n')
-    temporary.replace(path)
+    # The managed script guard permits writes within results, but not renames.
+    # Each write closes before the next progress report or terminal outcome.
+    path.write_text(json.dumps(value, indent=2) + '\n')
 
 
 def main(argv=None):

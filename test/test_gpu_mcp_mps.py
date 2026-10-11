@@ -10,6 +10,9 @@ import sqlite3
 import fcntl
 import threading
 import uuid
+import subprocess
+import shlex
+import errno
 
 import pytest
 
@@ -96,6 +99,46 @@ def test_one_failure_does_not_stop_siblings_or_retry_itself(mps):
     assert final['long']['state'] == final['later']['state'] == 'succeeded'
     assert len(final['bad']['attempts']) == 1
     assert len([e for e in f.runtime.store.events() if e['kind'] == 'case_failed.bad']) == 1
+
+
+@pytest.mark.parametrize('local_view', ['missing', 'empty'])
+def test_case_logs_read_at_source_when_control_mount_has_not_caught_up(mps, monkeypatch, local_view):
+    import gpu_mcp_codex_host as host
+    f = mps
+    job = launch(f, [entry(f, 'diagnostic', source='print("specific case failure evidence")\nraise SystemExit(17)\n')])
+    until(lambda: status(f, job)['job_lifecycle'] == 'failed')
+    before = f.runtime.store.get(job)
+    events = f.runtime.store.events()
+    def local_read(path):
+        if local_view == 'missing':
+            raise FileNotFoundError(errno.ENOENT, 'simulated delayed NFS visibility', str(path))
+        return ''
+    monkeypatch.setattr(host, 'read_human_log_tail', local_read)
+    monkeypatch.setattr(f.server, '_is_local_host', lambda host: False)
+    # A separate execution-host Python reads the real file. Only the control
+    # mount is made unavailable; no precomputed log reply bypasses the RPC.
+    monkeypatch.setattr(f.server, '_host_run', lambda host, command, **kw:
+                        subprocess.check_output(shlex.split(command), text=True, timeout=10))
+    result = call(f, 'manage_gpu_job', job_id=job, case_id='diagnostic', action='logs')
+    assert result['status'] == 'ok', result
+    assert 'specific case failure evidence' in result['log_tail']
+    assert f.runtime.store.get(job) == before and f.runtime.store.events() == events
+    f.actor['threadId'] = str(uuid.uuid4())
+    assert call(f, 'manage_gpu_job', job_id=job, case_id='diagnostic', action='logs')['status'] == 'refused'
+
+
+def test_execution_host_log_reader_is_bounded_and_rejects_symlinks(tmp_path):
+    log = tmp_path / 'large.log'
+    log.write_text('line\n' * 10000 + 'last\n')
+    assert worker.read_log_tail(log, 2) == 'line\nlast\n'
+    link = tmp_path / 'link.log'
+    link.symlink_to(log)
+    with pytest.raises(OSError):
+        worker.read_log_tail(link)
+    fifo = tmp_path / 'pipe'
+    os.mkfifo(fifo)
+    with pytest.raises(ValueError, match='regular file'):
+        worker.read_log_tail(fifo)
 
 
 def test_explicit_retry_changes_only_one_attempt_and_keeps_prior_log(mps):

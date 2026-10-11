@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 
@@ -63,9 +64,9 @@ def editor_command() -> list[str]:
 
 
 def repo_choices(config=None, base=None):
-    """Prefer the current policy; offer live repos when frontend cwd differs."""
+    """Prefer the current policy; retain known repositories after idle shutdown."""
     from gpu_mcp_policy_hook import find_policy_file
-    from gpu_mcp_codex_launcher import alive, read_info
+    from gpu_mcp_codex_launcher import read_info
     choices = []
     current = Path(config).resolve() if config else find_policy_file(Path.cwd())
     if current:
@@ -74,7 +75,8 @@ def repo_choices(config=None, base=None):
     if state.is_dir():
         for root in sorted(state.iterdir()):
             info = read_info(root)
-            if alive(info) and info.get('config_path'):
+            if (isinstance(info, dict) and info.get('hostname') == socket.gethostname()
+                    and isinstance(info.get('config_path'), str)):
                 policy = Path(info['config_path'])
                 if policy.is_file() and policy.resolve() not in choices:
                     choices.append(policy.resolve())
@@ -87,7 +89,9 @@ def choose(screen, policies, base, *, allow_edit=True):
     curses.curs_set(0)
     curses.set_escdelay(25)
     screen.keypad(True)
-    rows = [(f'Monitor jobs — {policy.parent}', policy) for policy in policies]
+    # Put the distinguishing name first so a narrow split does not show only
+    # the same long filesystem prefix for every repository.
+    rows = [(f'{policy.parent.name} — {policy.parent}', policy) for policy in policies]
     if allow_edit:
         rows.append(('Edit prompt in your text editor', 'edit'))
     rows.append(('Cancel', None))
@@ -98,7 +102,7 @@ def choose(screen, policies, base, *, allow_edit=True):
         height, width = screen.getmaxyx()
         lines = ['GPU MCP — human terminal', '↑↓ Select | Enter/→ Open | Esc Return to Codex', '']
         if not policies:
-            lines.append('No GPU MCP policy or live repository found.')
+            lines.append('No GPU MCP repository found.')
         start = max(0, selected - max(1, height - len(lines) - 4) + 1)
         for y, line in enumerate(lines):
             if y < height - 1:

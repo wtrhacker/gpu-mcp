@@ -67,6 +67,16 @@ def test_other_foreground_applications_receive_ctrl_g(monkeypatch):
     assert calls == [('send-keys','-t','%4','C-g')]
 
 
+def test_configured_native_editor_keeps_the_original_pane_handoff(monkeypatch):
+    calls = []
+    monkeypatch.setattr(popup, 'pane_info', lambda pane: (123, '/fixture'))
+    monkeypatch.setattr(popup, 'frontend', lambda pid: {'pid': 456, 'pgid': 456, 'start': '1'})
+    monkeypatch.setattr(popup, 'native_monitor', lambda pid: True)
+    monkeypatch.setattr(popup, 'tmux', lambda *args, **kw: calls.append(args))
+    assert popup.dispatch('%4')['action'] == 'native_editor'
+    assert calls == [('send-keys', '-t', '%4', 'C-g')]
+
+
 def make_proc(root, pid, *, exe, group, foreground, children=(), argv=()):
     directory = root / str(pid)
     (directory / 'task' / str(pid)).mkdir(parents=True)
@@ -162,11 +172,30 @@ char b[256];int n;while((n=read(0,b,sizeof b))>0){write(fd,b,n);write(1,b,n);}re
                 if needle in capture[start:]: return
             raise AssertionError(capture[start:].decode(errors='replace')[-6000:])
         await_text(b'GPT-5.5 medium' if npm == 'native' else b'UNCHANGED_DRAFT')
+        # Put Codex in the bottom-right of three splits, with a top status bar
+        # as in Byobu. The old 95%-of-client popup wrongly covered both neighbors.
+        neighbor = shlex.join([sys.executable, '-c', "import time; print('NEIGHBOR_SENTINEL',flush=True); time.sleep(3600)"])
+        mux('set-option', '-g', 'status-position', 'top')
+        mux('split-window', '-h', '-b', '-d', '-t', pane, neighbor)
+        mux('split-window', '-v', '-b', '-d', '-t', pane, neighbor)
+        mux('select-pane', '-t', pane)
+        width, height = map(int, mux('display-message', '-p', '-t', pane, '#{pane_width} #{pane_height}').split())
         if npm == 'native':
             os.write(master,b'DRAFT_SENTINEL')
             await_text(b'DRAFT_SENTINEL')
         os.write(master,b'\x07')
         await_text(b'GPU MCP')
+        viewers = []
+        for pid in (Path('/proc') / server_pid / 'task' / server_pid / 'children').read_text().split():
+            try:
+                if b'--popup' in (Path('/proc') / pid / 'cmdline').read_bytes().split(b'\0'):
+                    viewers.append(pid)
+            except OSError:
+                pass
+        assert len(viewers) == 1
+        with (Path('/proc') / viewers[0] / 'fd/0').open('rb', buffering=0) as terminal:
+            rows, columns, _, _ = struct.unpack('HHHH', fcntl.ioctl(terminal, termios.TIOCGWINSZ, bytes(8)))
+        assert (columns, rows) == (width - 2, height - 2), 'popup escaped its selected split'
         os.write(master,b'\r')
         await_text(b'GPU MCP Monitor')
         await_text(b'Jobs: 1/1')

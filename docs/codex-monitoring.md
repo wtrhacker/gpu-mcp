@@ -182,8 +182,10 @@ configures the Ctrl+G monitor once:
 ```
 
 On Linux with tmux 3.2 or later, setup installs and activates a tmux shortcut,
-including Byobu's user configuration when present. Ctrl+G opens the human
-monitor in a popup when the foreground application is Codex. It recognizes both
+including Byobu's user configuration when present. Ctrl+G keeps Codex's native
+editor handoff when its monitor helper is already configured. Otherwise it opens
+the human monitor in a popup sized and positioned inside the selected split.
+It recognizes both
 the standalone binary and npm's `node` launcher. Other applications receive their
 normal Ctrl+G. Existing custom bindings are reported rather than overwritten.
 
@@ -223,9 +225,11 @@ draft text or model input. Repo-wide viewer data stays on the human side. An
 ordinary agent shell or PTY call is refused for protected Codex drafts. This
 guard does not replace operating-system permissions or the earlier scope limits.
 
-A fresh chooser uses the nearest policy and offers other live repositories when
+A fresh chooser uses the nearest policy and offers other known repositories on
+this machine, including stopped backends. An idle repository stays available
+after an upgrade. Selecting it starts the backend with that repository's
+registered Python and environment. Select the displayed repo explicitly when
 the terminal's working directory differs from the frontend's current repository.
-Select the displayed repo explicitly in that case.
 
 The earlier frontend wrapper remains an optional tested prototype:
 

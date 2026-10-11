@@ -67,8 +67,8 @@ def private_path(path):
     return path
 
 
-def open_log(path):
-    """Create a log through pinned directories; reject link swaps at any level."""
+def log_descriptor(path, flags):
+    """Open a log through pinned directories; reject link swaps at any level."""
     parts = Path(path).absolute().parts
     fd = os.open(parts[0], os.O_RDONLY | os.O_DIRECTORY)
     try:
@@ -76,10 +76,28 @@ def open_log(path):
             next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
             os.close(fd)
             fd = next_fd
-        return os.open(parts[-1], os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                       0o600, dir_fd=fd)
+        return os.open(parts[-1], flags | os.O_NOFOLLOW, 0o600, dir_fd=fd)
     finally:
         os.close(fd)
+
+
+def open_log(path):
+    return log_descriptor(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+
+
+def read_log_tail(path, lines=200):
+    if type(lines) is not int or not 1 <= lines <= 200:
+        raise ValueError('log lines must be 1 through 200')
+    with os.fdopen(log_descriptor(path, os.O_RDONLY | os.O_NONBLOCK), 'rb') as stream:
+        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+            raise ValueError('job log is not a regular file')
+        start = max(0, stream.seek(0, os.SEEK_END) - 32000)
+        stream.seek(start)
+        data = stream.read(32000)
+    if start:
+        newline = data.find(b'\n')
+        data = data[newline + 1:] if newline >= 0 else b''
+    return ''.join(data.decode(errors='replace').splitlines(keepends=True)[-lines:])
 
 
 def read_json(path):
@@ -729,6 +747,18 @@ def rpc(action, spec, sources=None, request=None):
         write_json(path / 'launch.json', {'parent': identity(proc.pid)})
         return {'status': 'launched', 'parent': identity(proc.pid)}
     path, stored = authenticate(spec)
+    if action == 'logs':
+        request = request or {}
+        case_id = request.get('case_id')
+        selected = stored
+        if case_id is not None:
+            selected = next((c for c in read_json(path / 'state.json')['cases'] if c['case_id'] == case_id), None)
+            if selected is None:
+                raise ValueError('case unavailable in this sweep')
+            if selected['attempt_id'] != request.get('case_attempt_id'):
+                raise ValueError('case attempt changed; refresh its status before reading the log')
+        # Only saved paths are accepted; callers cannot request arbitrary files.
+        return {'tail': read_log_tail(selected['output_file'], request.get('lines', 200))}
     if action == 'status':
         return inspect(stored)
     if action not in {'stop', 'retry'}:

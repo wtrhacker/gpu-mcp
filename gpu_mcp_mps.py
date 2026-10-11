@@ -1,6 +1,8 @@
 """MPS parent/case management through existing GPU MCP policy and leases."""
 from __future__ import annotations
 
+import errno
+
 import base64
 from datetime import datetime, timezone
 import hashlib
@@ -282,6 +284,25 @@ class MpsManager:
             removed, _ = s._cleanup_stale_gone_reservation(record['reservation_key'], metadata)
             if removed:
                 record['active_reservation'] = False
+
+    def log_tail(self, record, case_id=None, lines=200):
+        from gpu_mcp_codex_host import read_human_log_tail
+        selected = next((c for c in record.get('cases', []) if c['case_id'] == case_id), None) if case_id else record
+        if selected is None:
+            raise ValueError('case unavailable in this sweep')
+        path = self.server._validate_output_path(selected['output_file'])
+        try:
+            tail = read_human_log_tail(path)
+            if tail or self.server._is_local_host(record['host']):
+                return ''.join(tail.splitlines(keepends=True)[-lines:])
+        except OSError as exc:
+            if exc.errno not in {errno.ENOENT, errno.ESTALE} or self.server._is_local_host(record['host']):
+                raise
+        # A remote-created log can remain invisible on the control host's NFS
+        # mount after the process finishes. Read it at its source, without a
+        # status call, lifecycle change or arbitrary caller-supplied path.
+        return self.rpc('logs', record['mps_spec'], request={
+            'case_id': case_id, 'case_attempt_id': selected.get('attempt_id'), 'lines': lines})['tail']
 
     def manage(self, record, action, case_id=None, reason=None, cadence_hint_sec=None, early_poll_reason=None,
                expected_duration_sec=None):

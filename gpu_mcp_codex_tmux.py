@@ -61,21 +61,44 @@ def pane_info(pane):
     return int(pid), directory
 
 
+def native_monitor(pid):
+    try:
+        entries = (Path('/proc') / str(pid) / 'environ').read_bytes().split(b'\0')
+        env = dict(entry.split(b'=', 1) for entry in entries if b'=' in entry)
+        return env.get(b'GPU_MCP_CODEX_EDITOR_ENABLED') == b'1' and any(
+            Path(arg).name == 'gpu_mcp_codex_editor.py'
+            for arg in shlex.split(env.get(b'VISUAL', b'').decode()))
+    except (OSError, ValueError, UnicodeError):
+        return False
+
+
+def pane_dimensions(pane):
+    raw = tmux('display-message', '-p', '-t', pane, '#{pane_width} #{pane_height}').stdout
+    width, height = map(int, raw.split())
+    if width < 20 or height < 8:
+        raise ValueError('enlarge this split to open the monitor')
+    return width, height
+
+
 def dispatch(pane, client=None, *, probe=False, state_base=None):
     pane_pid, directory = pane_info(pane)
     matched = frontend(pane_pid)
     result = {'pane':pane, 'directory':directory, 'frontend':matched,
-              'action':'popup' if matched else 'passthrough'}
+              'action':('native_editor' if native_monitor(matched['pid']) else 'popup') if matched else 'passthrough'}
     if probe:
         return result
-    if not matched or frontend(pane_pid) != matched:
+    if not matched or frontend(pane_pid) != matched or result['action'] == 'native_editor':
         tmux('send-keys', '-t', pane, 'C-g')
         return result
     command = [sys.executable, str(Path(__file__).resolve()), '--popup', '--pane', pane,
                '--frontend', str(matched['pid']), '--start', matched['start']]
     if state_base:
         command += ['--state-base', str(state_base)]
-    args = ['display-popup', '-E', '-w', '95%', '-h', '95%', '-t', pane, '-d', directory]
+    width, height = pane_dimensions(pane)
+    # P anchors at the pane's bottom-left; equal height keeps the popup wholly
+    # inside it, including when tmux/Byobu puts status lines above the panes.
+    args = ['display-popup', '-E', '-w', str(width), '-h', str(height),
+            '-x', 'P', '-y', 'P', '-t', pane, '-d', directory]
     if client:
         args += ['-c', client]
     # tmux 3.2 accepts one shell-command. exec keeps tmux as the viewer's parent.
