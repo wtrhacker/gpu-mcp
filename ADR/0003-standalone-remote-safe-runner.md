@@ -256,3 +256,18 @@ bootstrap, raw SSH blocking, and process-kill flow remain unchanged.
 The implementation must avoid drifting into a general scheduler or portable
 cluster runtime. The goal is only to decouple remote guarded execution from the
 control-side MCP server install path.
+
+## Temporary storage amendment — 2026-10-13
+
+Each guarded job or MPS case places private scratch below
+`<first approved write root>/.gpu_mcp_tmp/<execution host>/`, keeping the job's delete/rename
+exception limited to its individual child directory. Successful workers remove
+that child after library shutdown handlers. Failed scratch is retained for a
+fixed seven days; a subsequent worker performs collection before installing its
+guard. Collection requires an unused owner-file lock, expired retention and
+proof that the encoded PID ended on its matching host. Live reused PIDs are
+retained; editable start/boot metadata and migration flags cannot prove death.
+Creation and recursive removal pin directory handles. Foreign-host uncertainty and
+unmanaged folders are retained. This adds no reservation-expiry rule, lifecycle
+adoption, background scheduler or agent reminder. Explicitly verified legacy
+scratch migrations preserve contents and receive seven days from the move.

@@ -5,13 +5,20 @@ from __future__ import annotations
 import ast
 import atexit
 import builtins
+import fcntl
 import io
+import json
+import math
 import os
+import re
+import secrets
 import shlex
 import shutil
+import socket
 import stat
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 
@@ -465,18 +472,196 @@ def _temporary_operation_allowed(event: str, args: tuple, temporary_root: Path |
     return False
 
 
-def _prepare_temporary_root(write_roots: list[Path]) -> Path | None:
-    """Create a fresh private directory under an already approved write root."""
+TEMPORARY_CONTAINER = ".gpu_mcp_tmp"
+TEMPORARY_OWNER_FILE = ".owner.json"
+TEMPORARY_RETENTION_SEC = 7 * 24 * 60 * 60
+
+
+def _temporary_process_start(pid: int) -> str | None:
+    fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+    return None if fields[0] in {"Z", "X"} else fields[19]
+
+
+def _temporary_owner_gone(owner: dict) -> bool:
+    if owner.get("kind") not in {'job', 'migrated'} or owner.get("host") != socket.gethostname():
+        return False
+    if (type(owner.get("pid")) is not int or owner['pid'] <= 0
+            or not isinstance(owner.get('process_start'), str) or not owner['process_start'].isdigit()
+            or not isinstance(owner.get('boot_id'), str)
+            or not re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', owner['boot_id'])):
+        return False
+    try:
+        # Never infer death from editable start/boot fields. A live reused PID
+        # is conservatively retained; the host and PID are bound to the path.
+        return _temporary_process_start(owner['pid']) is None
+    except FileNotFoundError as exc:
+        return exc.filename == f"/proc/{owner['pid']}/stat"
+    except (OSError, ValueError, IndexError):
+        return False
+
+
+def _open_private_temporary_directory(parent: int, name: str) -> int:
+    try:
+        os.mkdir(name, mode=0o700, dir_fd=parent)
+    except FileExistsError:
+        pass
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+    except OSError as exc:
+        raise PermissionError('GPU MCP temporary container must be a real directory owned by this user') from exc
+    if os.fstat(fd).st_uid != os.getuid():
+        os.close(fd)
+        raise PermissionError('GPU MCP temporary container belongs to another user')
+    return fd
+
+
+def _open_temporary_container(root: Path) -> tuple[Path, int]:
+    host = socket.gethostname()
+    if not re.fullmatch(r'[A-Za-z0-9_-][A-Za-z0-9_.-]*', host) or host in {'.', '..'}:
+        raise ValueError('invalid execution host identity')
+    parent = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    container = None
+    try:
+        container = _open_private_temporary_directory(parent, TEMPORARY_CONTAINER)
+        child = _open_private_temporary_directory(container, host)
+    finally:
+        if container is not None:
+            os.close(container)
+        os.close(parent)
+    expected = root / TEMPORARY_CONTAINER / host
+    if Path(os.readlink(f'/proc/self/fd/{child}')) != expected:
+        os.close(child)
+        raise PermissionError('GPU MCP temporary container identity changed')
+    return expected, child
+
+
+def _temporary_container(root: Path) -> Path:
+    path, fd = _open_temporary_container(root)
+    os.close(fd)
+    return path
+
+
+def _remove_temporary_contents(directory: int) -> None:
+    """Walk the selected inode through FDs, never reopen a replacement path."""
+    for name in os.listdir(directory):
+        entry = os.stat(name, dir_fd=directory, follow_symlinks=False)
+        if stat.S_ISDIR(entry.st_mode):
+            child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+            try:
+                identity = os.fstat(child)
+                if (entry.st_dev, entry.st_ino) != (identity.st_dev, identity.st_ino):
+                    continue
+                _remove_temporary_contents(child)
+                latest = os.stat(name, dir_fd=directory, follow_symlinks=False)
+                if (latest.st_dev, latest.st_ino) == (identity.st_dev, identity.st_ino):
+                    os.rmdir(name, dir_fd=directory)  # Can remove only an empty directory.
+            finally:
+                os.close(child)
+        else:
+            os.unlink(name, dir_fd=directory)  # Unlinks a symlink itself, never its target.
+
+
+def _remove_temporary_directory(parent: int, directory: int, name: str) -> bool:
+    identity = os.fstat(directory)
+    latest = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    if (latest.st_dev, latest.st_ino) != (identity.st_dev, identity.st_ino):
+        return False
+    _remove_temporary_contents(directory)
+    latest = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    if (latest.st_dev, latest.st_ino) != (identity.st_dev, identity.st_ino):
+        return False
+    os.rmdir(name, dir_fd=parent)
+    return True
+
+
+def _prune_temporary_roots(container: Path, *, now: float | None = None, parent_fd: int | None = None) -> list[str]:
+    """Remove expired, unlocked scratch with process proof; run before job guards."""
+    now = time.time() if now is None else now
+    removed = []
+    if container.name != socket.gethostname() or container.parent.name != TEMPORARY_CONTAINER:
+        return removed
+    parent = parent_fd if parent_fd is not None else os.open(container, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        if Path(os.readlink(f'/proc/self/fd/{parent}')) != container:
+            return removed
+        for name in os.listdir(parent):
+            matched = re.fullmatch(r'\.gpu-mcp-tmp-(\d+)-[A-Za-z0-9_-]+', name)
+            if matched is None:
+                continue
+            directory = owner_fd = None
+            try:
+                directory = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+                identity = os.fstat(directory)
+                if identity.st_uid != os.getuid():
+                    continue
+                owner_fd = os.open(TEMPORARY_OWNER_FILE, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+                owner_info = os.fstat(owner_fd)
+                if not stat.S_ISREG(owner_info.st_mode) or owner_info.st_uid != os.getuid() or owner_info.st_size > 4096:
+                    continue
+                fcntl.flock(owner_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                owner = json.loads(os.read(owner_fd, 4096))
+                if not isinstance(owner, dict) or owner.get('schema_version') != 1:
+                    continue
+                if str(owner.get('pid')) != matched[1]:
+                    continue
+                ended = owner.get('finished_at', owner.get('created_at'))
+                if (type(ended) not in {int, float} or not math.isfinite(ended) or ended <= 0
+                        or now - ended < TEMPORARY_RETENTION_SEC or not _temporary_owner_gone(owner)):
+                    continue
+                latest = os.stat(name, dir_fd=parent, follow_symlinks=False)
+                if (latest.st_dev, latest.st_ino) != (identity.st_dev, identity.st_ino):
+                    continue
+                if _remove_temporary_directory(parent, directory, name):
+                    removed.append(name)
+            except (OSError, ValueError, TypeError, OverflowError):
+                continue  # Uncertain ownership and busy folders stay intact.
+            finally:
+                if owner_fd is not None:
+                    os.close(owner_fd)
+                if directory is not None:
+                    os.close(directory)
+    finally:
+        if parent_fd is None:
+            os.close(parent)
+    return removed
+
+
+def _prepare_temporary_root(write_roots: list[Path]) -> tuple[Path | None, dict | None, dict | None]:
+    """Create private per-job scratch beneath one container in an approved root."""
     if not write_roots:
-        return None
+        return None, None, None
     root = write_roots[0].expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
-    temporary_root = Path(tempfile.mkdtemp(prefix=f".gpu-mcp-tmp-{os.getpid()}-", dir=root)).resolve()
+    container, parent_fd = _open_temporary_container(root)
+    directory_fd = owner_fd = None
+    try:
+        _prune_temporary_roots(container, parent_fd=parent_fd)
+        if Path(os.readlink(f'/proc/self/fd/{parent_fd}')) != container:
+            raise PermissionError('GPU MCP temporary container identity changed before creation')
+        name = f'.gpu-mcp-tmp-{os.getpid()}-{secrets.token_hex(8)}'
+        os.mkdir(name, mode=0o700, dir_fd=parent_fd)
+        directory_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+        temporary_root = Path(os.readlink(f'/proc/self/fd/{directory_fd}'))
+        if temporary_root != container / name:
+            raise PermissionError('GPU MCP scratch identity changed before initialization')
+        owner_fd = os.open(TEMPORARY_OWNER_FILE, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                           0o600, dir_fd=directory_fd)
+    except BaseException:
+        for fd in (owner_fd, directory_fd, parent_fd):
+            if fd is not None:
+                os.close(fd)
+        raise
+    owner = {'schema_version': 1, 'kind': 'job', 'host': socket.gethostname(), 'pid': os.getpid(),
+             'process_start': _temporary_process_start(os.getpid()),
+             'boot_id': Path('/proc/sys/kernel/random/boot_id').read_text().strip(), 'created_at': time.time()}
+    fcntl.flock(owner_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    os.write(owner_fd, json.dumps(owner).encode())
     os.environ["GPU_MCP_TEMP_ROOT"] = str(temporary_root)
     os.environ["TMPDIR"] = str(temporary_root)
     # tempfile may have cached /tmp before the guard was installed.
     tempfile.tempdir = str(temporary_root)
-    return temporary_root
+    handles = {'parent': parent_fd, 'directory': directory_fd, 'owner': owner_fd}
+    return temporary_root, owner, handles
 
 
 def make_safe_run_audit_hook(write_roots: list[Path], *, temporary_root: Path | None = None):
@@ -579,15 +764,44 @@ def run_job(
     if issues:
         print(_script_rejection_message(script, issues), file=sys.stderr)
         return 126
-    temporary_root = _prepare_temporary_root(write_roots)
+    temporary_root, temporary_owner, temporary_handles = _prepare_temporary_root(write_roots)
     completed = [False]
     if temporary_root is not None:
+        identities = {name: os.fstat(fd) for name, fd in temporary_handles.items()}
+        temporary_owner_fd = temporary_handles['owner']
+        owner_identity = identities['owner']
         def cleanup_temporary_root():
-            if completed[0]:
-                shutil.rmtree(temporary_root, ignore_errors=True)
+            try:
+                for name, fd in temporary_handles.items():
+                    actual, expected = os.fstat(fd), identities[name]
+                    if (actual.st_dev, actual.st_ino) != (expected.st_dev, expected.st_ino):
+                        return
+                current = os.fstat(temporary_owner_fd)
+                if (current.st_dev, current.st_ino) != (owner_identity.st_dev, owner_identity.st_ino):
+                    return  # A library closed and reused this descriptor.
+                if completed[0]:
+                    _remove_temporary_directory(temporary_handles['parent'], temporary_handles['directory'], temporary_root.name)
+                else:
+                    payload = json.dumps(dict(temporary_owner, finished_at=time.time())).encode()
+                    if current.st_size <= 4096:
+                        os.lseek(temporary_owner_fd, 0, os.SEEK_SET)
+                        # Padding avoids truncation, which remains forbidden by
+                        # the guard, and replaces any trailing metadata bytes.
+                        os.write(temporary_owner_fd, payload.ljust(current.st_size, b' '))
+            except OSError:
+                pass  # Process identity still protects retained scratch.
+            finally:
+                for name, fd in temporary_handles.items():
+                    try:
+                        current = os.fstat(fd)
+                        expected = identities[name]
+                        if (current.st_dev, current.st_ino) == (expected.st_dev, expected.st_ino):
+                            os.close(fd)
+                    except OSError:
+                        pass
         # Register before user libraries, allowing their shutdown handlers to
         # finish before successful-job scratch is removed. Retain failed-job
-        # scratch for diagnosis; the job's other outputs are never removed.
+        # scratch for seven days; the job's other outputs are never removed.
         atexit.register(cleanup_temporary_root)
     sys.addaudithook(make_safe_run_audit_hook(write_roots, temporary_root=temporary_root))
     install_preopen_write_guards(write_roots)
