@@ -27,12 +27,12 @@ def test_repo_chooser_keeps_stopped_backends(tmp_path, monkeypatch):
         'hostname': socket.gethostname(), 'pid': 99999999,
         'config_path': str(stopped / 'gpu-mcp.toml')}))
     monkeypatch.chdir(current)
-    assert editor.repo_choices(base=base) == [current / 'gpu-mcp.toml', stopped / 'gpu-mcp.toml']
+    assert editor.repo_choices(base=base, home=tmp_path) == [current / 'gpu-mcp.toml', stopped / 'gpu-mcp.toml']
 
 
-def test_idle_monitor_uses_the_registered_interpreter_and_job_environment(tmp_path, monkeypatch):
+@pytest.mark.parametrize('entry', ['gpu_mcp_server.py', 'gpu_mcp_codex_launcher.py'])
+def test_idle_monitor_never_starts_a_registered_server(tmp_path, monkeypatch, entry):
     import json
-    import types
     import gpu_mcp_codex_monitor as monitor
     repo = tmp_path / 'repo'
     (repo / '.codex').mkdir(parents=True)
@@ -40,7 +40,7 @@ def test_idle_monitor_uses_the_registered_interpreter_and_job_environment(tmp_pa
     config.write_text('')
     runtime = tmp_path / 'runtime'
     runtime.mkdir()
-    launcher = runtime / 'gpu_mcp_codex_launcher.py'
+    launcher = runtime / entry
     launcher.write_text('')
     python = tmp_path / 'server-python'
     python.write_text('')
@@ -48,16 +48,59 @@ def test_idle_monitor_uses_the_registered_interpreter_and_job_environment(tmp_pa
         '[mcp_servers.gpu-cluster-mcp]\ncommand=' + json.dumps(str(python)) + '\nargs=' +
         json.dumps([str(launcher), '--config', str(config)]) + '\n'
         '[mcp_servers.gpu-cluster-mcp.env]\nGPU_MCP_PYTHON="/registered/job/python"\n')
-    calls = []
-    def launch(argv, **kw):
-        calls.append((argv, kw))
-        return types.SimpleNamespace(returncode=0, stdout='{"pid":321}', stderr='')
     monkeypatch.setattr(monitor, 'read_info', lambda *a: None)
-    monkeypatch.setattr(monitor.subprocess, 'run', launch)
-    assert monitor.connect_viewer(config) == {'pid': 321}
-    assert calls[0][0][0] == str(python)
-    assert str(runtime) in calls[0][0]
-    assert calls[0][1]['env']['GPU_MCP_PYTHON'] == '/registered/job/python'
+    monkeypatch.setattr(subprocess, 'run', lambda *a, **k: pytest.fail('viewing must not start a server'))
+    viewer = monitor.connect_viewer(config, base=tmp_path / 'states')
+    snapshot = monitor.request(viewer, '/human/snapshot', human=True)
+    assert snapshot['saved_only'] is True
+    assert snapshot['repo_root'] == str(repo)
+    assert snapshot['jobs'] == []
+    assert not (tmp_path / 'states').exists()
+
+
+def test_catalog_includes_legacy_registrations_independent_of_cwd_and_backend_liveness(tmp_path, monkeypatch):
+    import json
+    import socket
+
+    home, base = tmp_path / 'home', tmp_path / 'backends'
+    (home / 'gpu-mcp/state').mkdir(parents=True)
+    (home / '.codex').mkdir()
+    policies = []
+    for name, entry in [('Polycomb_Structure', 'gpu_mcp_server.py'),
+                        ('custom-openmm', 'gpu_mcp_server.py'),
+                        ('shared', 'gpu_mcp_codex_launcher.py')]:
+        repo = tmp_path / name
+        (repo / '.codex').mkdir(parents=True)
+        policy = repo / 'gpu-mcp.toml'
+        policy.write_text('schema_version=1\n')
+        (repo / '.codex/config.toml').write_text(
+            '[mcp_servers.gpu-cluster-mcp]\nenabled=true\nargs=' +
+            json.dumps(['/installed/' + entry, '--config', str(policy)]) + '\n')
+        policies.append(policy)
+    # Approval and trusted-project history are independent discovery sources.
+    (home / 'gpu-mcp/state/approved-policies.json').write_text(json.dumps({str(policies[0]): {}}))
+    (home / '.codex/config.toml').write_text('[projects.' + json.dumps(str(policies[1].parent)) + ']\n')
+    (base / 'shared').mkdir(parents=True)
+    info = base / 'shared/backend.json'
+    info.write_text(json.dumps({'hostname': socket.gethostname(), 'pid': 99999999,
+                                'config_path': str(policies[2])}))
+    broken = tmp_path / 'broken'
+    (broken / '.codex').mkdir(parents=True)
+    (broken / 'gpu-mcp.toml').write_text('schema_version=1\n')
+    (broken / '.codex/config.toml').write_text('invalid [ toml')
+    with (home / '.codex/config.toml').open('a') as stream:
+        stream.write('[projects.' + json.dumps(str(broken)) + ']\n')
+    monkeypatch.delenv('CODEX_HOME', raising=False)
+    monkeypatch.setattr(Path, 'home', classmethod(lambda cls: home))
+    expected = sorted(policies, key=lambda p: (p.parent.name.casefold(), str(p)))
+    for current in policies:
+        monkeypatch.chdir(current.parent)
+        assert editor.repo_choices(base=base) == expected
+    # Restarting changes backend PID, not membership or ordering.
+    record = json.loads(info.read_text())
+    record['pid'] = os.getpid()
+    info.write_text(json.dumps(record))
+    assert editor.repo_choices(base=base) == expected
 
 
 def test_install_preserves_shell_settings_and_is_idempotent(tmp_path):

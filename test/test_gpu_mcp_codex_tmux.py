@@ -109,6 +109,8 @@ def test_existing_pane_without_editor_opens_real_popup_and_preserves_input(backe
     prefix = ['tmux','-L','gpu-mcp-popup-' + uuid.uuid4().hex]
     env = {k:v for k,v in os.environ.items() if k not in {'VISUAL','EDITOR','GPU_MCP_CODEX_EDITOR_ENABLED','GPU_MCP_PROMPT_EDITOR','TMUX','TMUX_PANE'}}
     env['TERM'] = 'xterm-256color'
+    if npm != 'native':
+        env.update(HOME=str(tmp_path / 'viewer-home'), CODEX_HOME=str(tmp_path / 'viewer-home/.codex'))
     source, exe, received = tmp_path/'frontend.c',tmp_path/'codex',tmp_path/'input.bin'
     source.write_text('''#include <unistd.h>
 #include <stdio.h>

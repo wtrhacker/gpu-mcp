@@ -337,6 +337,15 @@ inspection results; do not infer scientific progress from GPU utilization.
 Reading the view must not consume the originating agent's notifications or
 advance its checking schedule.
 
+Opening the human view must not start an MCP backend. Only configured MCP
+startup owns that responsibility. With no reachable shared backend, the viewer
+reads saved jobs, events and local logs without reconciling lifecycle or changing
+ownership. Clearly mark these as saved status, including last-known running
+states and reservation counts. An empty history is a valid view. Keep known
+repositories discoverable through approved-policy history, Codex project
+registrations and backend records, in stable name/path order; membership must
+not depend on backend liveness or on which known repository opens the chooser.
+
 Reuse a small portion of
 [Scientific Workflow](https://github.com/dingyisun0101/Scientific-Workflow): task
 table rendering, status colors, progress display, messages, and keyboard

@@ -225,11 +225,21 @@ draft text or model input. Repo-wide viewer data stays on the human side. An
 ordinary agent shell or PTY call is refused for protected Codex drafts. This
 guard does not replace operating-system permissions or the earlier scope limits.
 
-A fresh chooser uses the nearest policy and offers other known repositories on
-this machine, including stopped backends. An idle repository stays available
-after an upgrade. Selecting it starts the backend with that repository's
-registered Python and environment. Select the displayed repo explicitly when
-the terminal's working directory differs from the frontend's current repository.
+A fresh chooser lists known GPU MCP repositories in a stable name/path order
+and selects the current repository initially. Discovery uses approved-policy
+history, saved Codex projects and shared-backend records, including legacy
+registrations and stopped backends. It does not scan the filesystem. Changing
+the working directory or restarting a backend does not remove other known
+repositories from the list.
+
+Opening the viewer never starts an MCP server. It reads an existing shared
+backend when available; otherwise it shows saved job records and local logs.
+The latter is labelled **Saved status**, with saved reservation counts and
+running states marked as last known. Legacy servers can continue updating those
+records. The viewer does not reconcile their jobs, renew or release reservations,
+change ownership, or consume pending notifications. Repositories without saved
+jobs open an empty view. Normal configured MCP startup remains responsible for
+starting shared backends.
 
 The earlier frontend wrapper remains an optional tested prototype:
 

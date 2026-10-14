@@ -55,6 +55,18 @@ The fixtures use temporary registrations and simulated backend replies; they
 do not restart the user's daemon or install packages in their Python. The shell
 entrypoint is also exercised from an installation path containing spaces.
 
+Human viewer contracts cover a stable repository list across working-directory
+changes and backend restarts, legacy registrations, saved/offline status,
+protected build/MPS records, bounded logs and disconnection. Opening a view must
+not start a server, create a database, change job ownership or consume events:
+
+```bash
+pytest -q test/test_gpu_mcp_codex_editor.py test/test_gpu_mcp_codex_monitor.py test/test_gpu_mcp_monitor_saved.py
+```
+
+`test/test_gpu_mcp_codex_tmux.py` also exercises real terminal navigation inside
+three splits, with viewer data kept out of the underlying frontend's input.
+
 MPS sweeps have real-process local contracts and separate opt-in CUDA/OpenMM
 and PyTorch acceptance. See [the MPS test guide](MPS.md) for commands, failure
 injection, hardware requirements and earlier ADR compatibility.

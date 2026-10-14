@@ -12,6 +12,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tomllib
 
 
 def native_draft(path: Path) -> bool:
@@ -63,29 +64,72 @@ def editor_command() -> list[str]:
     return [fallback]
 
 
-def repo_choices(config=None, base=None):
-    """Prefer the current policy; retain known repositories after idle shutdown."""
+def repo_choices(config=None, base=None, *, home=None):
+    """List known registrations and histories in a stable order, without startup."""
     from gpu_mcp_policy_hook import find_policy_file
     from gpu_mcp_codex_launcher import read_info
-    choices = []
+    explicit_home = home is not None
+    home = Path(home) if explicit_home else Path.home()
+    choices, candidates = set(), set()
+
+    def add(policy):
+        try:
+            if policy.is_file():
+                choices.add(policy.resolve())
+        except (OSError, ValueError):
+            pass
+
+    def read(path, parser):
+        try:
+            result = parser(path.read_text())
+            return result if isinstance(result, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
     current = Path(config).resolve() if config else find_policy_file(Path.cwd())
     if current:
-        choices.append(Path(current).resolve())
-    state = Path(base) if base else Path.home() / 'gpu-mcp/state/codex'
+        add(Path(current))
+    approvals = read(home / 'gpu-mcp/state/approved-policies.json', json.loads)
+    candidates.update(Path(p).parent for p in approvals if Path(p).is_absolute())
+    codex_homes = {home / '.codex'}
+    if not explicit_home and os.environ.get('CODEX_HOME'):
+        codex_homes.add(Path(os.environ['CODEX_HOME']).expanduser())
+    for codex_home in codex_homes:
+        projects = read(codex_home / 'config.toml', tomllib.loads).get('projects', {})
+        if isinstance(projects, dict):
+            candidates.update(Path(p) for p in projects if Path(p).is_absolute())
+    for repo in candidates:
+        servers = read(repo / '.codex/config.toml', tomllib.loads).get('mcp_servers', {})
+        server = servers.get('gpu-cluster-mcp', {}) if isinstance(servers, dict) else {}
+        if not isinstance(server, dict) or server.get('enabled', True) is False:
+            continue
+        args = server.get('args', [])
+        if not isinstance(args, list) or not all(isinstance(p, str) for p in args):
+            continue
+        if not any(Path(p).name in {'gpu_mcp_server.py', 'gpu_mcp_codex_launcher.py'} for p in args):
+            continue
+        if '--config' not in args or args.index('--config') + 1 >= len(args):
+            continue
+        policy = Path(args[args.index('--config') + 1]).expanduser()
+        try:
+            if policy.is_absolute() and policy.parent.resolve() == repo.resolve():
+                add(policy)
+        except (OSError, ValueError):
+            continue
+    state = Path(base) if base else home / 'gpu-mcp/state/codex'
     if state.is_dir():
         for root in sorted(state.iterdir()):
             info = read_info(root)
             if (isinstance(info, dict) and info.get('hostname') == socket.gethostname()
                     and isinstance(info.get('config_path'), str)):
-                policy = Path(info['config_path'])
-                if policy.is_file() and policy.resolve() not in choices:
-                    choices.append(policy.resolve())
-    return choices
+                add(Path(info['config_path']))
+    return sorted(choices, key=lambda p: (p.parent.name.casefold(), str(p)))
 
 
 def choose(screen, policies, base, *, allow_edit=True):
     from gpu_mcp_codex_monitor import connect_viewer, view
     from gpu_mcp_monitor_display import safe_text
+    from gpu_mcp_policy_hook import find_policy_file
     curses.curs_set(0)
     curses.set_escdelay(25)
     screen.keypad(True)
@@ -95,7 +139,9 @@ def choose(screen, policies, base, *, allow_edit=True):
     if allow_edit:
         rows.append(('Edit prompt in your text editor', 'edit'))
     rows.append(('Cancel', None))
-    selected, error = 0, ''
+    current = find_policy_file(Path.cwd())
+    selected = policies.index(current.resolve()) if current and current.resolve() in policies else 0
+    error = ''
     while True:
         screen.timeout(-1)
         screen.erase()

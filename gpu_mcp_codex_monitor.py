@@ -5,58 +5,61 @@ from __future__ import annotations
 import argparse
 import curses
 import json
-import os
 from pathlib import Path
-import subprocess
 import sys
 import textwrap
 import time
 import tomllib
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
-from gpu_mcp_codex_launcher import alive, read_info, request
+from gpu_mcp_codex_launcher import alive, read_info, request as backend_request
 from gpu_mcp_codex_state import runtime_root
+from gpu_mcp_monitor_saved import SavedViewer
 from gpu_mcp_monitor_display import STATUS_COLORS, matches_job, messages, parse_log_progress, progress_text, safe_text, task_row
 
 
+def request(info, path, *, payload=None, human=False, timeout=120):
+    parsed = urlsplit(path)
+    parts = parsed.path.split('/')
+    log_route = len(parts) == 5 and parts[:3] == ['', 'human', 'jobs'] and parts[4] == 'logs'
+    if (payload is not None or parsed.scheme or parsed.netloc
+            or not (parsed.path in ('/health', '/human/snapshot') or log_route)):
+        raise PermissionError('the viewer only reads health, snapshots and recorded logs')
+    if parsed.path != '/health' and not human:
+        raise PermissionError('monitor data is human-only')
+    if isinstance(info, SavedViewer):
+        if not human:
+            raise PermissionError('saved monitor data is read-only and human-only')
+        return info.request(path)
+    return backend_request(info, path, payload=payload, human=human, timeout=timeout)
+
+
 def connect_viewer(config, *, base=None):
-    """Read an existing repo backend without altering its execution settings."""
+    """Use a live backend or saved records; viewing never starts a server."""
     config = Path(config).expanduser().resolve()
-    info = read_info(runtime_root(config, base=base))
-    if not alive(info):
-        return start_registered_backend(config, base=base)
-    if info.get("config_path") != str(config):
-        raise ValueError("the live backend belongs to another policy path")
-    health = request(info, "/health", timeout=3)
-    if health.get("server_instance_id") != info.get("server_instance_id"):
-        raise ValueError("the live backend identity changed")
-    return info
-
-
-def start_registered_backend(config, *, base=None):
-    """An idle repo must restart with its registered interpreter and job settings."""
-    registration = config.parent / '.codex/config.toml'
-    with registration.open('rb') as stream:
-        server = tomllib.load(stream).get('mcp_servers', {}).get('gpu-cluster-mcp', {})
-    args = server.get('args', [])
-    candidates = [p for p in args if isinstance(p, str) and Path(p).name == 'gpu_mcp_codex_launcher.py']
-    if (server.get('enabled', True) is False or len(candidates) != 1 or '--config' not in args
-            or args.index('--config') + 1 == len(args) or Path(args[args.index('--config') + 1]).resolve() != config):
-        raise ValueError('open this repository in Codex with its configured shared GPU MCP launcher')
-    python, entry = Path(server.get('command', '')), Path(candidates[0])
-    if not python.is_absolute() or not entry.is_absolute() or not python.is_file() or not entry.is_file():
-        raise ValueError('the registered GPU MCP interpreter or launcher is unavailable')
-    if base is None and '--state-base' in args:
-        base = args[args.index('--state-base') + 1]
-    program = ('import json,sys;sys.path.insert(0,sys.argv[1]);'
-               'from gpu_mcp_codex_launcher import ensure_backend;'
-               'print(json.dumps(ensure_backend(sys.argv[2],base=sys.argv[3] or None)))')
-    result = subprocess.run([str(python), '-B', '-c', program, str(entry.parent), str(config), str(base or '')],
-                            cwd=server.get('cwd') or config.parent,
-                            env=dict(os.environ, **server.get('env', {})), capture_output=True, text=True, timeout=30)
-    if result.returncode:
-        raise ValueError('GPU MCP startup failed: ' + result.stderr.strip()[-1000:])
-    return json.loads(result.stdout)
+    if base is None:
+        try:
+            with (config.parent / '.codex/config.toml').open('rb') as stream:
+                args = tomllib.load(stream).get('mcp_servers', {}).get('gpu-cluster-mcp', {}).get('args', [])
+            if '--state-base' in args:
+                registered_base = args[args.index('--state-base') + 1]
+                if isinstance(registered_base, str) and Path(registered_base).is_absolute():
+                    base = registered_base
+        except (OSError, ValueError, IndexError, AttributeError, TypeError):
+            pass
+    root = runtime_root(config, base=base)
+    info = read_info(root)
+    if alive(info):
+        try:
+            if info.get('config_path') != str(config):
+                raise ValueError('the live backend belongs to another policy path')
+            health = request(info, '/health', timeout=3)
+            if health.get('server_instance_id') != info.get('server_instance_id'):
+                raise ValueError('the live backend identity changed')
+            return dict(info, _viewer_state_root=str(root))
+        except (OSError, ValueError, KeyError, AttributeError, TypeError) as exc:
+            return SavedViewer(config, root, notice='Saved status; backend unavailable: ' + str(exc))
+    return SavedViewer(config, root)
 
 
 def view(screen, info, *, chooser=False):
@@ -96,7 +99,13 @@ def view(screen, info, *, chooser=False):
                 snapshot = request(info, "/human/snapshot", human=True, timeout=3)
                 error = ""
             except Exception as exc:
-                error = "Monitor disconnected: " + str(exc)
+                if not isinstance(info, SavedViewer) and info.get('config_path'):
+                    root = info.get('_viewer_state_root') or runtime_root(info['config_path'])
+                    info = SavedViewer(info['config_path'], root)
+                    snapshot = request(info, '/human/snapshot', human=True)
+                    error = ''
+                else:
+                    error = 'Monitor disconnected: ' + str(exc)
             refresh_at = time.monotonic() + 1
         all_jobs = snapshot.get('jobs', [])
         active_reservations = [r for r in all_jobs if r.get('gpu_index') is not None and r.get('active_reservation')]
@@ -133,14 +142,15 @@ def view(screen, info, *, chooser=False):
         line(1, '  '.join(f'[{page.title()}]' if page == mode else page.title() for page in pages), curses.A_BOLD)
         line(2, 'Search: ' + (draft[:cursor] + '▏' + draft[cursor:] if searching else query or '/ to search saved jobs'))
         health = snapshot.get("health", {})
-        line(3, f"Active GPU reservations: {len(active_reservations)} | Jobs: {len(jobs)}/{len(all_jobs)}"
+        reservation_label = 'Saved GPU reservations' if snapshot.get('saved_only') else 'Active GPU reservations'
+        line(3, f"{reservation_label}: {len(active_reservations)} | Jobs: {len(jobs)}/{len(all_jobs)}"
              + (' | GPU reservations only' if reservations_only else ''))
         help_text = ('Enter apply  Esc cancel  Ctrl+U clear' if searching else
                      '←→ pages  ↑↓ select/scroll  / search  v GPU  r refresh  Esc close'
                      + ('  c parent/case' if cases else '')
                      + ('  b repos' if chooser else ''))
         line(height - 2, help_text)
-        issue = error or next((f'{name}: {value}' for name, value in health.items()
+        issue = error or snapshot.get('notice') or next((f'{name}: {value}' for name, value in health.items()
                               if value not in ('ready', 'starting', None)), '')
         if issue:
             line(height - 3, issue)
@@ -174,7 +184,8 @@ def view(screen, info, *, chooser=False):
                     displayed['progress'] = cached['progress']
                 row = task_row(displayed)
                 tag = f"[{row['role']}] " if row['role'] else ''
-                status = 'running' if item.get('job_lifecycle') == 'running' else row['status']
+                status = ('running' if item.get('job_lifecycle') == 'running' and not snapshot.get('saved_only')
+                          else row['status'])
                 timing = f" / {row['elapsed']}" if row['elapsed'] != '—' else ''
                 title_width = max(8, width - len(tag) - len(row['resource']) - len(status) - len(timing) - 10)
                 card = [f"{tag}{row['title'][:title_width]}  |  {row['resource']}  |  {status}{timing}"]
