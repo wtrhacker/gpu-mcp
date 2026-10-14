@@ -126,6 +126,28 @@ def repo_choices(config=None, base=None, *, home=None):
     return sorted(choices, key=lambda p: (p.parent.name.casefold(), str(p)))
 
 
+def repo_rows(policies):
+    """Place each descendant beneath its nearest listed repository ancestor."""
+    repos = {policy.parent for policy in policies}
+    children = {}
+    for policy in policies:
+        parent = next((p for p in policy.parent.parents if p in repos), None)
+        children.setdefault(parent, []).append(policy)
+
+    def rows(parent=None, depth=0):
+        def label(policy):
+            return str(policy.parent.relative_to(parent)) if parent else policy.parent.name
+
+        for policy in sorted(children.get(parent, []), key=lambda p: (label(p).casefold(), str(p))):
+            text = '  ' * depth + label(policy)
+            if parent is None:
+                text += f' — {policy.parent}'
+            yield text, policy
+            yield from rows(policy.parent, depth + 1)
+
+    return list(rows())
+
+
 def choose(screen, policies, base, *, allow_edit=True):
     from gpu_mcp_codex_monitor import connect_viewer, view
     from gpu_mcp_monitor_display import safe_text
@@ -135,12 +157,13 @@ def choose(screen, policies, base, *, allow_edit=True):
     screen.keypad(True)
     # Put the distinguishing name first so a narrow split does not show only
     # the same long filesystem prefix for every repository.
-    rows = [(f'{policy.parent.name} — {policy.parent}', policy) for policy in policies]
+    rows = repo_rows(policies)
     if allow_edit:
         rows.append(('Edit prompt in your text editor', 'edit'))
     rows.append(('Cancel', None))
     current = find_policy_file(Path.cwd())
-    selected = policies.index(current.resolve()) if current and current.resolve() in policies else 0
+    selected = next((i for i, (_, policy) in enumerate(rows)
+                     if current and policy == current.resolve()), 0)
     error = ''
     while True:
         screen.timeout(-1)

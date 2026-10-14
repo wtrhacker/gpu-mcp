@@ -55,8 +55,9 @@ The fixtures use temporary registrations and simulated backend replies; they
 do not restart the user's daemon or install packages in their Python. The shell
 entrypoint is also exercised from an installation path containing spaces.
 
-Human viewer contracts cover a stable repository list across working-directory
-changes and backend restarts, legacy registrations, saved/offline status,
+Human viewer contracts cover a stable hierarchical repository list across
+working-directory changes and backend restarts, selection of nested repositories,
+legacy registrations, saved/offline status,
 protected build/MPS records, bounded logs and disconnection. Opening a view must
 not start a server, create a database, change job ownership or consume events:
 

@@ -204,3 +204,35 @@ def test_return_to_chooser_keeps_repository_selection(monkeypatch):
     screen = Screen([editor.curses.KEY_DOWN, editor.curses.KEY_RIGHT, 10])
     assert editor.choose(screen, policies, None) is None
     assert opened == [policies[1], policies[1]]
+
+
+def test_hierarchy_groups_descendants_and_retains_current_child_selection(monkeypatch):
+    import gpu_mcp_codex_monitor as monitor
+    import gpu_mcp_policy_hook as hook
+    from test_gpu_mcp_codex_monitor import Screen
+
+    monkeypatch.setattr(editor.curses, 'curs_set', lambda value: None)
+    monkeypatch.setattr(editor.curses, 'set_escdelay', lambda value: None)
+    parent = Path('/fixture/parent/gpu-mcp.toml')
+    child = parent.parent / 'experiments/alpha/gpu-mcp.toml'
+    grandchild = child.parent / 'nested/gpu-mcp.toml'
+    sibling = Path('/fixture/parent-other/gpu-mcp.toml')
+    # The input order differs from the tree order. A textual prefix is not a parent.
+    policies = [grandchild, child, sibling, parent]
+    monkeypatch.setattr(hook, 'find_policy_file', lambda cwd: child)
+    opened = []
+    returns = iter(['chooser', None])
+    monkeypatch.setattr(monitor, 'connect_viewer', lambda policy, **kw: policy)
+
+    def view(screen, info, **kw):
+        opened.append(info)
+        return next(returns)
+
+    monkeypatch.setattr(monitor, 'view', view)
+    screen = Screen([10, 10])
+    editor.choose(screen, policies, None)
+    lines = screen.frames[0].splitlines()
+    assert lines.index('parent — /fixture/parent') < lines.index('  experiments/alpha')
+    assert lines.index('  experiments/alpha') < lines.index('    nested')
+    assert 'parent-other — /fixture/parent-other' in lines
+    assert opened == [child, child], 'tree ordering or returning to the chooser changed the selection'

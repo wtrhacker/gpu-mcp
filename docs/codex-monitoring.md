@@ -225,8 +225,10 @@ draft text or model input. Repo-wide viewer data stays on the human side. An
 ordinary agent shell or PTY call is refused for protected Codex drafts. This
 guard does not replace operating-system permissions or the earlier scope limits.
 
-A fresh chooser lists known GPU MCP repositories in a stable name/path order
-and selects the current repository initially. Discovery uses approved-policy
+A fresh chooser lists known GPU MCP repositories in a stable hierarchy
+and selects the current repository initially. A child repository appears beneath
+its nearest listed parent, indented and labelled with its relative path. Other
+repositories retain their name and full path. Discovery uses approved-policy
 history, saved Codex projects and shared-backend records, including legacy
 registrations and stopped backends. It does not scan the filesystem. Changing
 the working directory or restarting a backend does not remove other known
