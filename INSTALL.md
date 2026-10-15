@@ -165,8 +165,28 @@ Use the actual installed path if it differs. The command finds existing
 registrations for that installation, checks their Python dependencies, migrates
 older registrations, adds missing tool approval entries, installs Ctrl+G and
 refreshes outdated idle GPU MCP backends. It saves configuration backups and
-preserves explicit tool restrictions. It never stops active jobs; finish any
-reported jobs and rerun. Repeating a completed upgrade is safe.
+preserves explicit tool restrictions. Repeating a completed upgrade is safe.
+
+The command first checks shared GPU MCP backends for the old SSH connection
+leak. It discovers all known GPU MCP repositories and running controllers for
+the current user, including older per-session servers and separate code copies.
+Configuration selection does not limit that inventory. Separate installations
+are named explicitly and retain their own code and settings.
+An unresponsive backend with hundreds of sockets and threads is replaced
+after verifying its user, interpreter, process start time, command and protected
+state. Recovery closes the old control process's connections. Detached jobs keep
+running; saved jobs, pending notifications and GPU reservations stay in place.
+The replacement preserves the existing ownership boundary: it does not adopt
+the old instance's stop/retry authority or renew its leases. Existing completion
+recovery verifies finished jobs and releases orphaned reservations with the
+usual process checks. Healthy busy backends are deferred.
+
+SSH repair runs before optional configuration migrations. If active legacy jobs
+block those migrations, a completed SSH repair is reported separately. Finish
+the reported legacy work and rerun for the remaining changes. This deferral is
+reported without discarding the completed repair or treating busy legacy work
+as a failed SSH update. Older per-session
+servers load the fixed SSH helper after the usual quit/resume.
 
 Quit and resume existing Codex conversations once to refresh their MCP tools.
 New sessions use the update automatically. Ctrl+G activates immediately in
@@ -174,6 +194,7 @@ supported tmux/Byobu panes; outside tmux, open a fresh terminal for the installe
 editor setting. Continue using ordinary `codex` and `codex resume`.
 
 Optional: `bash ~/gpu-mcp/upgrade.sh --preview` shows the plan without changes.
+SSH leak recovery runs automatically on every normal upgrade.
 Use `--repo /absolute/research-repo` to select a single project or one absent
 from saved Codex and GPU MCP records. Other installed GPU MCP copies are left
 alone. Unsupported custom registrations and unapproved policy changes are

@@ -85,6 +85,21 @@ caller metadata and must not become separate owners of jobs or reservations.
 Only the shared backend owns lifecycle state and the heartbeat manager. Closing
 a connection or the monitor must not stop an active job or its monitoring.
 
+Every SSH command must close its Fabric connection and underlying client,
+including partial authentication and failure paths. The helper carries no
+interactive input; stdin belongs to MCP. Test repeated calls against actual
+thread/descriptor counts as well as returned values.
+
+An upgrade may recover a shared control process exhausted by the historical SSH
+leak when both a high socket/thread count and failed health checks confirm the
+condition. Verify protected job state and the process's UID, interpreter, exact
+server arguments and start time under the startup lock. Pin the PID before a
+bounded TERM/KILL sequence; signal only that control process. Preserve detached
+workers, reservations, job records, pending events and prior ownership. Restart
+with the registered interpreter/environment. Existing completed-orphan recovery
+applies; this does not adopt live leases or grant old-instance stop/retry rights.
+Healthy busy backends retain the normal no-restart rule. Preview is read-only.
+
 The probe demonstrated a shared HTTP process started by its test harness.
 Ordinary stdio configuration still started separate processes. Stock Codex
 0.160.1 has not been shown to supervise one GPU MCP process per repo by itself.

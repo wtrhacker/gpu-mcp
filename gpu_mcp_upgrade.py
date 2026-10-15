@@ -20,6 +20,7 @@ import gpu_mcp_codex_terminal_setup as terminal_setup
 import gpu_mcp_codex_upgrade as migration
 from gpu_mcp_codex_state import private_directory, runtime_root
 from gpu_mcp_policy_approval import default_store_path
+from gpu_mcp_ssh_recovery import repair as repair_ssh, running_servers
 
 TOOLS = ('run_python_on_gpu', 'check_gpus', 'kill_gpu_process', 'check_gpu_processes',
          'cluster_info', 'manage_gpu_job', 'list_gpu_reservations', 'list_gpu_jobs',
@@ -29,12 +30,16 @@ TERMINAL = {'succeeded', 'failed', 'finished', 'process_gone_unknown_outcome'}
 SERVER = ('mcp_servers', 'gpu-cluster-mcp')
 
 
+class LegacyWorkActive(ValueError):
+    """Code cleanup can be installed while registration migration must wait."""
+
+
 def read_toml(path):
     migration.reservations._assert_no_symlink_ancestors(path)
     return tomllib.loads(path.read_text())
 
 
-def discovery(runtime, home, codex_home, store):
+def discovery(runtime, home, codex_home, store, *, all_installations=False):
     """Use known registrations; never crawl a home directory or network mount."""
     candidates = {Path.cwd()}
     if store.exists():
@@ -55,7 +60,7 @@ def discovery(runtime, home, codex_home, store):
         entries = [p for p in server.get('args', []) if isinstance(p, str)
                    and Path(p).name in {'gpu_mcp_server.py', 'gpu_mcp_codex_launcher.py'}]
         if (server.get('enabled', True) and len(entries) == 1 and Path(entries[0]).is_absolute()
-                and Path(entries[0]).parent.resolve() == runtime):
+                and (all_installations or Path(entries[0]).parent.resolve() == runtime)):
             args = server.get('args', [])
             if '--config' in args and args.index('--config') + 1 < len(args):
                 policy = Path(args[args.index('--config') + 1])
@@ -115,7 +120,7 @@ def registration_plan(repo, runtime, store, home):
     if Path(plan['old_entrypoint']).parent.resolve() != runtime:
         raise ValueError(f'{repo}: update its installed folder, {Path(plan["old_entrypoint"]).parent}, then run upgrade.sh there')
     if plan['active_legacy_jobs']:
-        raise ValueError(f'{repo}: finish its legacy jobs, then rerun upgrade.sh')
+        raise LegacyWorkActive(f'{repo}: finish its legacy jobs, then rerun upgrade.sh')
     expected = copy.deepcopy(tomllib.loads(changed))
     tools = expected['mcp_servers']['gpu-cluster-mcp'].setdefault('tools', {})
     for name in TOOLS:
@@ -228,19 +233,42 @@ def upgrade(runtime, *, repos=(), home=None, codex_home=None, store=None, previe
     home = Path(home or Path.home()).resolve()
     codex_home = Path(codex_home or os.environ.get('CODEX_HOME', home / '.codex')).resolve()
     store = Path(store or default_store_path())
-    repos = [Path(p).expanduser().resolve() for p in repos] or discovery(runtime, home, codex_home, store)
+    processes = running_servers()
+    selected = [Path(p).expanduser().resolve() for p in repos]
+    repos = selected or discovery(runtime, home, codex_home, store)
+    if not selected:
+        repos = sorted(set(repos) | {Path(p['repo_root']) for p in processes
+                       if Path(p['runtime']).resolve() == runtime
+                       and (Path(p['repo_root']) / '.codex/config.toml').is_file()})
+    # --repo limits configuration migrations. The automatic SSH check still
+    # inventories every known registration and running MCP controller.
+    repair_repos = set(discovery(runtime, home, codex_home, store, all_installations=True)) | set(repos)
+    repair_repos.update(Path(p['repo_root']) for p in processes
+                        if (Path(p['repo_root']) / '.codex/config.toml').is_file())
+    print(f'Checking GPU MCP usage: {len(repair_repos)} known repositories, '
+          f'{len(processes)} running control processes.', flush=True)
+    repairs = repair_ssh(runtime, sorted(repair_repos), home=home, preview=preview, processes=processes)
     if not repos:
         raise ValueError('No existing GPU MCP registrations point to this folder. '
-                         'Run this script from the installed copy; use --repo /path/to/repo if it is not in Codex history.')
-    plans, blocked = [], []
+                         'The running-process inventory above still identifies older sessions and other copies. '
+                         'Run this script from the installed copy.')
+    plans, blocked, deferred = [], [], []
     for repo in sorted(set(repos)):
         try:
             plans.append(registration_plan(repo, runtime, store, home))
+        except LegacyWorkActive as exc:
+            deferred.append(str(exc))
         except (OSError, ValueError, KeyError, IndexError) as exc:
             blocked.append(str(exc))
     if blocked:
         raise ValueError('\n'.join(blocked) + '\nNo registrations or dependencies changed. '
                          'Finish the reported work, or use --repo to upgrade an idle project.')
+    if deferred:
+        print(('Preview: registration migrations must wait.' if preview else
+               'SSH cleanup is installed. Registration migrations must wait.') + '\n' + '\n'.join(deferred), flush=True)
+        print('Finish active legacy work, then quit/resume those sessions to load the fixed SSH helper. '
+              'Rerun upgrade.sh afterward for the remaining migrations.')
+        return dict(ssh_repair=repairs, deferred_upgrade=deferred, changed_files=[], preview=preview)
     probes = {}
     for plan in plans:
         key = (plan['python'], json.dumps(plan['server'].get('env', {}), sort_keys=True))
@@ -293,7 +321,7 @@ def upgrade(runtime, *, repos=(), home=None, codex_home=None, store=None, previe
     print(terminal_result['activation'])
     print('Upgrade complete. Quit and resume existing Codex conversations once to refresh their MCP tools.')
     print('New sessions use the update automatically. The Codex daemon was not restarted or reconfigured.')
-    return dict(result, terminal=terminal_result)
+    return dict(result, terminal=terminal_result, ssh_repair=repairs)
 
 
 def main(argv=None):

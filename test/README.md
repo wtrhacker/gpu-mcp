@@ -55,6 +55,25 @@ The fixtures use temporary registrations and simulated backend replies; they
 do not restart the user's daemon or install packages in their Python. The shell
 entrypoint is also exercised from an installation path containing spaces.
 
+SSH cleanup tests retain actual descriptors and threads to detect leaks across
+successful, timed-out and partially authenticated calls. Recovery tests use real
+disposable control/worker processes: the worker shares its parent's process
+group and must survive the parent's TERM/KILL recovery. They also check saved
+job/event/reservation preservation, preview, identity changes and healthy busy
+backends. Automatic discovery covers unlisted running controllers and separate
+code copies while excluding safe-run GPU worker processes:
+
+```bash
+pytest -q test/test_gpu_mcp_ssh_cleanup.py test/test_gpu_mcp_ssh_recovery.py test/test_gpu_mcp_upgrade.py
+```
+
+For real Fabric/Paramiko resource counts, explicitly select a configured SSH
+host. This runs `true`/`false` commands without GPU work:
+
+```bash
+GPU_MCP_SSH_TEST_HOST=your-host pytest -q test/test_gpu_mcp_ssh_cleanup.py -k real_ssh
+```
+
 Human viewer contracts cover a stable hierarchical repository list across
 working-directory changes and backend restarts, selection of nested repositories,
 legacy registrations, saved/offline status,

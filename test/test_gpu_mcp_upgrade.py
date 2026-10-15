@@ -23,6 +23,9 @@ def setup(installed, monkeypatch):
     (f.runtime / 'gpu_mcp_codex_editor.py').write_text('# editor helper\n')
     monkeypatch.setattr(upgrade, 'probe_python', lambda *args: {'missing': [], 'signature': 'current'})
     monkeypatch.setattr(upgrade.launcher, 'code_hash', lambda: 'current-code')
+    monkeypatch.setattr(upgrade, 'repair_ssh', lambda *a, **k: {'repaired': [], 'refreshed': [], 'deferred': []})
+    monkeypatch.setattr(upgrade, 'running_servers', lambda: [])
+    monkeypatch.chdir(f.repo)
     f.run = lambda **kw: upgrade.upgrade(f.runtime, repos=[f.repo], home=f.home,
                                        codex_home=f.codex_home, store=f.store,
                                        shell='bash', with_tmux=False, **kw)
@@ -73,6 +76,7 @@ def test_discovery_uses_known_paths_and_ignores_other_installs(setup):
     (unrelated / '.codex/config.toml').write_text('[mcp_servers.gpu-cluster-mcp]\nargs=["/other/gpu_mcp_server.py"]\n')
     (f.codex_home / 'config.toml').write_text(f'[projects.{json.dumps(str(unrelated))}]\ntrust_level="trusted"\n')
     assert upgrade.discovery(f.runtime, f.home, f.codex_home, f.store) == [f.repo]
+    assert set(upgrade.discovery(f.runtime, f.home, f.codex_home, f.store, all_installations=True)) == {f.repo, unrelated}
 
 
 def test_copied_runtime_registration_is_not_an_extra_repository(setup):
@@ -86,8 +90,9 @@ def test_copied_runtime_registration_is_not_an_extra_repository(setup):
 def test_active_legacy_job_blocks_all_configuration_changes(setup):
     job(setup)
     before = setup.registration.read_bytes()
-    with pytest.raises(ValueError, match='finish its legacy jobs'):
-        setup.run()
+    result = setup.run()
+    assert result['deferred_upgrade'] and result['changed_files'] == []
+    assert 'finish its legacy jobs' in result['deferred_upgrade'][0]
     assert setup.registration.read_bytes() == before
     assert not (setup.home / '.bashrc').exists()
 
@@ -209,3 +214,67 @@ def test_shell_entrypoint_handles_runtime_path_with_spaces(tmp_path):
     result = subprocess.run(['bash', str(runtime / 'upgrade.sh'), '--help'], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
     assert '--preview' in result.stdout and '--repo' in result.stdout
+    assert '--repair-ssh' not in result.stdout
+
+
+def test_ssh_recovery_runs_before_optional_legacy_migration_checks(setup, monkeypatch):
+    f = setup
+    job(f)
+    calls = []
+
+    def repair(runtime, repos, **kwargs):
+        calls.append((runtime, repos, kwargs))
+        return {'repaired': [str(f.repo)], 'refreshed': [], 'deferred': []}
+
+    monkeypatch.setattr(upgrade, 'repair_ssh', repair)
+    before = f.registration.read_bytes()
+    result = f.run()
+    assert calls and result['ssh_repair']['repaired'] == [str(f.repo)]
+    assert result['deferred_upgrade'] and before == f.registration.read_bytes()
+    assert not (f.home / '.bashrc').exists()
+
+
+def test_normal_upgrade_automatically_checks_ssh_before_dependencies(setup, monkeypatch):
+    f = setup
+    calls = []
+
+    def repair(*args, **kwargs):
+        calls.append('ssh')
+        return {'repaired': [], 'refreshed': [], 'deferred': []}
+
+    def probe(*args):
+        assert calls and calls[0] == 'ssh'
+        calls.append('dependencies')
+        return {'missing': [], 'signature': 'current'}
+
+    monkeypatch.setattr(upgrade, 'repair_ssh', repair)
+    monkeypatch.setattr(upgrade, 'probe_python', probe)
+    result = f.run()
+    assert calls[0] == 'ssh' and 'ssh_repair' in result
+
+
+def test_ssh_inventory_covers_other_repos_and_live_processes_despite_repo_selection(setup, monkeypatch):
+    f = setup
+    other = f.repo.parent / 'other-repo'
+    (other / '.codex').mkdir(parents=True)
+    (other / '.codex/config.toml').write_text(f.registration.read_text()
+        .replace(str(f.policy), str(other / 'gpu-mcp.toml')))
+    (f.codex_home / 'config.toml').write_text('[projects.' + json.dumps(str(other)) + ']\n')
+    live = f.repo.parent / 'live-only'
+    (live / '.codex').mkdir(parents=True)
+    (live / '.codex/config.toml').write_text(f.registration.read_text()
+        .replace(str(f.policy), str(live / 'gpu-mcp.toml')))
+    process = {'repo_root':str(live), 'runtime':str(f.runtime), 'shared':False, 'pid':123,
+               'resources':{'threads':500, 'sockets':498}}
+    monkeypatch.setattr(upgrade, 'running_servers', lambda: [process])
+    seen = []
+
+    def repair(runtime, repos, **kwargs):
+        seen.append((repos, kwargs))
+        return {'repaired': [], 'refreshed': [], 'deferred': []}
+
+    monkeypatch.setattr(upgrade, 'repair_ssh', repair)
+    f.run(preview=True)
+    assert set(seen[0][0]) == {f.repo, other, live}
+    assert seen[0][1]['processes'] == [process]
+    assert '--config' in f.registration.read_text()

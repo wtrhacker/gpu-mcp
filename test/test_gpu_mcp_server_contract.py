@@ -3649,13 +3649,19 @@ def test_remote_host_run_propagates_timeout(repo_fixture, monkeypatch):
 
 
 def test_remote_host_run_records_failure_reason(repo_fixture, monkeypatch):
+    from types import SimpleNamespace
     config = _write_config(repo_fixture)
     server = _import_server_with_config(monkeypatch, config)
 
     monkeypatch.setattr(server, "_is_local_host", lambda host: False)
 
     class FakeConnection:
-        def run(self, cmd, hide=True, timeout=15):
+        client = SimpleNamespace(close=lambda: None)
+
+        def close(self):
+            pass
+
+        def run(self, cmd, hide=True, timeout=15, in_stream=False):
             raise TimeoutError("timed out while connecting")
 
     monkeypatch.setattr(server, "_conn", lambda host, user=server.GPU_MCP_USER: FakeConnection())
@@ -3665,6 +3671,7 @@ def test_remote_host_run_records_failure_reason(repo_fixture, monkeypatch):
 
 
 def test_direct_ssh_run_defaults_to_policy_sync_timeout(repo_fixture, monkeypatch):
+    from types import SimpleNamespace
     config = _write_config(repo_fixture)
     server = _import_server_with_config(monkeypatch, config)
     seen = {}
@@ -3673,7 +3680,12 @@ def test_direct_ssh_run_defaults_to_policy_sync_timeout(repo_fixture, monkeypatc
         stdout = "ok\n"
 
     class FakeConnection:
-        def run(self, cmd, hide=True, timeout=15):
+        client = SimpleNamespace(close=lambda: None)
+
+        def close(self):
+            seen['closed'] = True
+
+        def run(self, cmd, hide=True, timeout=15, in_stream=False):
             seen["timeout"] = timeout
             return FakeResult()
 
@@ -3685,6 +3697,7 @@ def test_direct_ssh_run_defaults_to_policy_sync_timeout(repo_fixture, monkeypatc
 
     assert server._ssh_run("gpu-a", "true") == "ok"
     assert seen["timeout"] == server.SYNC_TIMEOUT_SEC
+    assert seen['closed']
 
 
 def test_remote_python_argv_uses_staged_safe_runner_not_server(repo_fixture, monkeypatch):

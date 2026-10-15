@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Run after updating this installed folder. Ordinary Codex commands stay unchanged.
+# Run after updating this installed folder. SSH leak recovery runs before migrations.
+# SSH repair is automatic on every upgrade; --preview is read-only.
 set -euo pipefail
 gpu_mcp_upgrade_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 for gpu_mcp_upgrade_python in "${GPU_MCP_UPGRADE_PYTHON:-}" "$gpu_mcp_upgrade_root/.venv/bin/python" python3 python; do

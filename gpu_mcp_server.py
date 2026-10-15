@@ -12,6 +12,7 @@ Register in Codex or another MCP-aware client as a stdio MCP server.
 """
 
 import sys, os, json, time, subprocess, re, shlex, hashlib, signal as signal_lib, secrets, shutil, threading, atexit, functools
+import contextlib
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -439,10 +440,16 @@ def _ssh_run(
     """Run a command on a remote host. Returns stdout or None on failure."""
     HOST_RUN_ERRORS.pop((host, cmd), None)
     try:
-        c = _conn(host, user)
-        command_timeout = SYNC_TIMEOUT_SEC if timeout is None else timeout
-        result = c.run(cmd, hide=hide, timeout=command_timeout)
-        return result.stdout.strip()
+        with contextlib.ExitStack() as cleanup:
+            c = _conn(host, user)
+            # Fabric.close() can skip an incompletely opened transport. Close
+            # its client as well, including authentication and command errors.
+            cleanup.callback(c.client.close)
+            cleanup.callback(c.close)
+            command_timeout = SYNC_TIMEOUT_SEC if timeout is None else timeout
+            # SSH commands carry no interactive input; stdin belongs to MCP.
+            result = c.run(cmd, hide=hide, timeout=command_timeout, in_stream=False)
+            return result.stdout.strip()
     except Exception as e:
         _record_host_run_error(host, cmd, _classify_run_exception(e))
         return None
