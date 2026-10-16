@@ -327,14 +327,16 @@ def test_raw_kill_refuses_mps_even_for_the_owner(mps):
 def test_main_sweep_uses_existing_smoke_and_cadence_rules(mps):
     f = mps
     smoke = launch(f, [entry(f, 'smoke')], job_title='MPS viability')
-    until(lambda: status(f, smoke)['job_lifecycle'] == 'succeeded')
+    # A result can be saved before process-gone proof releases the GPU.
+    until(lambda: status(f, smoke)['job_lifecycle'] == 'succeeded'
+          and not f.runtime.store.get(smoke)['active_reservation'])
     # This one-off cannot be substituted for smoke evidence.
     result = call(f, 'run_python_on_gpu', host='fixture', gpu_index=0, mps=True,
                   runs=[entry(f, 'main')], job_role='main', smoke_job_id=smoke)
     assert result['status'] == 'refused'
     result = call(f, 'run_python_on_gpu', host='fixture', gpu_index=0, mps=True,
                   runs=[entry(f, 'valid')], job_role='main', smoke_skip_reason='explicit independent test', cadence_hint_sec=17)
-    assert result['status'] == 'launched'
+    assert result['status'] == 'launched', result
     assert f.runtime.store.get(result['job_id'])['poll_interval_sec'] == 17
 
 
@@ -691,14 +693,13 @@ def test_mps_cadence_and_early_reason_provenance_is_saved(mps):
     assert record['last_early_poll_at'] == record['last_status_checked_at']
 
 
-def test_legacy_hook_sees_early_completion_but_mirror_is_not_authority(mps):
+def test_mps_completion_mirror_cannot_override_protected_outcome(mps):
     import gpu_mcp_policy_hook as hook
     f = mps
     job = launch(f, [entry(f, 'bad', code=17)], cadence_hint_sec=3600)
     record = f.runtime.store.get(job)
     until(lambda: f.server._mps_manager().rpc('status', record['mps_spec'])['state'] == 'gone')
-    candidates = hook._stop_job_candidates(f.repo)
-    assert next(c for c in candidates if c['job_id'] == job)['outcome_present']
+    assert hook.probe_stop_wait_ownership(f.repo)['owns_stop'] is False
     path = leases.outcome_record_path(f.repo, job, record['active_attempt_id'])
     mirror = leases.read_json_file_no_follow(path)
     mirror.update(terminal_status='success', exit_code=0)

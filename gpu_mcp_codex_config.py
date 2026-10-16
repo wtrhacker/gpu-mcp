@@ -1,11 +1,38 @@
 from __future__ import annotations
 
+import ast
 import re
 from pathlib import Path
 
 
 class CodexConfigError(ValueError):
     """Raised when Codex-side GPU MCP guard configuration is invalid."""
+
+
+def shared_entrypoint(path: str | Path) -> bool:
+    """Recognize the public launcher and the retired name's forwarding adapter.
+
+    A historical server file is not an adapter merely because its name matches.
+    Read its explicit protocol marker without importing an installed server.
+    """
+    path = Path(path)
+    if not path.is_absolute():
+        raise CodexConfigError("GPU MCP entrypoint must be absolute")
+    if path.name == "gpu_mcp_codex_launcher.py":
+        return True
+    if path.name != "gpu_mcp_server.py":
+        raise CodexConfigError("GPU MCP must use gpu_mcp_codex_launcher.py or its gpu_mcp_server.py adapter")
+    try:
+        module = ast.parse(path.read_text())
+    except (OSError, SyntaxError) as exc:
+        raise CodexConfigError(f"cannot inspect GPU MCP entrypoint: {path}: {exc}") from exc
+    for node in module.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == "SHARED_ENTRYPOINT_PROTOCOL"
+            for target in node.targets
+        ):
+            return isinstance(node.value, ast.Constant) and type(node.value.value) is int and node.value.value == 1
+    return False
 
 
 REMOTE_COMMANDS = ("ssh", "scp", "sftp", "rsync")

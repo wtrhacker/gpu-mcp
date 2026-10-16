@@ -13,6 +13,7 @@ import tempfile
 import tomllib
 
 from gpu_mcp_builds import control_root
+from gpu_mcp_codex_config import shared_entrypoint
 from gpu_mcp_config import load_policy_snapshot
 import gpu_mcp_reservations as reservations
 from gpu_mcp_policy_approval import verify_policy_approved
@@ -115,7 +116,7 @@ def upgrade_plan(config, *, registry_root=None, store_path=None):
     launcher = str(Path(old).with_name('gpu_mcp_codex_launcher.py'))
     if not Path(launcher).is_file():
         raise ValueError('update the installed GPU MCP runtime before upgrading this repo')
-    mode = 'shared' if Path(old).name == 'gpu_mcp_codex_launcher.py' else 'legacy'
+    mode = 'shared' if shared_entrypoint(old) else 'legacy'
     blocked, completed = [], []
     root = Path(registry_root) if registry_root is not None else reservations.reservation_registry_root()
     if mode == 'legacy':

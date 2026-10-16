@@ -84,8 +84,8 @@ changes, GPU work pauses until the new version is shown and approved.
 
 In the [shared Codex integration](docs/codex-monitoring.md), backend code performs
 routine checks and saves completion before releasing the GPU. The hook retains
-policy approval checks. Direct stdio clients retain the earlier hook reminders
-and agent-requested status checks.
+policy approval checks only. Existing `gpu_mcp_server.py` registrations forward
+to the same shared launcher; there is no legacy per-session monitoring mode.
 
 Existing Codex projects can use the [registration upgrader](docs/codex-monitoring.md#migration-and-upgrades)
 to enable shared monitoring without recreating their GPU policy or its approval.

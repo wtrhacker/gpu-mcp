@@ -163,7 +163,7 @@ bash ~/gpu-mcp/upgrade.sh
 
 Use the actual installed path if it differs. The command finds existing
 registrations for that installation, checks their Python dependencies, migrates
-older registrations, adds missing tool approval entries, installs Ctrl+G and
+older registrations when needed, adds missing tool approval entries, installs Ctrl+G and
 refreshes outdated idle GPU MCP backends. It saves configuration backups and
 preserves explicit tool restrictions. Repeating a completed upgrade is safe.
 
@@ -184,9 +184,11 @@ usual process checks. Healthy busy backends are deferred.
 SSH repair runs before optional configuration migrations. If active legacy jobs
 block those migrations, a completed SSH repair is reported separately. Finish
 the reported legacy work and rerun for the remaining changes. This deferral is
-reported without discarding the completed repair or treating busy legacy work
+reported with exit code 2, without discarding the completed repair or treating busy legacy work
 as a failed SSH update. Older per-session
-servers load the fixed SSH helper after the usual quit/resume.
+servers switch to shared mode after their jobs finish and the usual quit/resume.
+Existing `gpu_mcp_server.py` registrations forward to the shared launcher;
+no configuration edit is needed after updating the complete installed runtime.
 
 Quit and resume existing Codex conversations once to refresh their MCP tools.
 New sessions use the update automatically. Ctrl+G activates immediately in

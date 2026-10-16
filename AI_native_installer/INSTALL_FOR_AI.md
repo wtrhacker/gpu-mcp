@@ -28,7 +28,7 @@ control host. Do not copy it into every research repository.
 Before editing the research repository, establish all of these values:
 
 1. `GPU_MCP_ROOT`: the installed control-side runtime containing
-   `gpu_mcp_server.py`, `gpu_mcp_codex_launcher.py`, `gpu_mcp_policy_hook.py`,
+   `gpu_mcp_server.py`, `gpu_mcp_backend.py`, `gpu_mcp_codex_launcher.py`, `gpu_mcp_policy_hook.py`,
    and `installation_test.py`.
 2. `GPU_MCP_SERVER_PYTHON`: the control-host interpreter that launches the MCP
    server and can import MCP SDK v1, Fabric, and Paramiko.
@@ -57,6 +57,7 @@ Substitute the confirmed absolute paths and perform equivalent read-only checks:
 
 ```bash
 test -f /absolute/gpu-mcp-runtime/gpu_mcp_server.py
+test -f /absolute/gpu-mcp-runtime/gpu_mcp_backend.py
 test -f /absolute/gpu-mcp-runtime/gpu_mcp_codex_launcher.py
 test -f /absolute/gpu-mcp-runtime/gpu_mcp_policy_hook.py
 test -x /absolute/path/to/server-python
@@ -248,8 +249,8 @@ matcher = "*"
 [[hooks.Stop.hooks]]
 type = "command"
 command = "/ABSOLUTE/GPU_MCP_SERVER_PYTHON /ABSOLUTE/GPU_MCP_ROOT/gpu_mcp_policy_hook.py"
-timeout = 31536000
-statusMessage = "Waiting for a managed GPU job event"
+timeout = 5
+statusMessage = "Checking GPU MCP policy"
 ```
 
 Also verify the user's Codex command policy prompt-gates raw `ssh`, `scp`,

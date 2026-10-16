@@ -265,10 +265,10 @@ def upgrade(runtime, *, repos=(), home=None, codex_home=None, store=None, previe
                          'Finish the reported work, or use --repo to upgrade an idle project.')
     if deferred:
         print(('Preview: registration migrations must wait.' if preview else
-               'SSH cleanup is installed. Registration migrations must wait.') + '\n' + '\n'.join(deferred), flush=True)
+               'Upgrade incomplete: registration migrations must wait.') + '\n' + '\n'.join(deferred), flush=True)
         print('Finish active legacy work, then quit/resume those sessions to load the fixed SSH helper. '
               'Rerun upgrade.sh afterward for the remaining migrations.')
-        return dict(ssh_repair=repairs, deferred_upgrade=deferred, changed_files=[], preview=preview)
+        return dict(status='blocked', ssh_repair=repairs, deferred_upgrade=deferred, changed_files=[], preview=preview)
     probes = {}
     for plan in plans:
         key = (plan['python'], json.dumps(plan['server'].get('env', {}), sort_keys=True))
@@ -319,9 +319,15 @@ def upgrade(runtime, *, repos=(), home=None, codex_home=None, store=None, previe
         if report.get('backup_directory'):
             print('Backup: ' + report['backup_directory'])
     print(terminal_result['activation'])
-    print('Upgrade complete. Quit and resume existing Codex conversations once to refresh their MCP tools.')
+    pending = [p for p in processes if not p['shared'] and Path(p['runtime']).resolve() == runtime
+               and Path(p['repo_root']).resolve() in repos]
+    if pending:
+        print('Runtime updated; activation incomplete. Old per-session controllers are still running. '
+              'Finish their jobs, then quit/resume those conversations. Existing configurations will use the shared backend.')
+    else:
+        print('Upgrade complete. Quit and resume existing Codex conversations once to refresh their MCP tools.')
     print('New sessions use the update automatically. The Codex daemon was not restarted or reconfigured.')
-    return dict(result, terminal=terminal_result, ssh_repair=repairs)
+    return dict(result, terminal=terminal_result, ssh_repair=repairs, pending_legacy_sessions=pending)
 
 
 def main(argv=None):
@@ -330,11 +336,11 @@ def main(argv=None):
     parser.add_argument('--repo', type=Path, action='append', default=[], help='limit upgrade to this existing repository; repeatable')
     args = parser.parse_args(argv)
     try:
-        upgrade(Path(__file__).resolve().parent, repos=args.repo, preview=args.preview)
+        result = upgrade(Path(__file__).resolve().parent, repos=args.repo, preview=args.preview)
     except (OSError, ValueError, KeyError, IndexError, subprocess.SubprocessError) as exc:
         print('Upgrade stopped: ' + str(exc), file=sys.stderr)
         return 1
-    return 0
+    return 2 if result.get('deferred_upgrade') or result.get('pending_legacy_sessions') else 0
 
 
 if __name__ == '__main__':

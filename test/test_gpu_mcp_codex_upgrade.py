@@ -201,3 +201,13 @@ def test_existing_shared_registration_keeps_its_backend_jobs(installed):
     record = job(installed)
     assert run(installed, apply=True)['status'] == 'already_shared'
     assert (installed.registry / record['reservation_key'] / 'metadata.json').exists()
+
+
+def test_old_filename_forwarding_adapter_needs_no_config_or_job_migration(installed):
+    (installed.runtime / 'gpu_mcp_server.py').write_text('SHARED_ENTRYPOINT_PROTOCOL = 1\n')
+    (installed.runtime / 'gpu_mcp_backend.py').write_text('# shared backend\n')
+    record = job(installed)
+    before = installed.registration.read_bytes()
+    assert run(installed, apply=True)['status'] == 'already_shared'
+    assert installed.registration.read_bytes() == before
+    assert (installed.registry / record['reservation_key'] / 'metadata.json').exists()

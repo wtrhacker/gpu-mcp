@@ -84,12 +84,13 @@ def _write_target_repo(repo: Path, mcp_root: Path, *, host: str = "gpu-a") -> Pa
 
 def _write_mcp_root(root: Path) -> None:
     root.mkdir(parents=True, exist_ok=True)
-    for name in (
-        "gpu_mcp_server.py",
-        "gpu_mcp_doctor.py",
-        "gpu_mcp_policy_hook.py",
-    ):
-        (root / name).write_text("# installed file\n")
+    module = installation_module()
+    for name in set(module.REQUIRED_ROOT_FILES) | {
+        "gpu_mcp_codex_state.py", "gpu_mcp_codex_runtime.py", "gpu_mcp_codex_daemon.py",
+        "gpu_mcp_codex_host.py", "gpu_mcp_codex_versions.py",
+    }:
+        (root / name).write_text("SHARED_ENTRYPOINT_PROTOCOL = 1\n" if name == "gpu_mcp_server.py" else "# installed file\n")
+
 
 
 def _approve(config: Path, store: Path) -> None:

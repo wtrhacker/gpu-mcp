@@ -56,9 +56,9 @@ def test_prepared_blind_fixture_runs_both_smokes_while_native_commands_are_sandb
         assert (repo / '.gpu_mcp_state/jobs').is_dir(), 'sandbox preparation obstructed the MCP state directory'
         monkeypatch.setenv('GPU_MCP_TEST_RESERVATION_ROOT', str(tmp_path / 'leases'))
         monkeypatch.setenv('GPU_MCP_PYTHON', sys.executable)
-        monkeypatch.setattr(sys, 'argv', ['gpu_mcp_server.py', '--config', str(repo / 'gpu-mcp.toml')])
+        monkeypatch.setattr(sys, 'argv', ['gpu_mcp_backend.py', '--config', str(repo / 'gpu-mcp.toml')])
         name = 'native_manual_acceptance_' + uuid.uuid4().hex
-        spec = importlib.util.spec_from_file_location(name, ROOT / 'gpu_mcp_server.py')
+        spec = importlib.util.spec_from_file_location(name, ROOT / 'gpu_mcp_backend.py')
         server = importlib.util.module_from_spec(spec)
         monkeypatch.setitem(sys.modules, name, server)
         spec.loader.exec_module(server)

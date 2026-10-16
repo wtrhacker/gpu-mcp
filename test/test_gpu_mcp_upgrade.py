@@ -97,6 +97,26 @@ def test_active_legacy_job_blocks_all_configuration_changes(setup):
     assert not (setup.home / '.bashrc').exists()
 
 
+def test_upgrade_cli_reports_deferred_migration_as_incomplete(monkeypatch):
+    monkeypatch.setattr(upgrade, 'upgrade', lambda *a, **kw: {'deferred_upgrade': ['unfinished jobs']})
+    assert upgrade.main([]) == 2
+    monkeypatch.setattr(upgrade, 'upgrade', lambda *a, **kw: {'pending_legacy_sessions': [{'pid': 123}]})
+    assert upgrade.main([]) == 2
+
+
+def test_upgrade_keeps_old_filename_adapter_and_live_legacy_controller(setup, monkeypatch, capsys):
+    f = setup
+    (f.runtime / 'gpu_mcp_server.py').write_text('SHARED_ENTRYPOINT_PROTOCOL = 1\n')
+    (f.runtime / 'gpu_mcp_backend.py').write_text('# shared backend\n')
+    job(f)
+    process = {'repo_root': str(f.repo), 'runtime': str(f.runtime), 'shared': False, 'pid': 123}
+    monkeypatch.setattr(upgrade, 'running_servers', lambda: [process])
+    result = f.run()
+    assert result['pending_legacy_sessions'] == [process]
+    assert 'gpu_mcp_server.py' in f.registration.read_text()
+    assert 'Upgrade complete.' not in capsys.readouterr().out
+
+
 def shared_backend(f, monkeypatch, *, active=False, code='older-code'):
     f.registration.write_text(f.registration.read_text().replace('gpu_mcp_server.py', 'gpu_mcp_codex_launcher.py'))
     info = {'server_instance_id': 'own', 'code_hash': code, 'runtime_signature': 'current',
@@ -278,3 +298,12 @@ def test_ssh_inventory_covers_other_repos_and_live_processes_despite_repo_select
     assert set(seen[0][0]) == {f.repo, other, live}
     assert seen[0][1]['processes'] == [process]
     assert '--config' in f.registration.read_text()
+
+
+def test_shell_upgrade_never_substitutes_an_explicit_invalid_python(monkeypatch):
+    source = Path(__file__).resolve().parents[1]
+    monkeypatch.setenv('GPU_MCP_UPGRADE_PYTHON', '/missing/explicit-python')
+    result = subprocess.run(['bash', str(source / 'upgrade.sh'), '--help'], capture_output=True, text=True)
+    assert result.returncode == 1
+    assert 'GPU_MCP_UPGRADE_PYTHON' in result.stderr
+    assert '--preview' not in result.stdout

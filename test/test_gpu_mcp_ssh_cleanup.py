@@ -12,7 +12,7 @@ from typing import Optional
 import pytest
 
 pytestmark = pytest.mark.contract
-SOURCE = Path(__file__).resolve().parents[1] / 'gpu_mcp_server.py'
+SOURCE = Path(__file__).resolve().parents[1] / 'gpu_mcp_backend.py'
 
 
 @pytest.fixture

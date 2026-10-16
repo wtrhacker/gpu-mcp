@@ -26,7 +26,7 @@ PROTOCOL_VERSION = 1
 
 def code_hash() -> str:
     root = Path(__file__).resolve().parent
-    names = ("gpu_mcp_server.py", "gpu_mcp_builds.py", "gpu_mcp_config.py", "gpu_mcp_guard.py",
+    names = ("gpu_mcp_backend.py", "gpu_mcp_server.py", "gpu_mcp_builds.py", "gpu_mcp_config.py", "gpu_mcp_guard.py",
              "gpu_mcp_reservations.py", "gpu_mcp_codex_state.py", "gpu_mcp_codex_runtime.py",
              "gpu_mcp_codex_daemon.py", "gpu_mcp_codex_host.py", "gpu_mcp_build_worker.py",
              "gpu_mcp_policy_approval.py", "gpu_mcp_safe_runner.py", "gpu_mcp_codex_launcher.py")
@@ -44,7 +44,7 @@ def process_start(pid: int) -> str | None:
         stat = Path(f"/proc/{pid}/stat").read_text()
         fields = stat[stat.rfind(")") + 2:].split()
         return None if fields[0] in {"Z", "X"} else fields[19]
-    except (OSError, ValueError, IndexError):
+    except (FileNotFoundError, ProcessLookupError):
         return None
 
 
@@ -77,9 +77,14 @@ def request(info, path, *, payload=None, human=False, timeout=120):
 
 def read_info(root: Path):
     try:
-        return reservations.read_json_file_no_follow(root / "backend.json")
-    except (OSError, ValueError):
+        info = reservations.read_json_file_no_follow(root / "backend.json")
+    except FileNotFoundError:
         return None
+    if (not isinstance(info, dict) or type(info.get("pid")) is not int or info["pid"] <= 0
+            or any(not isinstance(info.get(key), str) or not info[key]
+                   for key in ("hostname", "process_start", "server_instance_id", "config_path"))):
+        raise ValueError(f"Invalid shared GPU MCP backend identity: {root / 'backend.json'}")
+    return info
 
 
 def alive(info):
@@ -118,7 +123,7 @@ def ensure_backend(config: str | Path, *, base: str | Path | None = None, timeou
         fd = listener.fileno()
         credentials = {"agent_token": secrets.token_urlsafe(32), "human_token": secrets.token_urlsafe(32)}
         reservations.atomic_write_json(root / "credentials.json", credentials)
-        command = [sys.executable, str(Path(__file__).with_name("gpu_mcp_server.py")),
+        command = [sys.executable, str(Path(__file__).with_name("gpu_mcp_backend.py")),
                    "--config", str(config), "--codex-shared", "--runtime-root", str(root),
                    "--listen-fd", str(fd)]
         with (root / "backend.log").open("ab") as log:

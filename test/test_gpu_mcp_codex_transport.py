@@ -326,3 +326,48 @@ def test_human_viewer_reads_existing_backend_without_changing_runtime_settings(b
     attached = connect_viewer(policy, base=base)
     assert attached["server_instance_id"] == info["server_instance_id"]
     assert attached["runtime_signature"] == info["runtime_signature"]
+
+
+@pytest.mark.parametrize('entrypoint', ['gpu_mcp_server.py', 'gpu_mcp_codex_launcher.py'])
+def test_both_public_entrypoints_share_backend_and_enforce_native_ownership(backend, entrypoint):
+    policy, base, info = backend
+    info = dict(info, state_base=str(base))
+    owner, foreign = Origin(str(uuid.uuid4())), Origin(str(uuid.uuid4()))
+    own = record_for(policy, info, owner, label='adapter-owner')
+    other = record_for(policy, info, foreign, label='adapter-foreign')
+    messages = [
+        {'jsonrpc': '2.0', 'id': 1, 'method': 'initialize', 'params': {
+            'protocolVersion': '2025-11-25', 'capabilities': {}, 'clientInfo': {'name': 'codex-fixture', 'version': '1'}}},
+        {'jsonrpc': '2.0', 'id': 2, 'method': 'tools/call', 'params': {
+            'name': 'list_gpu_jobs', 'arguments': {}, '_meta': {'threadId': owner.thread_id}}},
+        {'jsonrpc': '2.0', 'id': 3, 'method': 'tools/call', 'params': {
+            'name': 'manage_gpu_job', 'arguments': {'action': 'status', 'job_id': other['job_id']},
+            '_meta': {'threadId': owner.thread_id}}},
+    ]
+    result = subprocess.run([sys.executable, str(SOURCE / entrypoint), '--config', str(policy), '--state-base', str(base)],
+                            input=''.join(json.dumps(m) + '\n' for m in messages), text=True,
+                            capture_output=True, timeout=20)
+    assert result.returncode == 0, result.stderr
+    replies = {r['id']: r for r in map(json.loads, result.stdout.splitlines())}
+    assert 'result' in replies[1]
+    jobs = json.loads(replies[2]['result']['content'][0]['text'])['jobs']
+    assert [j['job_id'] for j in jobs] == [own['job_id']]
+    refused = json.loads(replies[3]['result']['content'][0]['text'])
+    assert refused['status'] == 'refused' and 'unavailable' in refused['reason']
+    assert ensure_backend(policy, base=base)['pid'] == info['pid']
+    argv = Path(f'/proc/{info["pid"]}/cmdline').read_bytes().split(b'\0')
+    assert str(SOURCE / 'gpu_mcp_backend.py').encode() in argv
+
+
+@pytest.mark.parametrize('contents', ['{broken json', '[]', '{}'])
+def test_corrupt_backend_descriptor_never_starts_a_replacement(tmp_path, monkeypatch, contents):
+    import gpu_mcp_codex_launcher as launcher
+    policy = write_repo(tmp_path)
+    base = tmp_path / 'backends'
+    root = runtime_root(policy, base=base)
+    root.mkdir(parents=True)
+    (root / 'backend.json').write_text(contents)
+    monkeypatch.setattr(launcher.subprocess, 'Popen', lambda *a, **kw: pytest.fail('replaced an unverified backend'))
+    with pytest.raises(ValueError):
+        ensure_backend(policy, base=base)
+    assert not (root / 'credentials.json').exists()

@@ -31,7 +31,7 @@ def running(tmp_path, monkeypatch):
     base = home / 'gpu-mcp/state/codex'
     root = runtime_root(config, base=base)
     store = JobStore(root)
-    script = runtime / 'gpu_mcp_server.py'
+    script = runtime / 'gpu_mcp_backend.py'
     # The worker shares its parent's process group. killpg would kill it too.
     worker_script = runtime / 'worker.py'
     worker_script.write_text('import time\nwhile True: time.sleep(1)\n')
@@ -44,6 +44,7 @@ Path(sys.argv[-1]).write_text(str(p.pid))
 while True: time.sleep(1)
 ''')
     (runtime / 'gpu_mcp_codex_launcher.py').write_text('# fixture launcher\n')
+    (runtime / 'gpu_mcp_server.py').write_text('SHARED_ENTRYPOINT_PROTOCOL = 1\n')
     reg = repo / '.codex/config.toml'
     reg.write_text('[mcp_servers.gpu-cluster-mcp]\ncommand=' + json.dumps(sys.executable) +
                    '\nargs=' + json.dumps([str(runtime / 'gpu_mcp_codex_launcher.py'), '--config', str(config)]) + '\n')
@@ -121,7 +122,7 @@ def test_metadata_identity_change_never_signals_a_process(running, monkeypatch, 
     altered = dict(f.info, **{change: 'replacement'})
     reservations.atomic_write_json(f.root / 'backend.json', altered)
     monkeypatch.setattr(recovery, 'pidfd_signal', lambda *a: pytest.fail('identity mismatch was signalled'))
-    with pytest.raises(ValueError, match='identity changed'):
+    with pytest.raises(ValueError, match='identity changed|Invalid shared GPU MCP backend identity'):
         recovery.verify_process(f.plan, f.info)
 
 
@@ -141,12 +142,12 @@ def test_healthy_busy_backend_is_deferred_without_a_signal(running, monkeypatch)
     assert f.child.poll() is None
 
 
-def test_wrong_runtime_and_legacy_registrations_are_left_for_normal_resume(running):
+def test_wrong_runtime_is_untouched_and_old_filename_adapter_can_repair(running):
     f = running
     assert recovery.repair(f.runtime / 'other', [f.repo], home=f.home)['repaired'] == []
     f.registration.write_text(f.registration.read_text().replace('gpu_mcp_codex_launcher.py', 'gpu_mcp_server.py'))
-    assert recovery.repair(f.runtime, [f.repo], home=f.home)['repaired'] == []
-    assert f.child.poll() is None
+    assert recovery.repair(f.runtime, [f.repo], home=f.home)['repaired'] == [str(f.repo)]
+    assert f.child.wait(timeout=5) == -signal.SIGKILL
 
 
 def test_invalid_protected_job_state_blocks_forced_recovery(running, monkeypatch):
@@ -201,7 +202,7 @@ def test_identity_is_rechecked_after_pidfd_open(running, monkeypatch):
 
     monkeypatch.setattr(recovery, 'pidfd_open', replaced)
     monkeypatch.setattr(recovery, 'pidfd_signal', lambda *a: pytest.fail('changed owner was signalled'))
-    with pytest.raises(ValueError, match='identity changed'):
+    with pytest.raises(ValueError, match='identity changed|Invalid shared GPU MCP backend identity'):
         recovery.stop_exhausted(f.plan, f.info)
     assert f.child.poll() is None
 

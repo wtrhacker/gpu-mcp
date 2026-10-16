@@ -39,7 +39,7 @@ def offload_shared_tools(service):
     """Keep synchronous GPU/SSH work off the shared HTTP loop.
 
     to_thread copies ContextVars, including the native MCP caller metadata.
-    Exported server functions and legacy stdio registration remain unchanged.
+    Exported backend functions retain their normal call signatures.
     """
     def adapter(function):
         @wraps(function)

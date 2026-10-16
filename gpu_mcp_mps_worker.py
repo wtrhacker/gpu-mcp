@@ -161,8 +161,8 @@ def hint(spec, outcome=None):
         os.close(fd)
         os.utime(path, None, follow_symlinks=False)
         if outcome is not None:
-            # Existing direct-stdio hooks notice outcome presence. This mirror
-            # is advisory; MPS status always reads protected execution-host state.
+            # This repository mirror is advisory. Shared monitoring uses the
+            # readiness hint; MPS status reads protected execution-host state.
             write_json(path.with_name('outcome.json'), outcome)
     except OSError:
         pass

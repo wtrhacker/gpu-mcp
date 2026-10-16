@@ -25,6 +25,8 @@ DEFAULT_MCP_ROOT = Path("/home/tingran/gpu-mcp")
 DEFAULT_PYTHON = Path("/home/tingran/miniconda3/bin/python")
 REQUIRED_ROOT_FILES = (
     "gpu_mcp_server.py",
+    "gpu_mcp_backend.py",
+    "gpu_mcp_codex_launcher.py",
     "gpu_mcp_doctor.py",
     "gpu_mcp_policy_hook.py",
 )
@@ -102,23 +104,23 @@ def _validate_server_path(repo: Path, mcp_root: Path, config_path: Path) -> dict
     args = [str(arg) for arg in server.get("args", [])]
     expected_server = (mcp_root / "gpu_mcp_server.py").resolve()
     launcher = (mcp_root / "gpu_mcp_codex_launcher.py").resolve()
-    shared = str(launcher) in args
-    if str(expected_server) not in args and not shared:
+    entry = launcher if str(launcher) in args else expected_server
+    if str(entry) not in args:
         raise ValueError(f"{MCP_SERVER_NAME} must point at {launcher} or {expected_server}")
-    if shared:
-        for filename in ("gpu_mcp_codex_launcher.py", "gpu_mcp_codex_state.py", "gpu_mcp_codex_runtime.py",
-                         "gpu_mcp_codex_daemon.py", "gpu_mcp_codex_host.py", "gpu_mcp_codex_versions.py"):
-            if not (mcp_root / filename).is_file():
-                raise ValueError(f"shared Codex runtime is incomplete: {filename}")
+    validate_repo_local_codex_config(repo, config_path)
+    for filename in ("gpu_mcp_backend.py", "gpu_mcp_codex_launcher.py", "gpu_mcp_codex_state.py", "gpu_mcp_codex_runtime.py",
+                     "gpu_mcp_codex_daemon.py", "gpu_mcp_codex_host.py", "gpu_mcp_codex_versions.py"):
+        if not (mcp_root / filename).is_file():
+            raise ValueError(f"shared Codex runtime is incomplete: {filename}")
     if "--config" not in args:
         raise ValueError(f"{MCP_SERVER_NAME} args must include --config")
     actual_config = Path(args[args.index("--config") + 1]).resolve()
     if actual_config != config_path.resolve():
         raise ValueError(f"{MCP_SERVER_NAME} --config points at {actual_config}")
     return {
-        "server_path": str(launcher if shared else expected_server),
+        "server_path": str(entry),
         "config_path": str(actual_config),
-        "mode": "codex_shared" if shared else "legacy_stdio",
+        "mode": "codex_shared",
     }
 
 

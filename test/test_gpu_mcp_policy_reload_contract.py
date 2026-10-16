@@ -16,7 +16,7 @@ import pytest
 pytestmark = pytest.mark.contract
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-SERVER = REPO_ROOT / "gpu_mcp_server.py"
+SERVER = REPO_ROOT / "gpu_mcp_backend.py"
 
 
 @pytest.fixture()
@@ -53,9 +53,9 @@ def _import_server(monkeypatch, config: Path, store: Path):
     monkeypatch.delenv("GPU_MCP_TEST_DISABLE_POLICY_APPROVAL", raising=False)
     approval = importlib.import_module("gpu_mcp_policy_approval")
     monkeypatch.setattr(approval, "default_store_path", lambda: store)
-    sys.modules.pop("gpu_mcp_server", None)
+    sys.modules.pop("gpu_mcp_backend", None)
     monkeypatch.setattr(sys, "argv", [str(SERVER), "--config", str(config)])
-    return importlib.import_module("gpu_mcp_server")
+    return importlib.import_module("gpu_mcp_backend")
 
 
 @pytest.fixture()
@@ -153,9 +153,9 @@ def test_policy_approval_bypass_is_pytest_only(monkeypatch, repo_fixture, tmp_pa
     monkeypatch.setenv("GPU_MCP_TEST_DISABLE_POLICY_APPROVAL", "1")
     monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
     monkeypatch.setattr(sys, "argv", [str(SERVER), "--config", str(config)])
-    sys.modules.pop("gpu_mcp_server", None)
+    sys.modules.pop("gpu_mcp_backend", None)
 
-    server = importlib.import_module("gpu_mcp_server")
+    server = importlib.import_module("gpu_mcp_backend")
 
     assert server.GPU_MCP_TEST_DISABLE_POLICY_APPROVAL is False
     assert server.CONFIG_POLICY is None

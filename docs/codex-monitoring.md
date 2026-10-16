@@ -168,7 +168,7 @@ adopt another server instance's GPU leases. It saves verified GPU-job completion
 recovers their orphaned reservations once stale, with process-gone proof and a
 locked identity/heartbeat check. Alive or uncertain processes stay reserved.
 Completion clears the saved check time; recovery updates the booking state and
-resolves any pending restart alert for that job. Direct stdio status calls use
+resolves any pending restart alert for that job. Explicit status calls use
 the same safe stale cleanup and persist terminal state.
 
 ## Human terminal monitor
@@ -411,11 +411,18 @@ A CLI/daemon mismatch can appear as incompatible shared feature settings.
 Do not change feature flags to mask that mismatch. Those flags are separate
 from ChatGPT subscription versus API-key authentication.
 
-Direct `gpu_mcp_server.py --config ...` remains available for existing stdio
-clients. It retains the earlier per-instance ownership and reminder behavior.
-Existing jobs without native Codex ownership are not silently assigned to a new
-conversation. Drain them through their original server before switching that
-repository to the launcher.
+Existing `gpu_mcp_server.py --config ...` registrations forward directly to the
+shared launcher. The implementation lives in `gpu_mcp_backend.py`, which the
+launcher starts with its private shared-backend arguments. Both public entrypoint
+names therefore use one ownership and monitoring implementation. Updating the
+installed runtime is enough; changing existing Codex configurations is optional.
+The policy hook no longer reads Codex configuration or scans repository jobs to
+select a monitoring mode. Its older research-hook Stop probe returns no owner.
+
+Already-running processes retain their loaded code. Finish jobs through their
+original controller before reconnecting that conversation. Jobs without native
+Codex ownership are never silently assigned to another conversation. New
+connections through either public entrypoint use the shared backend.
 
 After updating the installed folder, existing users can run one command:
 
@@ -444,7 +451,7 @@ omit the wrappers. Unsupported platforms stop before sending any signal.
 The replacement retains the existing server-instance ownership boundary.
 Detached work continues, completed-job recovery retains its normal process and
 reservation checks, and no launch is resent. Healthy busy backends remain
-running. Old per-session servers load the fixed helper on quit/resume.
+running. Old per-session servers switch to shared mode on quit/resume after their jobs finish.
 The script lists their PIDs and socket/thread counts. It cannot reload a Python
 function inside an existing stdio connection, so those sessions need their normal
 quit/resume once. Other code copies are reported for updating at their own path.
@@ -465,6 +472,9 @@ hashes are checked again before writing, including after dependency installation
 A healthy active outdated backend must finish its work before that refresh;
 an already current backend can keep running. A completed emergency SSH repair is
 reported even when active legacy work defers later registration migrations.
+An incomplete migration or a still-running legacy controller returns exit code 2,
+so scripts cannot mistake pending work for a completed upgrade. An explicit
+`GPU_MCP_UPGRADE_PYTHON` must work; the shell helper never silently replaces it.
 The script preserves the Codex daemon's lifecycle, features and update channel.
 
 The smaller registration-only helper remains available for custom installers.

@@ -20,6 +20,7 @@ import urllib.error
 
 import gpu_mcp_codex_launcher as launcher
 import gpu_mcp_reservations as reservations
+from gpu_mcp_codex_config import shared_entrypoint
 from gpu_mcp_codex_state import private_directory, runtime_root
 
 # A shared backend has a small, bounded request pool. Hundreds of persistent
@@ -84,7 +85,7 @@ def running_servers(*, proc_root=Path('/proc')):
             if index >= len(argv):
                 continue
             script = Path(argv[index])
-            if (not script.is_absolute() or script.name != 'gpu_mcp_server.py'
+            if (not script.is_absolute() or script.name not in {'gpu_mcp_server.py', 'gpu_mcp_backend.py'}
                     or '--safe-run' in argv or '--supervise' in argv or argv.count('--config') != 1):
                 continue
             config = Path(argv[argv.index('--config') + 1])
@@ -124,7 +125,8 @@ def verify_process(plan, info):
         raise ValueError('GPU MCP process owner or interpreter differs; no signal sent')
     argv = (proc / 'cmdline').read_bytes().decode().split('\0')
     expected = {'--config': str(plan['config']), '--runtime-root': str(root)}
-    if len(argv) < 2 or argv[1] != str(plan['runtime'] / 'gpu_mcp_server.py') or '--codex-shared' not in argv:
+    if (len(argv) < 2 or argv[1] not in {str(plan['runtime'] / name) for name in ('gpu_mcp_server.py', 'gpu_mcp_backend.py')}
+            or '--codex-shared' not in argv):
         raise ValueError('process is not this installation\'s shared GPU MCP server')
     for flag, value in expected.items():
         if argv.count(flag) != 1 or argv.index(flag) + 1 >= len(argv) or argv[argv.index(flag) + 1] != value:
@@ -244,7 +246,7 @@ def repair(runtime, repos, *, home=None, preview=False, processes=()):
             installed = Path(entries[0]).resolve().parent
             if installed != runtime:
                 other_copies.add(str(installed))
-            if installed != runtime or Path(entries[0]).name == 'gpu_mcp_server.py' or args.count('--config') != 1:
+            if installed != runtime or not shared_entrypoint(entries[0]) or args.count('--config') != 1:
                 continue
             config = Path(args[args.index('--config') + 1]).resolve()
             if config.parent != Path(repo).resolve():

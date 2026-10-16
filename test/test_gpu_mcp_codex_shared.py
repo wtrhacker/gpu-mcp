@@ -22,7 +22,7 @@ import gpu_mcp_reservations as leases
 from gpu_mcp_codex_daemon import DaemonClient, DeliveryUncertain
 from gpu_mcp_codex_runtime import CodexRuntime
 from gpu_mcp_codex_state import Origin, SessionAccessError, runtime_root
-from gpu_mcp_policy_hook import check_gpu_job_reminders, probe_stop_wait_ownership
+from gpu_mcp_policy_hook import probe_stop_wait_ownership
 
 pytestmark = pytest.mark.contract
 SOURCE = Path(__file__).resolve().parents[1]
@@ -56,9 +56,9 @@ def shared(tmp_path, monkeypatch):
                       "min_free_memory_mib = 0\nsync_timeout_sec = 2\nbuild_enabled = true\n")
     monkeypatch.setenv("GPU_MCP_TEST_RESERVATION_ROOT", str(tmp_path / "leases"))
     monkeypatch.setenv("GPU_MCP_TEST_BUILD_CONTROL_ROOT", str(tmp_path / "build-control"))
-    monkeypatch.setattr(sys, "argv", ["gpu_mcp_server.py", "--config", str(config)])
+    monkeypatch.setattr(sys, "argv", ["gpu_mcp_backend.py", "--config", str(config)])
     name = "codex_shared_contract_" + uuid.uuid4().hex
-    spec = importlib.util.spec_from_file_location(name, SOURCE / "gpu_mcp_server.py")
+    spec = importlib.util.spec_from_file_location(name, SOURCE / "gpu_mcp_backend.py")
     server = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, name, server)
     spec.loader.exec_module(server)
@@ -384,7 +384,6 @@ def test_shared_registration_bypasses_legacy_poll_and_stop_hooks(shared):
     codex.mkdir()
     (codex / "config.toml").write_text("[mcp_servers.gpu-cluster-mcp]\nargs = [" +
         repr(str(SOURCE / "gpu_mcp_codex_launcher.py")) + ", '--config', " + repr(str(shared.server.POLICY_CONFIG_PATH)) + "]\n")
-    assert check_gpu_job_reminders(shared.repo) is None
     assert probe_stop_wait_ownership(shared.repo)["owns_stop"] is False
 
 

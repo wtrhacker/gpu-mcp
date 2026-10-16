@@ -25,6 +25,7 @@ def test_repo_chooser_keeps_stopped_backends(tmp_path, monkeypatch):
         (repo / 'gpu-mcp.toml').write_text('schema_version=1\n')
     (base / 'old/backend.json').write_text(json.dumps({
         'hostname': socket.gethostname(), 'pid': 99999999,
+        'process_start': '1', 'server_instance_id': 'stopped-fixture',
         'config_path': str(stopped / 'gpu-mcp.toml')}))
     monkeypatch.chdir(current)
     assert editor.repo_choices(base=base, home=tmp_path) == [current / 'gpu-mcp.toml', stopped / 'gpu-mcp.toml']
@@ -83,6 +84,7 @@ def test_catalog_includes_legacy_registrations_independent_of_cwd_and_backend_li
     (base / 'shared').mkdir(parents=True)
     info = base / 'shared/backend.json'
     info.write_text(json.dumps({'hostname': socket.gethostname(), 'pid': 99999999,
+        'process_start': '1', 'server_instance_id': 'stopped-fixture',
                                 'config_path': str(policies[2])}))
     broken = tmp_path / 'broken'
     (broken / '.codex').mkdir(parents=True)

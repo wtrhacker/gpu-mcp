@@ -22,7 +22,7 @@ import pytest
 pytestmark = pytest.mark.contract
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-SERVER = REPO_ROOT / "gpu_mcp_server.py"
+SERVER = REPO_ROOT / "gpu_mcp_backend.py"
 SAFE_RUNNER = REPO_ROOT / "gpu_mcp_safe_runner.py"
 GUARD = REPO_ROOT / "gpu_mcp_guard.py"
 FIXTURE_ROOT = REPO_ROOT / "test_mcp_repos" / "server_contract"
@@ -60,11 +60,11 @@ def _write_config(repo: Path) -> Path:
 
 def _import_server_with_config(monkeypatch, config: Path):
     monkeypatch.setattr(sys, "argv", [str(SERVER), "--config", str(config)])
-    old_server = sys.modules.get("gpu_mcp_server")
+    old_server = sys.modules.get("gpu_mcp_backend")
     if old_server is not None and hasattr(old_server, "HEARTBEAT_MANAGER"):
         old_server.HEARTBEAT_MANAGER.stop()
-    sys.modules.pop("gpu_mcp_server", None)
-    return importlib.import_module("gpu_mcp_server")
+    sys.modules.pop("gpu_mcp_backend", None)
+    return importlib.import_module("gpu_mcp_backend")
 
 
 def _server_subprocess_env(registry: Path) -> dict[str, str]:
@@ -91,12 +91,12 @@ def test_server_startup_accepts_pytest_policy_approval_store(monkeypatch, repo_f
     monkeypatch.setenv("GPU_MCP_TEST_POLICY_APPROVAL_STORE", str(store))
     monkeypatch.setenv("PYTEST_CURRENT_TEST", "server approval store contract")
     monkeypatch.setattr(sys, "argv", [str(SERVER), "--config", str(config)])
-    old_server = sys.modules.get("gpu_mcp_server")
+    old_server = sys.modules.get("gpu_mcp_backend")
     if old_server is not None and hasattr(old_server, "HEARTBEAT_MANAGER"):
         old_server.HEARTBEAT_MANAGER.stop()
-    sys.modules.pop("gpu_mcp_server", None)
+    sys.modules.pop("gpu_mcp_backend", None)
 
-    server = importlib.import_module("gpu_mcp_server")
+    server = importlib.import_module("gpu_mcp_backend")
 
     assert server.CONFIG_POLICY.config_path == config.resolve()
 
@@ -1456,7 +1456,7 @@ def test_phase3_cleanup_guard_excludes_cross_process_heartbeat_refresh(
         from pathlib import Path
 
         sys.argv = [{str(SERVER)!r}, "--config", {str(config)!r}]
-        import gpu_mcp_server as server
+        import gpu_mcp_backend as server
 
         server._inspect_reservation_process = lambda metadata: {{
             "status": "gone",
@@ -1527,7 +1527,7 @@ def test_phase3_two_cleaners_racing_one_quarantines_one_aborts(
         from pathlib import Path
 
         sys.argv = [{str(SERVER)!r}, "--config", {str(config)!r}]
-        import gpu_mcp_server as server
+        import gpu_mcp_backend as server
 
         metadata = json.loads(Path({str(metadata_path)!r}).read_text())
         worker = os.environ["GPU_MCP_CLEANER_WORKER"]
@@ -2405,15 +2405,12 @@ def test_phase6_status_action_writes_status_acknowledgement(
 
     status = json.loads(server.manage_gpu_job(action="status", job_id=launched["job_id"]))
     after_status = json.loads(record_path.read_text())
-    hook = importlib.import_module("gpu_mcp_policy_hook")
-    reminder = hook.check_gpu_job_reminders(repo_fixture)
 
     assert before_status["last_status_checked_at"] is None
     assert status["status"] == "ok"
     assert status["job_lifecycle"] == "running"
     assert after_status["last_status_checked_at"] is not None
     assert after_status["next_poll_after"] == status["next_poll_after"]
-    assert reminder is None
 
 
 def test_phase7_async_launch_defaults_main_and_soft_refuses_without_smoke(

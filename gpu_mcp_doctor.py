@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from gpu_mcp_codex_config import CodexConfigError, validate_remote_command_prompt_rules
+from gpu_mcp_codex_config import CodexConfigError, shared_entrypoint, validate_remote_command_prompt_rules
 from gpu_mcp_config import ConfigError, load_policy
 from gpu_mcp_policy_approval import approve_policy, policy_file_hash, policy_summary
 
@@ -104,12 +104,27 @@ def validate_repo_local_codex_config(repo: str | Path, config_path: str | Path) 
     codex_config = repo_path / ".codex" / "config.toml"
     if not codex_config.exists():
         raise DoctorError("repo-local Codex config is missing")
-    raw = _load_toml(codex_config)
+    try:
+        raw = _load_toml(codex_config)
+    except (OSError, ValueError) as exc:
+        raise DoctorError(f"cannot read repo-local Codex config: {exc}") from exc
     servers = raw.get("mcp_servers", {})
     for name, server in servers.items():
         if name != MCP_SERVER_NAME:
             continue
+        if server.get("enabled", True) is False:
+            raise DoctorError("repo-local GPU MCP registration is disabled")
         args = [str(arg) for arg in server.get("args", [])]
+        entries = [arg for arg in args if Path(arg).name in {"gpu_mcp_server.py", "gpu_mcp_codex_launcher.py"}]
+        if len(entries) != 1:
+            raise DoctorError("repo-local GPU MCP config must name exactly one shared entrypoint")
+        try:
+            if not shared_entrypoint(entries[0]):
+                raise DoctorError("installed gpu_mcp_server.py still runs the retired per-session server; update the installed runtime")
+        except CodexConfigError as exc:
+            raise DoctorError(str(exc)) from exc
+        if not Path(entries[0]).with_name("gpu_mcp_backend.py").is_file():
+            raise DoctorError("shared GPU MCP runtime is incomplete: gpu_mcp_backend.py is missing; update the installed runtime")
         if "--config" not in args:
             continue
         index = args.index("--config")
@@ -136,7 +151,7 @@ def validate_repo_local_codex_config(repo: str | Path, config_path: str | Path) 
             "server_name": name,
             "config_path": str(actual_config),
             "tool_timeout_sec": tool_timeout_sec,
-            "mode": "codex_shared" if any(Path(arg).name == "gpu_mcp_codex_launcher.py" for arg in args) else "legacy_stdio",
+            "mode": "codex_shared",
         }
     raise DoctorError(f"repo-local Codex config must register {MCP_SERVER_NAME} with --config")
 

@@ -45,9 +45,9 @@ def launched_server(tmp_path, monkeypatch):
                       "min_free_memory_mib = 0\nsync_timeout_sec = 2\n")
     monkeypatch.setenv('GPU_MCP_TEST_RESERVATION_ROOT', str(tmp_path / 'reservations'))
     monkeypatch.setenv('GPU_MCP_PYTHON', sys.executable)
-    monkeypatch.setattr(sys, 'argv', ['gpu_mcp_server.py', '--config', str(policy)])
+    monkeypatch.setattr(sys, 'argv', ['gpu_mcp_backend.py', '--config', str(policy)])
     name = 'uncertainty_repro_' + uuid.uuid4().hex
-    spec = importlib.util.spec_from_file_location(name, SOURCE / 'gpu_mcp_server.py')
+    spec = importlib.util.spec_from_file_location(name, SOURCE / 'gpu_mcp_backend.py')
     server = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, name, server)
     spec.loader.exec_module(server)

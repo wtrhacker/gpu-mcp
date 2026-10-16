@@ -46,9 +46,9 @@ def restarted(shared):
         metadata["last_heartbeat_at"] = (datetime.now(timezone.utc) - timedelta(seconds=age)).isoformat()
         leases.atomic_write_json(metadata_path, metadata)
 
-        shared.monkeypatch.setattr(sys, "argv", ["gpu_mcp_server.py", "--config", str(shared.repo / "gpu-mcp.toml")])
+        shared.monkeypatch.setattr(sys, "argv", ["gpu_mcp_backend.py", "--config", str(shared.repo / "gpu-mcp.toml")])
         name = "restart_recovery_" + uuid.uuid4().hex
-        spec = importlib.util.spec_from_file_location(name, SOURCE / "gpu_mcp_server.py")
+        spec = importlib.util.spec_from_file_location(name, SOURCE / "gpu_mcp_backend.py")
         server = importlib.util.module_from_spec(spec)
         shared.monkeypatch.setitem(sys.modules, name, server)
         spec.loader.exec_module(server)

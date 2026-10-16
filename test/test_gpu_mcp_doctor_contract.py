@@ -78,6 +78,10 @@ def _write_codex_config(
     approval_mode: str = "approve",
     reload_approval_mode: str = "prompt",
 ) -> Path:
+    runtime = repo.parent / "runtime"
+    runtime.mkdir(exist_ok=True)
+    (runtime / "gpu_mcp_backend.py").write_text("# shared backend fixture\n")
+    (runtime / "gpu_mcp_server.py").write_text("SHARED_ENTRYPOINT_PROTOCOL = 1\n")
     codex_config = repo / ".codex" / "config.toml"
     codex_config.write_text(
         "\n".join(
@@ -85,7 +89,7 @@ def _write_codex_config(
                 "[mcp_servers.gpu-cluster-mcp]",
                 'command = "/usr/bin/python3"',
                 "args = [",
-                '  "/opt/gpu-mcp/gpu_mcp_server.py",',
+                f'  "{runtime / "gpu_mcp_server.py"}",',
                 '  "--config",',
                 f"  {str(config_path)!r},",
                 "]",
@@ -111,6 +115,24 @@ def _assert_doctor_result(result: dict, *, status: str) -> None:
     assert result["schema_version"] == 1
     assert result["status"] == status
     assert isinstance(result["checks"], list)
+
+
+def test_doctor_rejects_old_runtime_behind_the_preserved_filename(doctor_module, repo_fixture):
+    config = _write_policy(repo_fixture)
+    _write_codex_config(repo_fixture, config)
+    runtime = repo_fixture.parent / "runtime"
+    (runtime / "gpu_mcp_server.py").write_text("# original per-session implementation\n")
+    with pytest.raises(doctor_module.DoctorError, match="retired per-session"):
+        doctor_module.validate_repo_local_codex_config(repo_fixture, config)
+
+
+def test_doctor_reports_forwarding_adapter_as_shared_and_requires_backend(doctor_module, repo_fixture):
+    config = _write_policy(repo_fixture)
+    _write_codex_config(repo_fixture, config)
+    assert doctor_module.validate_repo_local_codex_config(repo_fixture, config)["mode"] == "codex_shared"
+    (repo_fixture.parent / "runtime/gpu_mcp_backend.py").unlink()
+    with pytest.raises(doctor_module.DoctorError, match="gpu_mcp_backend.py is missing"):
+        doctor_module.validate_repo_local_codex_config(repo_fixture, config)
 
 
 def test_doctor_rejects_malformed_or_missing_policy_file(doctor_module, repo_fixture):
