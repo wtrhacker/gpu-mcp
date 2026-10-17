@@ -31,7 +31,23 @@ def request(info, path, *, payload=None, human=False, timeout=120):
         if not human:
             raise PermissionError('saved monitor data is read-only and human-only')
         return info.request(path)
-    return backend_request(info, path, payload=payload, human=human, timeout=timeout)
+    saved = info.get('_viewer_saved')
+    if saved is not None and log_route and parts[3] in info.get('_viewer_saved_job_ids', set()):
+        return saved.request(path)
+    result = backend_request(info, path, payload=payload, human=human, timeout=timeout)
+    if saved is not None and parsed.path == '/human/snapshot':
+        # The human can inspect every repository job. Legacy records stay
+        # display data; never import them into the backend's ownership store.
+        history = saved.snapshot()
+        live_ids = {job['job_id'] for job in result['jobs']}
+        older = [dict(job, saved_only=True) for job in history['jobs'] if job['job_id'] not in live_ids]
+        info['_viewer_saved_job_ids'] = {job['job_id'] for job in older}
+        jobs = sorted(result['jobs'] + older, key=lambda job: job['job_id'], reverse=True)
+        notice = result.get('notice') or history.get('notice') or ''
+        if older:
+            notice = (notice + f' {len(older)} jobs show saved status from their original controllers.').strip()
+        result = dict(result, jobs=jobs, notice=notice)
+    return result
 
 
 def connect_viewer(config, *, base=None):
@@ -56,7 +72,8 @@ def connect_viewer(config, *, base=None):
             health = request(info, '/health', timeout=3)
             if health.get('server_instance_id') != info.get('server_instance_id'):
                 raise ValueError('the live backend identity changed')
-            return dict(info, _viewer_state_root=str(root))
+            return dict(info, _viewer_state_root=str(root),
+                        _viewer_saved=SavedViewer(config, root, notice=''))
         except (OSError, ValueError, KeyError, AttributeError, TypeError) as exc:
             return SavedViewer(config, root, notice='Saved status; backend unavailable: ' + str(exc))
     return SavedViewer(config, root)
@@ -142,16 +159,22 @@ def view(screen, info, *, chooser=False):
         line(1, '  '.join(f'[{page.title()}]' if page == mode else page.title() for page in pages), curses.A_BOLD)
         line(2, 'Search: ' + (draft[:cursor] + '▏' + draft[cursor:] if searching else query or '/ to search saved jobs'))
         health = snapshot.get("health", {})
-        reservation_label = 'Saved GPU reservations' if snapshot.get('saved_only') else 'Active GPU reservations'
-        line(3, f"{reservation_label}: {len(active_reservations)} | Jobs: {len(jobs)}/{len(all_jobs)}"
+        saved_reservations = sum(bool(r.get('saved_only')) for r in active_reservations)
+        if snapshot.get('saved_only'):
+            reservations = f'Saved GPU reservations: {len(active_reservations)}'
+        else:
+            reservations = f'Active GPU reservations: {len(active_reservations) - saved_reservations}'
+            if saved_reservations:
+                reservations += f' | Saved GPU reservations: {saved_reservations}'
+        line(3, f"{reservations} | Jobs: {len(jobs)}/{len(all_jobs)}"
              + (' | GPU reservations only' if reservations_only else ''))
         help_text = ('Enter apply  Esc cancel  Ctrl+U clear' if searching else
                      '←→ pages  ↑↓ select/scroll  / search  v GPU  r refresh  Esc close'
                      + ('  c parent/case' if cases else '')
                      + ('  b repos' if chooser else ''))
         line(height - 2, help_text)
-        issue = error or snapshot.get('notice') or next((f'{name}: {value}' for name, value in health.items()
-                              if value not in ('ready', 'starting', None)), '')
+        issue = error or next((f'{name}: {value}' for name, value in health.items()
+                              if value not in ('ready', 'starting', None)), '') or snapshot.get('notice')
         if issue:
             line(height - 3, issue)
         if mode == 'jobs':
@@ -184,7 +207,8 @@ def view(screen, info, *, chooser=False):
                     displayed['progress'] = cached['progress']
                 row = task_row(displayed)
                 tag = f"[{row['role']}] " if row['role'] else ''
-                status = ('running' if item.get('job_lifecycle') == 'running' and not snapshot.get('saved_only')
+                status = ('running' if item.get('job_lifecycle') == 'running'
+                          and not snapshot.get('saved_only') and not item.get('saved_only')
                           else row['status'])
                 timing = f" / {row['elapsed']}" if row['elapsed'] != '—' else ''
                 title_width = max(8, width - len(tag) - len(row['resource']) - len(status) - len(timing) - 10)

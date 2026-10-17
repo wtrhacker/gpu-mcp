@@ -179,3 +179,79 @@ def test_live_viewer_cannot_issue_lifecycle_or_notification_mutations(monkeypatc
             monitor.request({}, route, human=True)
     with pytest.raises(PermissionError):
         monitor.request({}, '/human/snapshot', human=True, payload={})
+
+
+@pytest.mark.parametrize('shared_jobs', ['empty', 'different_job', 'same_job'])
+def test_live_monitor_keeps_legacy_history_without_adopting_jobs(saved_repo, monkeypatch, shared_jobs):
+    config, base, record, path = saved_repo
+    before = path.read_bytes()
+    info = {'config_path': str(config), 'server_instance_id': 'live-backend'}
+    live = dict(record, origin_thread_id='shared-owner', job_title='Shared run',
+                job_lifecycle='succeeded', active_reservation=False)
+    if shared_jobs == 'different_job':
+        live['job_id'] = 'job-20261014T000000Z-shared'
+    jobs = [] if shared_jobs == 'empty' else [live]
+    calls = []
+    monkeypatch.setattr(monitor, 'read_info', lambda *a: info)
+    monkeypatch.setattr(monitor, 'alive', lambda *a: True)
+
+    def remote(info, route, **kwargs):
+        assert kwargs.get('payload') is None
+        calls.append(route)
+        if route == '/health':
+            return {'server_instance_id': 'live-backend'}
+        if route == '/human/snapshot':
+            return {'repo_root': str(config.parent), 'jobs': list(jobs), 'events': [], 'health': {}}
+        assert route == f'/human/jobs/{live["job_id"]}/logs'
+        return {'tail': 'shared protected log\n'}
+
+    monkeypatch.setattr(monitor, 'backend_request', remote)
+    viewer = monitor.connect_viewer(config, base=base)
+    snapshot = monitor.request(viewer, '/human/snapshot', human=True)
+    rows = {job['job_id']: job for job in snapshot['jobs']}
+    if shared_jobs == 'same_job':
+        assert rows == {live['job_id']: live}
+        assert monitor.request(viewer, f'/human/jobs/{live["job_id"]}/logs', human=True)['tail'] == 'shared protected log\n'
+    else:
+        assert rows[record['job_id']] == dict(record, saved_only=True)
+        if jobs:
+            assert rows[live['job_id']] == live
+        calls_before_log = list(calls)
+        assert '"current": 2' in monitor.request(viewer, f'/human/jobs/{record["job_id"]}/logs', human=True)['tail']
+        assert calls == calls_before_log, 'legacy log inspection must not request backend lifecycle access'
+        # Updates from the original controller remain visible while shared mode is live.
+        record.update(job_lifecycle='succeeded', active_reservation=False)
+        path.write_text(json.dumps(record))
+        refreshed = monitor.request(viewer, '/human/snapshot', human=True)
+        assert next(job for job in refreshed['jobs'] if job['job_id'] == record['job_id'])['job_lifecycle'] == 'succeeded'
+    assert not base.exists(), 'viewing must not create an ownership store'
+    assert info == {'config_path': str(config), 'server_instance_id': 'live-backend'}
+    if shared_jobs == 'same_job':
+        assert path.read_bytes() == before
+
+
+def test_live_panel_shows_legacy_jobs_and_saved_reservations(saved_repo, monkeypatch):
+    config, base, record, path = saved_repo
+    before = path.read_bytes()
+    info = {'config_path': str(config), 'server_instance_id': 'live-backend'}
+    monkeypatch.setattr(monitor, 'read_info', lambda *a: info)
+    monkeypatch.setattr(monitor, 'alive', lambda *a: True)
+
+    def remote(info, route, **kwargs):
+        if route == '/health':
+            return {'server_instance_id': 'live-backend'}
+        assert route == '/human/snapshot'
+        return {'repo_root': str(config.parent), 'jobs': [], 'events': [], 'health': {}}
+
+    monkeypatch.setattr(monitor, 'backend_request', remote)
+    for name in ('curs_set', 'set_escdelay'):
+        monkeypatch.setattr(monitor.curses, name, lambda value: None)
+    monkeypatch.setattr(monitor.curses, 'has_colors', lambda: False)
+    monkeypatch.setattr(monitor.time, 'monotonic', lambda: 0)
+    screen = Screen([27])
+    monitor.view(screen, monitor.connect_viewer(config, base=base))
+    frame = screen.frames[0]
+    assert 'Legacy run' in frame and 'running (last known)' in frame
+    assert 'Active GPU reservations: 0 | Saved GPU reservations: 1' in frame
+    assert 'Jobs: 1/1' in frame and '1 jobs show saved status' in frame
+    assert path.read_bytes() == before and not base.exists()

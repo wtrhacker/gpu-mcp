@@ -277,6 +277,13 @@ job IDs and reservation state. The header counts recorded active GPU reservation
 across all conversations in this repository; `v` toggles a view of just those
 reservations. CPU jobs and released GPU reservations are excluded from that filter.
 
+A live shared backend does not hide earlier jobs. The human monitor combines its
+live records with saved repository history, preferring live data for matching
+job IDs. Jobs known only through saved records retain last-known status and
+separate saved-reservation counts; their recorded logs and MPS cases remain
+readable. This display does not import those jobs into the backend, assign a
+conversation owner, or expose repository-wide history through agent tools.
+
 Press `/` inside the viewer to search saved jobs by title, script, arguments,
 host/GPU, role, status, session or job ID. Matching ignores case and requires
 every query word. Completed jobs remain searchable. Enter applies the query;
