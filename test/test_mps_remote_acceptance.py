@@ -206,3 +206,163 @@ context.setPositions([[0.1,0.2,0.3]])''')
                 wait(lambda: server._mps_manager().rpc('status', record['mps_spec'])['state'] == 'gone')
             server.manage_gpu_job(job_id=job, action='finish')
         server.HEARTBEAT_MANAGER.stop()
+
+
+@pytest.mark.parametrize('stop_group', [False, True], ids=['completion', 'parent-stop'])
+def test_private_mps_coexists_with_ordinary_cuda_and_leaves_it_running(monkeypatch, stop_group):
+    """Own the test card, then create an unrelated CUDA context before admission.
+
+    Only the hardware-probe seam is wrapped to prepare that starting condition.
+    Both admission decisions, the MPS service, guarded clients and cleanup are
+    real. The ordinary process is test-owned and exits on a sentinel; production
+    jobs and services are never used as fixtures.
+    """
+    from gpu_mcp_builds import BuildManager
+    host = os.environ['GPU_MCP_MPS_TEST_HOST']
+    preferred_gpu = int(os.environ.get('GPU_MCP_MPS_TEST_GPU', '0'))
+    root = ROOT / 'test_mcp_repos' / ('gpu-mcp-mps-sharing-' + secrets.token_hex(5))
+    repo = root / 'repo'
+    for name in ('jobs', 'results', 'logs'):
+        (repo / name).mkdir(parents=True)
+    config = repo / 'gpu-mcp.toml'
+    config.write_text(f"schema_version=1\nrepo_root={str(repo)!r}\nnodes=[{host!r}]\n"
+                      "script_roots=['jobs']\nwrite_roots=['results']\noutput_roots=['logs']\n")
+    approval = root / 'approved.json'
+    approve_policy(load_policy(config), store_path=approval, approved_by='pytest',
+                   diff_summary=['isolated ordinary-CUDA and private-MPS coexistence test'])
+    for name in ('GPU_MCP_TEST_RESERVATION_ROOT', 'GPU_MCP_TEST_DISABLE_POLICY_APPROVAL',
+                 'GPU_MCP_TEST_MPS_DRIVER', 'GPU_MCP_CODEX_SHARED'):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv('GPU_MCP_TEST_POLICY_APPROVAL_STORE', str(approval))
+    monkeypatch.setenv('GPU_MCP_TEST_MPS_CONTROL_ROOT', str(root / 'control'))
+    server = _import_server_with_config(monkeypatch, config)
+    source = '''import json, sys, time
+from pathlib import Path
+import torch
+output, stop = Path(sys.argv[1]), Path(sys.argv[2])
+duration = float(sys.argv[3])
+x = torch.ones((64, 64), device='cuda')
+started, steps = time.monotonic(), 0
+while time.monotonic() - started < duration and not stop.exists():
+    y = x @ x
+    torch.cuda.synchronize()
+    assert float(y[0, 0]) == 64
+    steps += 1
+    output.write_text(json.dumps({'steps': steps, 'value': 64}))
+    time.sleep(.1)
+'''
+    script = repo / 'jobs' / 'cuda_case.py'
+    script.write_text(source)
+    ordinary_output, ordinary_stop = repo / 'results' / 'ordinary.json', repo / 'results' / 'ordinary.stop'
+    outside = {}
+    job = None
+    def remote(code, *args):
+        command = shlex.join([server.PYTHON, '-B', '-I', '-c', code, *map(str, args)])
+        raw = server._host_run(host, command, timeout=20)
+        assert raw is not None, server._host_run_error(host, command)
+        return json.loads(raw)
+    def ordinary_snapshot():
+        return remote('''import json,sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import gpu_mcp_mps_worker as worker
+try:
+    progress = json.loads(Path(sys.argv[3]).read_text())
+except (OSError, ValueError):
+    progress = {}
+print(json.dumps({'alive': worker.same_process(json.loads(sys.argv[2])), **progress}))
+''', ROOT, json.dumps(outside), ordinary_output)
+    original_probe = BuildManager.probe_gpu
+    def prepare_ordinary_process(manager, selected_host, selected_gpu, *, allow_existing_cuda=False):
+        assert allow_existing_cuda and not outside
+        # MpsManager acquired its normal reservation before calling this probe.
+        # Verify a genuinely unused card before starting our small ordinary job.
+        gpu_uuid, _ = original_probe(manager, selected_host, selected_gpu)
+        outside.update(remote('''import json,os,subprocess,sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import gpu_mcp_mps_worker as worker
+env = dict(os.environ, CUDA_VISIBLE_DEVICES=sys.argv[2], CUDA_MPS_PIPE_DIRECTORY='')
+with open(sys.argv[6], 'xb') as log:
+    process = subprocess.Popen([sys.executable, '-B', sys.argv[3], sys.argv[4], sys.argv[5], '120'],
+        env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+print(json.dumps(worker.identity(process.pid)))
+''', ROOT, gpu_uuid, script, ordinary_output, ordinary_stop, repo / 'logs' / 'ordinary.log'))
+        wait(lambda: ordinary_snapshot().get('steps', 0) >= 2)
+        # Prove the opt-in changes admission for this exact real CUDA process.
+        with pytest.raises(ValueError, match='already has a compute process'):
+            original_probe(manager, selected_host, selected_gpu)
+        return original_probe(manager, selected_host, selected_gpu, allow_existing_cuda=True)
+    monkeypatch.setattr(BuildManager, 'probe_gpu', prepare_ordinary_process)
+    try:
+        inventory = json.loads(server.check_gpus(samples=1))
+        available = [g['gpu_index'] for g in inventory.get('gpus', []) if g.get('availability') == 'available']
+        assert available, inventory
+        gpu = preferred_gpu if preferred_gpu in available else available[0]
+        entries = [{'case_id': 'managed', 'script_path': 'jobs/cuda_case.py',
+                    'args': ['results/managed.json', 'results/managed.stop', '30' if stop_group else '8'],
+                    'output_file': 'logs/managed.log'}]
+        launched = json.loads(server.run_python_on_gpu(host=host, gpu_index=gpu, mps=True,
+            mps_allow_existing_cuda=True, runs=entries, max_concurrent=1, job_role='one_off',
+            cadence_hint_sec=1, job_title='Private MPS coexistence acceptance'))
+        job = launched.get('job_id')
+        assert launched['status'] == 'launched' and launched['mps_allow_existing_cuda'], launched
+        def status():
+            result = json.loads(server.manage_gpu_job(job_id=job, action='status', detail='full',
+                early_poll_reason='verify coexistence and preserve the independent CUDA process'))
+            assert result['status'] == 'ok', result
+            return result
+        def running():
+            status()
+            cases = server._mps_manager().read(job)['cases']
+            return cases and cases[0]['state'] == 'running'
+        wait(running)
+        captured = server._mps_manager().read(job)['mps_spec']
+        service = server._mps_manager().rpc('status', captured)
+        client_pids = remote(r'''import json,os,subprocess,sys
+env=dict(os.environ, CUDA_MPS_PIPE_DIRECTORY=sys.argv[2], CUDA_MPS_PROTOCOL_VERSION='2')
+result=subprocess.run([sys.argv[1]], input='get_client_list '+sys.argv[3]+'\n',
+                      env=env, capture_output=True, text=True, check=True, timeout=5)
+print(json.dumps([int(v) for v in result.stdout.split() if v.isdigit()]))
+''', captured['mps_binary'], captured['pipe_directory'], service['server']['pid'])
+        assert outside['pid'] not in client_pids
+        assert service['cases'][0]['process']['pid'] in client_pids
+        before = ordinary_snapshot()
+        assert before['alive'] and before['steps'] > 0
+        if stop_group:
+            stopped = json.loads(server.manage_gpu_job(job_id=job, action='stop'))
+            assert stopped['status'] == 'stop_queued', stopped
+        def completed():
+            value = status()
+            return value if not value['active_reservation'] else None
+        final = wait(completed)
+        expected = 'failed' if stop_group else 'succeeded'
+        assert final['job_lifecycle'] == expected and final['mps_allow_existing_cuda'], final
+        observed = server._mps_manager().rpc('status', captured)
+        assert observed['state'] == 'gone' and not observed['live_processes']
+        at_cleanup = ordinary_snapshot()
+        assert at_cleanup['alive']
+        def progressed_after_cleanup():
+            value = ordinary_snapshot()
+            return value if value.get('alive') and value.get('steps', 0) > at_cleanup['steps'] else None
+        after = wait(progressed_after_cleanup)
+        assert outside['pid'] not in {receipt['process']['pid'] for receipt in observed['termination_receipts']}
+        (root / 'acceptance.json').write_text(json.dumps({'host': host, 'gpu': gpu,
+            'gpu_uuid': captured['gpu_uuid'], 'stop_group': stop_group, 'ordinary_process': outside,
+            'ordinary_before_cleanup': before, 'ordinary_at_cleanup': at_cleanup,
+            'ordinary_after_cleanup': after,
+            'private_mps_client_pids': client_pids, 'final': final, 'state': observed}, indent=2))
+        print('MPS coexistence acceptance evidence:', root)
+    finally:
+        try:
+            if job:
+                saved = server._mps_manager().read(job)
+                if server._mps_manager().rpc('status', saved['mps_spec'])['state'] != 'gone':
+                    server.manage_gpu_job(job_id=job, action='stop')
+                    wait(lambda: server._mps_manager().rpc('status', saved['mps_spec'])['state'] == 'gone')
+                server.manage_gpu_job(job_id=job, action='finish')
+        finally:
+            if outside:
+                remote('from pathlib import Path; import json,sys; Path(sys.argv[1]).touch(); print(json.dumps(True))', ordinary_stop)
+                wait(lambda: not ordinary_snapshot()['alive'], seconds=20)
+            server.HEARTBEAT_MANAGER.stop()

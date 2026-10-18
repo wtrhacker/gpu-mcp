@@ -140,6 +140,18 @@ PyTorch/OpenMM CUDA clients on MPS protocol 2. Independent review also added
 regressions for broken parent pipes, missing identity fields, replacement
 bookings, obsolete case events, shutdown admission and narrow terminal views.
 
+## Amendment: explicit coexistence with ordinary CUDA processes
+
+`mps_allow_existing_cuda=true` permits an explicitly shared MPS launch when
+ordinary CUDA processes already occupy a Default-mode GPU. The default remains
+an empty-card check. Model and free-memory policy, the physical-GPU reservation,
+private endpoint, client verification and process-specific cleanup still apply.
+A detected MPS server or an unidentified compute process is refused in sharing
+mode. This does not attach to an external service, change compute mode, adopt
+existing processes or permit overlapping GPU MCP reservations. Existing jobs
+continue outside the managed MPS group and share time and memory with it.
+GPU-assisted builds retain their empty-card requirement.
+
 ## Sources
 
 - [NVIDIA client termination](https://docs.nvidia.com/deploy/mps/latest/when-to-use-mps.html#client-early-termination)

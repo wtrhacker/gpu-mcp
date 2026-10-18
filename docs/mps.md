@@ -41,6 +41,26 @@ an ordinary main job. Checking intervals and descriptive durations retain their
 existing meanings. `script_path`, top-level `args` and `async_mode` are for
 ordinary jobs; do not combine them with `mps=True`.
 
+## Sharing with existing CUDA jobs
+
+By default, a managed MPS sweep starts only when the card has no compute
+processes. Use `check_gpus` to inspect current load, free memory and reservations.
+If a notebook or another ordinary CUDA job already uses the card and you intend
+to share it, add `mps_allow_existing_cuda=True` to the MPS launch above.
+The GPU must use `Default` compute mode and still meet the configured memory
+and GPU-model requirements. GPU MCP does not change the compute mode.
+
+GPU MCP creates its own private MPS service. Existing jobs keep their original
+CUDA contexts; they do not join the new group. Stopping a case or the whole sweep
+controls only the sweep's processes and service. The jobs share GPU time and
+memory, so their speeds and available memory can change.
+
+This option does not bypass another GPU MCP reservation or attach to an MPS
+service started by another manager. An existing MPS server on the selected GPU
+is refused. GPU MCP still reserves the card against other managed launches;
+that reservation does not claim ownership of processes started outside GPU MCP.
+Launch and status replies record whether sharing was requested.
+
 ## Individual and parent controls
 
 ```python

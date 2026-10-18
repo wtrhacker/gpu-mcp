@@ -141,7 +141,8 @@ class MpsManager:
 
     def launch(self, host, gpu_index, runs, max_concurrent=4, protocol=2, output_file=None,
                job_role=None, expected_duration_sec=None, cadence_hint_sec=None, smoke_job_id=None,
-               smoke_skip_reason=None, smoke_cadence_representative=False, job_title=None):
+               smoke_skip_reason=None, smoke_cadence_representative=False, job_title=None,
+               allow_existing_cuda=False):
         s = self.server
         if not s._is_allowed_host(host) or not isinstance(gpu_index, int) or isinstance(gpu_index, bool) or gpu_index < 0:
             raise ValueError('select an approved host and a non-negative GPU index')
@@ -149,6 +150,8 @@ class MpsManager:
             raise ValueError('max_concurrent must be an integer from 1 to 32')
         if isinstance(protocol, bool) or protocol != 2:
             raise ValueError('this release supports MPS protocol 2; protocol 3 requires separate acceptance')
+        if type(allow_existing_cuda) is not bool:
+            raise ValueError('mps_allow_existing_cuda must be a boolean')
         cases = self.validate_runs(runs)
         leases.ensure_repo_job_state_root(s.REPO_ROOT)
         parent_log = s._validate_output_path(output_file if output_file is not None else
@@ -181,7 +184,8 @@ class MpsManager:
             phase7_poll_discipline=True, cadence_basis=basis, job_title=s._validated_job_title(job_title),
             smoke_job_id=smoke_job_id, smoke_skip_reason=s._nonempty_text(smoke_skip_reason),
             expected_duration_sec=expected_duration_sec,
-            cases=[], max_concurrent=max_concurrent, launch_mode='ssh' if not s._is_local_host(host) else 'local',
+            cases=[], max_concurrent=max_concurrent, mps_allow_existing_cuda=allow_existing_cuda,
+            launch_mode='ssh' if not s._is_local_host(host) else 'local',
             ready_file=str(leases.outcome_record_path(s.REPO_ROOT, job, attempt).with_name('mps-ready')))
         nonce = secrets.token_hex(24)
         token = hashlib.sha256((job + attempt).encode()).hexdigest()[:20]
@@ -192,6 +196,7 @@ class MpsManager:
             'write_roots': [str(p) for p in s.APPROVED_WRITE_ROOTS],
             'output_roots': [str(p) for p in s.APPROVED_OUTPUT_ROOTS], 'runs': cases,
             'max_concurrent': max_concurrent, 'protocol': protocol, 'output_file': str(parent_log),
+            'allow_existing_cuda': allow_existing_cuda,
             'ready_file': record['ready_file'], 'pipe_directory': f'/tmp/gpu-mcp-mps-{os.getuid()}-{token}',
             'job_env': s._gpu_job_env(gpu_index), **support}
         if os.environ.get('PYTEST_CURRENT_TEST'):
@@ -217,7 +222,14 @@ class MpsManager:
             if support.get('test_driver'):
                 spec['gpu_uuid'] = 'GPU-' + token
             else:
-                spec['gpu_uuid'], _ = s._build_manager().probe_gpu(host, gpu_index)
+                try:
+                    spec['gpu_uuid'], _ = s._build_manager().probe_gpu(
+                        host, gpu_index, allow_existing_cuda=allow_existing_cuda)
+                except ValueError as exc:
+                    if not allow_existing_cuda and 'already has a compute process' in str(exc):
+                        raise ValueError(str(exc) + '; inspect the GPU occupants, then use '
+                            'mps_allow_existing_cuda=true to share with ordinary CUDA processes') from exc
+                    raise
                 raw = s._host_run(host, f'nvidia-smi -i {gpu_index} --query-gpu=compute_cap --format=csv,noheader', timeout=10)
                 if raw is None or float(raw.strip()) < 7:
                     raise ValueError('safe per-client MPS termination requires a Volta-or-newer GPU')
@@ -256,6 +268,7 @@ class MpsManager:
             'attempt_id': record['active_attempt_id'], 'job_kind': 'mps', 'job_lifecycle': record['job_lifecycle'],
             'host': record['host'], 'gpu_index': record['gpu_index'], 'case_counts': counts,
             'max_concurrent': record['max_concurrent'], 'active_reservation': record.get('active_reservation'),
+            'mps_allow_existing_cuda': record.get('mps_allow_existing_cuda', False),
             'output_file': record['output_file'], 'next_poll_after': record.get('next_poll_after'),
             'last_status_checked_at': record.get('last_status_checked_at'), 'outcome': record.get('outcome')}
         if case:

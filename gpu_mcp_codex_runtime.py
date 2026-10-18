@@ -257,7 +257,8 @@ class CodexRuntime:
                   "host", "gpu_index", "output", "output_file", "artifact", "next_poll_after",
                   "artifact_path", "smoke_evidence", "allowed_actions", "polling_state", "watch",
                   "last_status_checked_at", "remote_inspection_performed"}
-        fields.update({'case', 'case_counts', 'max_concurrent', 'request_id', 'active_reservation'})
+        fields.update({'case', 'case_counts', 'max_concurrent', 'request_id', 'active_reservation',
+                       'mps_allow_existing_cuda'})
         compact = {k: v for k, v in payload.items() if k in fields and v not in (None, "")}
         if compact.get('case'):
             compact['case'] = {k:v for k,v in compact['case'].items() if k in {

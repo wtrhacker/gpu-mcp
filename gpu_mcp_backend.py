@@ -4799,6 +4799,7 @@ def run_python_on_gpu(
     runs: Optional[list[dict]] = None,
     max_concurrent: Optional[int] = None,
     mps_protocol: int = 2,
+    mps_allow_existing_cuda: bool = False,
 ):
     """Launch an approved Python file as a managed GPU job and return its handle.
 
@@ -4817,9 +4818,16 @@ def run_python_on_gpu(
     a distinct output_file, optional case_id and job_title. Normal case failures
     preserve siblings; retries are never automatic. Scripts retain the
     subprocess ban. Use manage_gpu_job(case_id=...) for individual controls.
+    By default MPS requires no existing compute processes. After inspecting the
+    occupants, ``mps_allow_existing_cuda=true`` permits ordinary CUDA processes
+    alongside the private MPS group on a Default-mode GPU. It does not join an
+    existing MPS service or override GPU MCP reservations. Other processes stay
+    outside this job's controls and cleanup, and compete for GPU time and memory.
     """
     if not isinstance(mps, bool):
         return _launch_refusal('mps must be a boolean')
+    if type(mps_allow_existing_cuda) is not bool:
+        return _launch_refusal('mps_allow_existing_cuda must be a boolean')
     if mps:
         if script_path is not None or args is not None or async_mode is not None:
             return _launch_refusal('MPS uses runs; do not mix single-script launch fields')
@@ -4828,10 +4836,11 @@ def run_python_on_gpu(
                 max_concurrent=4 if max_concurrent is None else max_concurrent, protocol=mps_protocol,
                 output_file=output_file, job_role=job_role, expected_duration_sec=expected_duration_sec,
                 cadence_hint_sec=cadence_hint_sec, smoke_job_id=smoke_job_id, smoke_skip_reason=smoke_skip_reason,
-                smoke_cadence_representative=smoke_cadence_representative, job_title=job_title))
+                smoke_cadence_representative=smoke_cadence_representative, job_title=job_title,
+                allow_existing_cuda=mps_allow_existing_cuda))
         except (ValueError, RuntimeError, OSError, TypeError) as exc:
             return _launch_refusal(str(exc)[:1000], host=host, gpu_index=gpu_index)
-    if runs is not None or max_concurrent is not None or mps_protocol != 2:
+    if runs is not None or max_concurrent is not None or mps_protocol != 2 or mps_allow_existing_cuda:
         return _launch_refusal('sweep fields require mps=true')
     if not isinstance(script_path, str):
         return _launch_refusal('ordinary GPU execution requires script_path')

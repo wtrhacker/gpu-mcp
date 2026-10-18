@@ -707,3 +707,114 @@ def test_mps_completion_mirror_cannot_override_protected_outcome(mps):
     with f.runtime.acting_as(f.owner):
         assert f.server._read_outcome_record(record) is None
     assert status(f, job)['job_lifecycle'] == 'failed'
+
+
+@pytest.fixture
+def gpu_probe(mps, monkeypatch):
+    """Keep admission real while supplying controlled, read-only GPU observations."""
+    from gpu_mcp_mps import MpsManager
+    f = mps
+    observed = {'mode': 'Default', 'free': 22000, 'processes': 'GPU-selected, 42, /usr/bin/python'}
+    monkeypatch.setattr(MpsManager, 'capability', lambda *a: {'mps_binary': '/usr/bin/nvidia-cuda-mps-control'})
+    def host_run(host, command, **kwargs):
+        if '--query-compute-apps' in command:
+            return observed['processes']
+        if command == 'nvidia-smi -i 0 -q -x':
+            return ('<nvidia_smi_log><gpu><uuid>GPU-selected</uuid><minor_number>3</minor_number>'
+                    '<product_name>GPU</product_name><compute_mode>' + observed['mode'] + '</compute_mode>'
+                    '<fb_memory_usage><free>' + str(observed['free']) + ' MiB</free></fb_memory_usage>'
+                    '</gpu></nvidia_smi_log>')
+        raise AssertionError('Admission must refuse before starting processes: ' + command)
+    monkeypatch.setattr(f.server, '_host_run', host_run)
+    return f, observed
+
+
+def test_sharing_requires_explicit_choice_and_default_refusal_explains_it(gpu_probe):
+    f, observed = gpu_probe
+    result = call(f, 'run_python_on_gpu', host='fixture', gpu_index=0, mps=True,
+                  runs=[entry(f, 'busy')])
+    assert result['status'] == 'refused' and 'mps_allow_existing_cuda=true' in result['reason']
+    assert f.runtime.store.records() == []
+    assert not leases.reservation_dir(leases.reservation_registry_root(), 'fixture.gpu0').exists()
+    # The same observed card is admissible with explicit ordinary-CUDA sharing.
+    uuid, devices = f.server._build_manager().probe_gpu('fixture', 0, allow_existing_cuda=True)
+    assert uuid == 'GPU-selected' and '/dev/nvidia3' in devices
+    # GPU-assisted builds still use the strict default.
+    with pytest.raises(ValueError, match='already has a compute process'):
+        f.server._build_manager().probe_gpu('fixture', 0)
+
+
+@pytest.mark.parametrize('field,value,reason', [
+    ('mode', 'Exclusive_Process', 'Default compute mode'),
+    ('mode', 'Prohibited', 'Default compute mode'),
+    ('mode', '', 'Default compute mode'),
+    ('free', 1023, 'insufficient free memory'),
+    ('processes', 'GPU-selected, 42, /usr/bin/nvidia-cuda-mps-server', 'MPS server'),
+    ('processes', 'GPU-selected, 42, nvidia-cuda-mps-server', 'MPS server'),
+    ('processes', 'GPU-selected, 42, [Not Found]', 'cannot identify'),
+    ('processes', 'GPU-selected, 42, [N/A]', 'cannot identify'),
+    ('processes', 'GPU-selected, 42, [Insufficient Permissions]', 'cannot identify'),
+    ('processes', 'unexpected diagnostic instead of a process table', 'cannot identify'),
+    ('processes', 'GPU-selected, 42, ', 'cannot identify'),
+    ('processes', 'GPU-selected, unknown, /usr/bin/python', 'cannot identify'),
+    ('processes', 'GPU-selected, 0, /usr/bin/python', 'cannot identify'),
+    ('processes', 'GPU-selected, 42', 'cannot identify'),
+    ('processes', None, 'compute-process availability'),
+])
+def test_shared_admission_refusals_release_only_the_attempted_reservation(gpu_probe, field, value, reason):
+    from dataclasses import replace
+    f, observed = gpu_probe
+    f.server.CONFIG_POLICY = replace(f.server.CONFIG_POLICY, min_free_memory_mib=1024)
+    observed[field] = value
+    result = call(f, 'run_python_on_gpu', host='fixture', gpu_index=0, mps=True,
+                  mps_allow_existing_cuda=True, runs=[entry(f, 'refused')])
+    assert result['status'] == 'refused' and reason in result['reason'], result
+    assert f.runtime.store.records() == []
+    assert not leases.reservation_dir(leases.reservation_registry_root(), 'fixture.gpu0').exists()
+
+
+def test_shared_probe_is_scoped_to_selected_gpu_and_preserves_model_policy(gpu_probe):
+    from dataclasses import replace
+    f, observed = gpu_probe
+    observed['processes'] += '\nGPU-other, 99, nvidia-cuda-mps-server'
+    manager = f.server._build_manager()
+    assert manager.probe_gpu('fixture', 0, allow_existing_cuda=True)[0] == 'GPU-selected'
+    f.server.CONFIG_POLICY = replace(f.server.CONFIG_POLICY, allowed_gpu_names=('Different GPU',))
+    with pytest.raises(ValueError, match='model is not approved'):
+        manager.probe_gpu('fixture', 0, allow_existing_cuda=True)
+
+
+@pytest.mark.parametrize('value', ['yes', 1, None])
+def test_sharing_option_requires_a_boolean(mps, value):
+    f = mps
+    result = call(f, 'run_python_on_gpu', host='fixture', gpu_index=0, mps=True,
+                  mps_allow_existing_cuda=value, runs=[entry(f, 'invalid')])
+    assert result['status'] == 'refused' and 'must be a boolean' in result['reason']
+    assert f.runtime.store.records() == []
+
+
+def test_sharing_option_requires_mps(mps):
+    f = mps
+    result = call(f, 'run_python_on_gpu', host='fixture', gpu_index=0,
+                  script_path='jobs/task.py', mps_allow_existing_cuda=True)
+    assert result['status'] == 'refused' and 'require mps=true' in result['reason']
+    assert f.runtime.store.records() == []
+
+
+def test_shared_launch_records_choice_and_cannot_override_existing_booking(mps):
+    f = mps
+    launched = call(f, 'run_python_on_gpu', host='fixture', gpu_index=0, mps=True,
+                   mps_allow_existing_cuda=True, runs=[entry(f, 'owned', delay=1)],
+                   job_role='one_off', cadence_hint_sec=1)
+    assert launched['status'] == 'launched' and launched['mps_allow_existing_cuda'] is True
+    job = launched['job_id']
+    saved = f.runtime.store.get(job)
+    assert saved['mps_allow_existing_cuda'] is True and saved['mps_spec']['allow_existing_cuda'] is True
+    reservation = leases.reservation_dir(leases.reservation_registry_root(), 'fixture.gpu0') / 'metadata.json'
+    identity = json.loads(reservation.read_text())
+    denied = call(f, 'run_python_on_gpu', host='fixture', gpu_index=0, mps=True,
+                  mps_allow_existing_cuda=True, runs=[entry(f, 'overlap')])
+    assert denied['status'] == 'refused'
+    assert json.loads(reservation.read_text())['job_id'] == identity['job_id']
+    until(lambda: status(f, job)['job_lifecycle'] == 'succeeded')
+    assert status(f, job)['mps_allow_existing_cuda'] is True

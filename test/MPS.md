@@ -55,6 +55,25 @@ authority, logs and `acceptance.json` stay under ignored
 `test_mcp_repos/gpu-mcp-mps-*`; reusable tests and this guide are versioned.
 No Codex daemon restart or global configuration change is involved.
 
+The coexistence test starts a small ordinary CUDA process after obtaining its
+own GPU reservation, then exercises the real admission check with and without
+`mps_allow_existing_cuda`. The ordinary process uses no MPS endpoint. The test
+verifies that the managed client attaches to the private service, then checks
+that the ordinary process keeps computing after both normal completion and an
+explicit parent stop. Its only external process is test-owned and exits through
+a stop file; existing lab jobs are not used as fixtures. Run just these cases:
+
+```bash
+GPU_MCP_RUN_MPS_REMOTE_TESTS=1 GPU_MCP_MPS_TEST_HOST=your-host \
+  python -m pytest -q -s test/test_mps_remote_acceptance.py -k coexists
+```
+
+Local admission regressions cover the explicit choice, Default compute mode,
+GPU model and memory policy, unknown process observations, external MPS servers,
+reservation conflicts and persistence of the sharing setting. Builds retain
+strict admission. These tests do not establish performance under contention or
+support for attaching to an externally managed MPS service.
+
 ## Evidence and Limits
 
 The first contracts exposed a Python build lacking the usual PID-handle

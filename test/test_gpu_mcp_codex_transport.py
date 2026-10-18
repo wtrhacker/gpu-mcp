@@ -163,7 +163,8 @@ def test_mps_case_tools_and_human_logs_use_the_actual_shared_http_routes(backend
     store.save(record, origin=origin)
     schemas = rpc(info, 'tools/list')['result']['tools']
     launch = next(t for t in schemas if t['name'] == 'run_python_on_gpu')['inputSchema']
-    assert {'mps','runs','max_concurrent'} <= set(launch['properties'])
+    assert {'mps','runs','max_concurrent','mps_allow_existing_cuda'} <= set(launch['properties'])
+    assert launch['properties']['mps_allow_existing_cuda']['default'] is False
     assert 'script_path' not in launch.get('required', [])
     for action in ('status','logs','stop','retry'):
         refused = tool(info, 'manage_gpu_job', {'job_id':record['job_id'],'case_id':'alpha','action':action}, foreign.thread_id)

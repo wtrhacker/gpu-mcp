@@ -99,7 +99,15 @@ class BuildManager:
                 'gpu_uuid', 'gpu_devices', 'worker_state_root', 'ready_file')
         return {key: record[key] for key in keys if key in record}
 
-    def probe_gpu(self, host, index):
+    def probe_gpu(self, host, index, *, allow_existing_cuda=False):
+        """Check identity, capacity and admission without controlling other processes.
+
+        Builds always require an idle card. Managed MPS may explicitly share a
+        Default-mode card with ordinary CUDA processes; those processes remain
+        outside its private service and are never part of its cleanup.
+        """
+        if type(allow_existing_cuda) is not bool:
+            raise ValueError('allow_existing_cuda must be a boolean')
         server = self.server
         command = f'nvidia-smi -i {index} -q -x'
         raw = server._host_run(host, command, timeout=10)
@@ -119,19 +127,32 @@ class BuildManager:
             raise ValueError('selected GPU model is not approved')
         if free < policy.min_free_memory_mib:
             raise ValueError('selected GPU has insufficient free memory')
-        process_command = 'nvidia-smi --query-compute-apps=gpu_uuid,pid --format=csv,noheader'
+        if not minor.isdigit() or not uuid.startswith('GPU-'):
+            raise ValueError('unsupported GPU device mapping')
+        if allow_existing_cuda and device.findtext('compute_mode', '').strip().lower() != 'default':
+            raise ValueError('sharing with existing CUDA processes requires Default compute mode; GPU MCP does not change it')
+        fields = 'gpu_uuid,pid,process_name' if allow_existing_cuda else 'gpu_uuid,pid'
+        process_command = f'nvidia-smi --query-compute-apps={fields} --format=csv,noheader'
         processes = server._host_run(host, process_command, timeout=10)
         if processes is None:
             raise ValueError('could not establish selected GPU compute-process availability')
-        compute = [line.split(',') for line in processes.splitlines()
-                   if line.split(',')[0].strip() == uuid]
-        if compute:
+        rows = [line.split(',', 2) for line in processes.splitlines() if line.strip()]
+        if allow_existing_cuda and any(len(row) != 3 or not row[0].strip().startswith('GPU-') for row in rows):
+            raise ValueError('cannot identify existing CUDA processes from the GPU query; inspect the GPU and retry')
+        compute = [row for row in rows if row[0].strip() == uuid]
+        if allow_existing_cuda:
+            for row in compute:
+                if (len(row) != 3 or not row[1].strip().isdigit() or int(row[1]) <= 0
+                        or not row[2].strip() or row[2].strip().startswith('[')
+                        or row[2].strip().lower() in {'n/a', 'not found', 'unknown', '?'}):
+                    raise ValueError('cannot identify an existing CUDA process; inspect the GPU and retry')
+                if 'nvidia-cuda-mps' in Path(row[2].strip()).name.lower():
+                    raise ValueError('selected GPU already has an MPS server; sharing permits ordinary CUDA processes, not another MPS service')
+        elif compute:
             if getattr(server, 'CODEX_RUNTIME', None) is not None:
                 raise ValueError('selected GPU already has a compute process')
             pids = ', '.join(row[1].strip() if len(row) > 1 else '?' for row in compute)
             raise ValueError(f'selected GPU already has a compute process (PID {pids})')
-        if not minor.isdigit() or not uuid.startswith('GPU-'):
-            raise ValueError('unsupported GPU device mapping')
         return uuid, [f'/dev/nvidia{minor}', '/dev/nvidiactl', '/dev/nvidia-uvm']
 
     def reserve(self, record):
