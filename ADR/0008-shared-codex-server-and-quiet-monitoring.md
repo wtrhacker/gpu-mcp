@@ -226,8 +226,12 @@ scientific progress or numerical correctness.
 Stable tool descriptions explain automatic checks, private results and explicit
 inspection. Returns and events carry current facts. Waiting for completion alone
 needs no repeated status/list calls; a concrete question or decision remains a
-valid reason to inspect. Completion supplies task state without requiring an
-acknowledgement tool call, `finish` call or immediate follow-up work.
+valid reason to inspect. Completion supplies verified job state without requiring
+a separate status acknowledgement or `finish` call. The event directs the agent
+back to the user's current objective and any unfinished work. A finished job does
+not by itself finish that objective. The agent yields when the task is complete,
+human input is genuinely required, or only waiting remains; failures call for a
+concise alert and investigation within the current task's scope.
 Compact Codex replies use `next_backend_check_at`; full diagnostics retain the
 existing `next_poll_after` field and interval controls.
 

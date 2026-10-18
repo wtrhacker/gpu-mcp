@@ -205,11 +205,17 @@ class DaemonClient:
             self.call("thread/resume", {"threadId": thread_id, "excludeTurns": True})
         abnormal = event["kind"] not in {"succeeded", "finished", "milestone"}
         instruction = (
-            "This private GPU MCP event reports a failure or uncertainty. Tell the human a concise "
-            "alert for this job. Inspect only this session's job when needed."
+            "This private event reports a job failure or uncertainty. Alert the human concisely, "
+            "then investigate this session's job in light of the user's current objective. "
+            "Continue unfinished work toward that objective: fix what you can within its scope, "
+            "or explain what you need."
             if abnormal else
-            "This is a private job result or requested checkpoint. Do not announce routine success. "
-            "Existing task instructions determine follow-up. No acknowledgement tool call is required."
+            "This private event delivers a job result or requested checkpoint. "
+            "Review this result in light of the user's current objective in this conversation. "
+            "Continue any unfinished work toward that objective, incorporating the result into your ongoing work. "
+            "A finished job does not by itself finish the task. "
+            "Stop when the task is complete, human input is genuinely required, or only waiting on other jobs remains. "
+            "No separate status acknowledgement is required."
         )
         if event["kind"] == "finished" and not event["payload"].get("terminal_result_known"):
             instruction += " This reports management cleanup after process-gone proof. A successful job result is still unknown; do not claim final scientific results from it."

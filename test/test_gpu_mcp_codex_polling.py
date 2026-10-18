@@ -210,6 +210,6 @@ def test_static_tool_rules_explain_background_checks_without_repeating_them_in_r
     record = f.start()
     description = f.server.mcp._tool_manager.get_tool('run_python_on_gpu').description
     assert 'next backend check' in description and 'concrete question or decision' in description
-    assert 'acknowledgement tool call' in description
+    assert 'no separate status acknowledgement' in description
     reply = json.loads(f.server.manage_gpu_job(job_id=record['job_id']))
     assert runtime_module.MONITORING_GUIDANCE not in json.dumps(reply)

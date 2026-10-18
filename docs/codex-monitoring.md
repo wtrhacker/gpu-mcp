@@ -75,8 +75,11 @@ is correct or progressing.
 The registered tool descriptions explain this once. Waiting for a final result
 alone needs no sleep-and-check loop. Status, logs and intermediate outputs remain
 available for a concrete question or decision. Routine healthy updates require
-no human-facing commentary. Completion requires no acknowledgement tool call or
-immediate follow-up work; the user's task determines what happens next.
+no human-facing commentary. Completion requires no separate status acknowledgement.
+The result message asks the agent to review the result against the user's current
+objective and continue unfinished work. It yields when the task is complete,
+human input is genuinely required, or only waiting remains. Failure messages
+request a concise alert and investigation within the current task's scope.
 Compact replies label the timestamp `next_backend_check_at`. The existing
 `next_poll_after` remains in saved state and full diagnostics.
 

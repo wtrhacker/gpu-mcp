@@ -41,7 +41,10 @@ def test_idle_or_active_delivery_uses_one_atomic_queued_operation():
     starts = [params for method, params in client.calls if method == "turn/start"]
     assert len(starts) == 1 and starts[0]["input"] == [] and len(sends) == 1
     assert starts[0]["toolOutput"]["name"] == "gpu_mcp_event_event"
-    assert "Do not announce routine success" in next(iter(starts[0]["additionalContext"].values()))["value"]
+    instruction = next(iter(starts[0]["additionalContext"].values()))["value"]
+    assert "user's current objective in this conversation" in instruction
+    assert "Continue any unfinished work" in instruction
+    assert "No separate status acknowledgement is required" in instruction
 
 
 def test_failure_instruction_is_visible_alert_and_scoped():
@@ -49,7 +52,10 @@ def test_failure_instruction_is_visible_alert_and_scoped():
     client.deliver(event(kind="failed"), Path("/repo"))
     start = client.calls[-1][1]
     assert start["threadId"] == "owner"
-    assert "Tell the human a concise alert" in next(iter(start["additionalContext"].values()))["value"]
+    instruction = next(iter(start["additionalContext"].values()))["value"]
+    assert "Alert the human concisely" in instruction
+    assert "investigate this session's job" in instruction
+    assert "fix what you can within its scope" in instruction
 
 
 def test_archived_thread_is_not_resumed_or_woken():

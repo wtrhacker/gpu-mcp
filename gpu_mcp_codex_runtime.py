@@ -27,7 +27,7 @@ MONITORING_GUIDANCE = (
     "Status, logs and intermediate outputs remain available for a concrete question or decision. "
     "Routine healthy updates require no human-facing commentary. "
     "Report job failures and monitoring problems that need attention. "
-    "A result notification requires no acknowledgement tool call or immediate follow-up work. "
+    "A result notification requires no separate status acknowledgement. "
     "Backend code handles booking cleanup; finish is explicit cleanup for an unresolved job, not a success acknowledgement."
 )
 
