@@ -85,6 +85,23 @@ caller metadata and must not become separate owners of jobs or reservations.
 Only the shared backend owns lifecycle state and the heartbeat manager. Closing
 a connection or the monitor must not stop an active job or its monitoring.
 
+A different source hash marks a pending update; it does not by itself make a
+healthy backend incompatible. With the same connection protocol, policy path
+and runtime identity, new sessions must still connect to the existing backend
+and use its advertised tools. Under the startup lock, the launcher asks the
+backend to stop only if idle. A busy refusal keeps the old backend available;
+an acknowledged shutdown is followed by one new backend using the installed
+code. No process is killed and no job or event state is discarded. The upgrade
+command follows the same rule for compatible code-only updates. Changes to the
+connection protocol, interpreter or dependencies still require idle work.
+A read-only launcher status command distinguishes installed and loaded code.
+
+Before booking a GPU, verify that the execution host can access the project
+root. A confirmed error before process creation is a terminal launch failure:
+persist its outcome and owner event, then release only the matching attempt's
+reservation. A missing reply alone remains uncertain. MPS keeps a protected
+pre-start failure receipt so status can recover a lost negative acknowledgement.
+
 Every SSH command must close its Fabric connection and underlying client,
 including partial authentication and failure paths. The helper carries no
 interactive input; stdin belongs to MCP. Test repeated calls against actual

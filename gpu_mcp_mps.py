@@ -173,6 +173,7 @@ class MpsManager:
         if role == 'main' and not smoke and not s._nonempty_text(smoke_skip_reason):
             raise ValueError('main MPS sweep requires successful smoke evidence or smoke_skip_reason')
         host = s._canonical_policy_host(host)
+        s._check_execution_repo(host)
         support = self.capability(host, protocol)
         job, attempt = leases.generate_job_id(), leases.generate_attempt_id()
         key = leases.reservation_key(host, gpu_index)
@@ -244,6 +245,11 @@ class MpsManager:
             s.HEARTBEAT_MANAGER.register(key, interval_sec=600)
             launched = True  # From this point a lost reply must never trigger blind release/relaunch.
             reply = self.rpc('launch', spec)
+            if reply.get('status') == 'launch_failed':
+                worker.validate_launch_failure(spec, reply)
+                record = s._record_prestart_failure(record, reply['error'])
+                self.save(record)
+                return self.response(record, 'failed')
             record.update(remote_pid=(reply.get('parent') or {}).get('pid'), parent=reply.get('parent'), job_lifecycle='running')
             s.HEARTBEAT_MANAGER.update_owned_metadata(key, {'remote_pid': record['remote_pid']}, expected_identity=(job,attempt))
             self.save(record)
@@ -354,12 +360,24 @@ class MpsManager:
             signature = Path(record['ready_file']).stat().st_mtime_ns
         except OSError:
             signature = None
-        if record.get('job_lifecycle') == 'finished' and not record.get('active_reservation') and action == 'status':
+        if (record.get('job_lifecycle') == 'finished' or record.get('failed_before_start')
+                or record.get('operator_reconciliation')) and not record.get('active_reservation') and action == 'status':
             return self.response(record, case=next((c for c in record['cases'] if c['case_id'] == case_id), None))
         if (action == 'status' and due and due > datetime.now(timezone.utc)
                 and not s._nonempty_text(early_poll_reason) and signature == record.get('mps_ready_signature') and not record.get('outcome')):
             return self.response(record, 'not_due', case=next((c for c in record['cases'] if c['case_id'] == case_id), None))
         observed = self.rpc('status', record['mps_spec'])
+        if observed.get('launch_failure'):
+            worker.validate_launch_failure(record['mps_spec'], observed['launch_failure'])
+            record = s._record_prestart_failure(record, observed['launch_failure']['error'])
+            self.save(record)
+            if action == 'status':
+                return self.response(record)
+            if action == 'finish':
+                record.update(job_lifecycle='finished')
+                self.save(record)
+                return self.response(record, 'finished')
+            raise ValueError('MPS failed before starting; submit a new sweep')
         record.update(cases=observed.get('cases', []), last_status_checked_at=leases.iso_timestamp(),
             last_process_observation={'status': observed['state'], 'reason': observed.get('reason', '')},
             mps_paused=observed.get('paused', False), reason=observed.get('reason', ''))

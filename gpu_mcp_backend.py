@@ -816,18 +816,27 @@ def _remote_async_launch_command(
             "import json, os, subprocess, sys\n"
             "supervisor_argv = json.loads(sys.argv[1])\n"
             "pid_ack_path = sys.argv[2]\n"
-            "os.makedirs(os.path.dirname(pid_ack_path), mode=0o700, exist_ok=True)\n"
-            "ack_fh = open(pid_ack_path, 'w')\n"
+            "base = json.loads(sys.argv[3])\n"
+            "ack_fh = None\n"
             "try:\n"
+            "    os.chdir(supervisor_argv[4])\n"
+            "    flags = os.O_WRONLY | os.O_CREAT | getattr(os, 'O_NOFOLLOW', 0)\n"
+            "    fd = os.open(supervisor_argv[3], flags, 0o600)\n"
+            "    os.close(fd)\n"
+            "    os.makedirs(os.path.dirname(pid_ack_path), mode=0o700, exist_ok=True)\n"
+            "    ack_fh = open(pid_ack_path, 'w')\n"
             "    proc = subprocess.Popen(supervisor_argv, stdout=subprocess.DEVNULL, "
             "stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, start_new_session=True)\n"
-            "except Exception:\n"
-            "    ack_fh.close()\n"
-            "    try:\n"
-            "        os.unlink(pid_ack_path)\n"
-            "    except FileNotFoundError:\n"
-            "        pass\n"
-            "    raise\n"
+            "except (OSError, ValueError) as exc:\n"
+            "    failure = {'status': 'launch_failed', 'job_id': base['job_id'], "
+            "'attempt_id': base['attempt_id'], 'error': str(exc)}\n"
+            "    if ack_fh is not None:\n"
+            "        json.dump(failure, ack_fh)\n"
+            "        ack_fh.close()\n"
+            "    print(json.dumps(failure))\n"
+            "    sys.exit(0)\n"
+            # Once Popen has returned, a failure to write/return the PID is
+            # uncertain. It must never be labelled as a pre-start failure.
             "json.dump({'schema_version': 1, 'remote_pid': proc.pid}, ack_fh, sort_keys=True)\n"
             "ack_fh.write('\\n')\n"
             "ack_fh.flush()\n"
@@ -837,13 +846,8 @@ def _remote_async_launch_command(
         )
         return " ".join([
             _shell_env_prefix(env_values),
-            shlex.join([
-                PYTHON,
-                "-c",
-                wrapper,
-                json.dumps(supervisor_argv),
-                str(pid_ack_path),
-            ]),
+            shlex.join([PYTHON, "-c", wrapper, json.dumps(supervisor_argv),
+                        str(pid_ack_path), json.dumps(outcome_base)]),
         ])
     return " ".join([
         _shell_env_prefix(env_values),
@@ -1166,6 +1170,21 @@ def _job_checkins_reason(key: str | None = None) -> str:
 def _shell_env_prefix(env_values: dict[str, str]) -> str:
     """Format env assignments safely for remote shell launch."""
     return " ".join(f"{key}={shlex.quote(value)}" for key, value in env_values.items())
+
+
+def _check_execution_repo(host):
+    """Check the execution host's mount before booking a GPU or starting work."""
+    if _is_local_host(host):
+        return
+    program = ('import os,sys; p=sys.argv[1]; '
+               'print("ready" if os.path.isdir(p) and os.access(p,os.R_OK|os.X_OK) else "missing")')
+    command = shlex.join([PYTHON, '-I', '-c', program, str(REPO_ROOT)])
+    result = _host_run(host, command, timeout=10)
+    if result is None:
+        raise ValueError('Cannot check the project directory on ' + host + '; no GPU was reserved')
+    if result.strip() != 'ready':
+        raise ValueError('Project directory is unavailable on ' + host + ': ' + str(REPO_ROOT)
+                         + '; no GPU was reserved')
 
 
 def _remote_repo_command(command: str) -> str:
@@ -2485,6 +2504,7 @@ def _rollback_retry_claim(
         return
 
 
+
 def _finalize_retry_attempt(
     *,
     pending_record: dict,
@@ -2526,6 +2546,47 @@ def _finalize_retry_attempt(
         _write_repo_job_record(launched_record)
         reservations.atomic_write_json(metadata_path, latest)
     return True, ""
+
+
+def _prestart_failure(reply, job_id, attempt_id):
+    """Only a direct trusted launcher reply proves that this attempt did not start.
+
+    Repository-local acknowledgement files remain advisory: scientific code
+    may be allowed to write there, so they cannot authorize GPU release.
+    """
+    if not isinstance(reply, str):
+        return None
+    try:
+        value = json.loads(reply)
+    except ValueError:
+        return None
+    if (isinstance(value, dict) and value.get('status') == 'launch_failed'
+            and value.get('job_id') == job_id and value.get('attempt_id') == attempt_id
+            and isinstance(value.get('error'), str)):
+        return value['error']
+    return None
+
+def _record_prestart_failure(record, reason):
+    """Persist a known launch failure before releasing exactly its reservation."""
+    record = dict(record)
+    outcome = reservations.build_outcome_record(job_id=record['job_id'],
+        attempt_id=record['active_attempt_id'], reservation_key_value=record['reservation_key'],
+        host=record['host'], gpu_index=record['gpu_index'], terminal_status='launcher_error',
+        ended_at=reservations.iso_timestamp(), exit_code=127, error_summary=reason)
+    record.setdefault('active_reservation', True)
+    record.update(job_lifecycle='failed', outcome=outcome, reason=reason,
+                  failed_before_start=True, next_poll_after=None)
+    _write_repo_job_record(record)
+    metadata = _read_reservation_metadata(record['reservation_key'])
+    if _job_record_matches_current_metadata(record, metadata):
+        removed, _ = _remove_owned_finished_reservation(record, metadata)
+        if removed:
+            HEARTBEAT_MANAGER.unregister(record['reservation_key'])
+            record['active_reservation'] = False
+    else:
+        record['active_reservation'] = False  # Any current claim belongs to another attempt.
+    _write_repo_job_record(record)
+    return record
 
 
 def _read_retry_pid_ack(pid_ack_path: Path, *, attempts: int = 10) -> int | None:
@@ -2675,8 +2736,18 @@ def _start_managed_attempt(
             outcome_base,
             pid_ack_path=pid_ack_path,
         )
-        bg_cmd = _remote_repo_command(launch_cmd)
+        # The trusted Python launcher checks cwd and reports setup failures.
+        # A shell-level `cd` would discard that distinction before it can run.
+        bg_cmd = launch_cmd
         pid_str = _ssh_run(host, bg_cmd)
+        failure = _prestart_failure(pid_str, job_id, attempt_id)
+        if failure is not None:
+            _rollback_retry_claim(source_record=job_record, source_metadata=metadata, attempt_id=attempt_id)
+            return _launch_handle_response(status="refused", reason=f"Failed to relaunch GPU job on {host}: {failure}",
+                job_id=job_id, attempt_id=attempt_id, reservation_key_value=reservation_key_value,
+                host=host, gpu_index=gpu_index, output_path=output_path, next_poll_after=next_poll_after,
+                job_lifecycle="retry_launch_failed", launch="ssh", async_mode_requested=async_mode_requested,
+                poll_interval_sec=poll_interval_sec)
         acknowledged_pid = _positive_pid_from_text(pid_str)
         if acknowledged_pid is None:
             acknowledged_pid = _read_retry_pid_ack(pid_ack_path)
@@ -3124,7 +3195,7 @@ def _job_status_response(
         return _json_tool_response(_mps_manager().manage(job_record, action, early_poll_reason=early_poll_reason))
     early_reason = _nonempty_text(early_poll_reason)
     local_outcome = _read_outcome_record(job_record)
-    if CODEX_RUNTIME is not None:
+    if CODEX_RUNTIME is not None or job_record.get('failed_before_start'):
         local_outcome = local_outcome or job_record.get("outcome")
     if (
         action == "status"
@@ -4388,6 +4459,7 @@ def _run_python_on_gpu_impl(
 
     try:
         canonical_host = _canonical_policy_host(host)
+        _check_execution_repo(canonical_host)
         reservation_key_value = reservations.reservation_key(canonical_host, gpu_index)
         argv = _build_python_gpu_argv(script_path, args=args, execution_host=host)
         out_path = _validate_output_path(output_file)
@@ -4564,12 +4636,7 @@ def _run_python_on_gpu_impl(
                 start_new_session=True,
             )
         except Exception as e:
-            reservations.remove_reservation_if_launch_failed(
-                registry_root=registry_root,
-                reservation_key_value=reservation_key_value,
-            )
-            HEARTBEAT_MANAGER.unregister(reservation_key_value)
-            shutil.rmtree(reservations.job_record_path(REPO_ROOT, job_id).parent, ignore_errors=True)
+            _record_prestart_failure(job_record, str(e))
             return _launch_refusal(
                 f"Failed to launch local GPU job on {host}: {e}",
                 host=canonical_host,
@@ -4589,8 +4656,17 @@ def _run_python_on_gpu_impl(
             outcome_base,
             pid_ack_path=pid_ack_path,
         )
-        bg_cmd = _remote_repo_command(launch_cmd)
+        # The trusted Python launcher checks cwd and reports setup failures.
+        # A shell-level `cd` would discard that distinction before it can run.
+        bg_cmd = launch_cmd
         pid_str = _ssh_run(host, bg_cmd)
+        failure = _prestart_failure(pid_str, job_id, attempt_id)
+        if failure is not None:
+            failed = _record_prestart_failure(job_record, failure)
+            return _json_tool_response({"status": "failed", "job_id": job_id,
+                "attempt_id": attempt_id, "host": host, "gpu_index": gpu_index,
+                "job_lifecycle": "failed", "active_reservation": failed["active_reservation"],
+                "reason": failure, "outcome": failed["outcome"]})
         acknowledged_pid = _positive_pid_from_text(pid_str)
         if acknowledged_pid is None:
             acknowledged_pid = _read_retry_pid_ack(pid_ack_path)

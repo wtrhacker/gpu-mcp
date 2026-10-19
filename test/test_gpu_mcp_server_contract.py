@@ -64,7 +64,12 @@ def _import_server_with_config(monkeypatch, config: Path):
     if old_server is not None and hasattr(old_server, "HEARTBEAT_MANAGER"):
         old_server.HEARTBEAT_MANAGER.stop()
     sys.modules.pop("gpu_mcp_backend", None)
-    return importlib.import_module("gpu_mcp_backend")
+    server = importlib.import_module("gpu_mcp_backend")
+    if set(server.NODES) <= {'gpu-a', 'gpu-b'}:
+        # These hostnames are simulated transports, not execution machines.
+        # Actual execution-host mount checks have dedicated regression tests.
+        monkeypatch.setattr(server, '_check_execution_repo', lambda host: None)
+    return server
 
 
 def _server_subprocess_env(registry: Path) -> dict[str, str]:

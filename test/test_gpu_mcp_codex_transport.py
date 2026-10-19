@@ -202,8 +202,9 @@ def test_monitor_pty_renders_and_escape_leaves_backend_running(backend):
     for label in ('alpha', 'beta'):
         record_for(policy, info, Origin(str(uuid.uuid4())), label=label)
     before = request(info, '/human/snapshot', human=True)
-    selected = before['jobs'][1]
-    selected_log = Path(selected['output_file']).stem + ' private log'
+    # The viewer sorts newest job IDs first; the raw snapshot need not.
+    # After clearing the beta filter and moving Down, alpha is selected.
+    selected_log = 'alpha private log'
     beta_job = next(r['job_id'] for r in before['jobs'] if Path(r['output_file']).stem == 'beta')
     master, slave = pty.openpty()
     process = subprocess.Popen([sys.executable, str(SOURCE / "gpu_mcp_codex_monitor.py"),
@@ -372,3 +373,31 @@ def test_corrupt_backend_descriptor_never_starts_a_replacement(tmp_path, monkeyp
     with pytest.raises(ValueError):
         ensure_backend(policy, base=base)
     assert not (root / 'credentials.json').exists()
+
+
+def test_hidden_backend_pid_reuses_authenticated_service_without_starting_a_replacement(backend, monkeypatch):
+    import gpu_mcp_codex_launcher as launcher
+    policy, base, info = backend
+    with monkeypatch.context() as namespace:
+        namespace.setattr(launcher, 'process_start', lambda pid: None)
+        namespace.setattr(launcher.subprocess, 'Popen',
+                          lambda *a, **kw: pytest.fail('started a duplicate backend for a hidden PID'))
+        assert launcher.alive(info)
+        attached = launcher.ensure_backend(policy, base=base)
+        status = launcher.backend_status(policy, base=base)
+        assert attached['server_instance_id'] == info['server_instance_id']
+        assert status['status'] == 'running' and not status['update_pending']
+
+
+def test_hidden_pid_with_unverifiable_service_does_not_start_a_duplicate(backend, monkeypatch):
+    import gpu_mcp_codex_launcher as launcher
+    policy, base, info = backend
+    with monkeypatch.context() as namespace:
+        namespace.setattr(launcher, 'process_start', lambda pid: None)
+        def unavailable(*a, **kw):
+            raise TimeoutError('controlled health timeout')
+        namespace.setattr(launcher, 'request', unavailable)
+        namespace.setattr(launcher.subprocess, 'Popen',
+                          lambda *a, **kw: pytest.fail('replaced a backend whose identity was uncertain'))
+        with pytest.raises(RuntimeError, match='Cannot verify'):
+            launcher.ensure_backend(policy, base=base)

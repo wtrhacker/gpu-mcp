@@ -88,10 +88,66 @@ def read_info(root: Path):
 
 
 def alive(info):
-    return (isinstance(info, dict) and info.get("hostname") == socket.gethostname()
-            and isinstance(info.get("pid"), int)
-            and info.get("process_start") is not None
-            and process_start(info["pid"]) == info.get("process_start"))
+    if (not isinstance(info, dict) or info.get("hostname") != socket.gethostname()
+            or type(info.get("pid")) is not int or info["pid"] <= 0
+            or not info.get("process_start")):
+        return False
+    observed_start = process_start(info["pid"])
+    if observed_start is not None:
+        return observed_start == info["process_start"]
+    # An agent's PID namespace may hide a backend on the same control host.
+    # Its authenticated endpoint can still establish the recorded identity.
+    if not all(info.get(key) for key in ("url", "agent_token", "server_instance_id")):
+        return False
+    try:
+        health = request(info, "/health", timeout=2)
+    except (urllib.error.URLError, OSError) as exc:
+        cause = getattr(exc, "reason", exc)
+        if isinstance(cause, ConnectionRefusedError):
+            return False
+        raise RuntimeError("Cannot verify the existing GPU MCP backend; no replacement was started.") from exc
+    if health.get("server_instance_id") != info["server_instance_id"]:
+        raise RuntimeError("shared backend identity changed")
+    return True
+
+
+def stop_if_idle(info, *, timeout=15):
+    """Ask the owning backend to stop atomically, or leave busy work running.
+
+    Only the backend can decide whether a request or job is still active.
+    A refusal is normal during an update; it does not make the connection bad.
+    """
+    result = request(info, "/human/stop-if-idle", payload={}, human=True, timeout=3)
+    if result.get("status") == "refused":
+        return False
+    if result.get("status") != "stopping":
+        raise RuntimeError("The backend did not confirm an idle shutdown.")
+    deadline = time.monotonic() + timeout
+    while alive(info) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    if alive(info):
+        raise TimeoutError("The idle backend is still shutting down; reconnect shortly. No process was killed.")
+    return True
+
+
+def backend_status(config, *, base=None):
+    """Describe installed and loaded code without starting or stopping anything."""
+    config = Path(config).expanduser().resolve()
+    installed = code_hash()
+    info = read_info(runtime_root(config, base=base))
+    result = {"config_path": str(config), "installed_runtime": str(Path(__file__).resolve().parent),
+              "installed_code_hash": installed, "status": "not_running"}
+    if alive(info):
+        health = request(info, "/health", timeout=3)
+        if health.get("server_instance_id") != info["server_instance_id"]:
+            raise RuntimeError("shared backend identity changed")
+        result.update(status="running", pid=info["pid"], server_instance_id=info["server_instance_id"],
+                      backend_code_hash=info.get("code_hash"),
+                      update_pending=info.get("code_hash") != installed,
+                      protocol_matches=info.get("protocol_version") == PROTOCOL_VERSION,
+                      runtime_settings_match=info.get("runtime_signature") == runtime_signature(),
+                      policy_state=health.get("policy_state"))
+    return result
 
 
 def ensure_backend(config: str | Path, *, base: str | Path | None = None, timeout=20):
@@ -108,14 +164,22 @@ def ensure_backend(config: str | Path, *, base: str | Path | None = None, timeou
         if alive(info):
             if info.get("config_path") != str(config):
                 raise RuntimeError("This repository already has a backend for a different policy path.")
-            if info.get("protocol_version") != PROTOCOL_VERSION or info.get("code_hash") != code_hash():
-                raise RuntimeError("The shared backend uses another code version. Drain its jobs before upgrading it.")
+            if info.get("protocol_version") != PROTOCOL_VERSION:
+                raise RuntimeError("The shared backend uses an incompatible connection protocol. Finish its jobs before upgrading it.")
             if info.get("runtime_signature") != runtime_signature():
                 raise RuntimeError("The shared backend has different runtime settings. Drain its jobs and stop the idle backend before changing interpreters or connection settings.")
             health = request(info, "/health", timeout=3)
             if health.get("server_instance_id") != info.get("server_instance_id"):
                 raise RuntimeError("shared backend identity changed")
-            return info
+            if info.get("code_hash") == code_hash():
+                return info
+            # A source edit is not a wire-protocol change. Keep the actual
+            # backend's tools and job ownership available until it can refresh.
+            # The startup lock also serializes simultaneous refresh attempts.
+            if not stop_if_idle(info, timeout=timeout):
+                print("GPU MCP update pending: connected to the existing backend while its jobs or requests finish.",
+                      file=sys.stderr)
+                return info
         # Retain the reserved port until the child inherits its socket: no free-port race.
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         listener.bind(("127.0.0.1", 0))
@@ -186,7 +250,12 @@ def main(argv=None):
     parser.add_argument("--state-base", type=Path)
     parser.add_argument("--monitor", action="store_true")
     parser.add_argument("--stop-if-idle", action="store_true")
+    parser.add_argument("--status", action="store_true",
+                        help="report installed and running code without starting or stopping the backend")
     args = parser.parse_args(argv)
+    if args.status:
+        print(json.dumps(backend_status(args.config, base=args.state_base), indent=2))
+        return
     if args.stop_if_idle:
         info = read_info(runtime_root(args.config, base=args.state_base))
         if not alive(info):

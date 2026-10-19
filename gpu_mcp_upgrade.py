@@ -12,7 +12,6 @@ from pathlib import Path
 import re
 import subprocess
 import sys
-import time
 import tomllib
 
 import gpu_mcp_codex_launcher as launcher
@@ -166,13 +165,22 @@ print(json.dumps({'missing':missing,'signature':runtime_signature()}))
     return json.loads(result.stdout)
 
 
+def compatible_refresh(plan, info):
+    """Code-only updates can wait while the existing tools continue serving work."""
+    return (not plan['probe']['missing']
+            and info.get('protocol_version') == launcher.PROTOCOL_VERSION
+            and info.get('runtime_signature') == plan['probe']['signature'])
+
+
 def backend_to_refresh(plan, probe):
+    plan['backend_update_pending'] = False
     info = launcher.read_info(plan['root'])
     if not launcher.alive(info):
         return None
     if info.get('config_path') != str(plan['config']):
         raise ValueError(f'{plan["repo_root"]}: backend policy identity differs; no refresh attempted')
     if (not probe['missing'] and info.get('code_hash') == launcher.code_hash()
+            and info.get('protocol_version') == launcher.PROTOCOL_VERSION
             and info.get('runtime_signature') == probe['signature']):
         return None
     snapshot = launcher.request(info, '/human/snapshot', human=True, timeout=10)
@@ -181,19 +189,16 @@ def backend_to_refresh(plan, probe):
     active = [j for j in snapshot['jobs'] if j.get('server_instance_id') == info['server_instance_id']
               and (j.get('job_lifecycle') not in TERMINAL or j.get('active_reservation', bool(j.get('reservation_key'))))]
     if active:
-        raise ValueError(f'{plan["repo_root"]}: finish {len(active)} active job(s), then rerun upgrade.sh')
+        if compatible_refresh(plan, info):
+            plan['backend_update_pending'] = True
+            return None
+        raise ValueError(f'{plan["repo_root"]}: finish {len(active)} active job(s) before changing '
+                         'dependencies, runtime settings or the connection protocol, then rerun upgrade.sh')
     return info
 
 
 def stop_idle(info):
-    result = launcher.request(info, '/human/stop-if-idle', payload={}, human=True, timeout=10)
-    if result.get('status') != 'stopping':
-        raise ValueError('GPU MCP became busy; finish its jobs/requests, then rerun. ' + result.get('reason', ''))
-    deadline = time.monotonic() + 15
-    while launcher.alive(info) and time.monotonic() < deadline:
-        time.sleep(.1)
-    if launcher.alive(info):
-        raise ValueError('GPU MCP has not finished stopping; no process was killed. Rerun shortly.')
+    return launcher.stop_if_idle(info)
 
 
 def check_unchanged(plans, runtime, store, home):
@@ -207,6 +212,10 @@ def check_shared_interpreters(plans, home):
     needed = {Path(p['python']).resolve() for p in plans if p['probe']['missing']}
     if not needed:
         return
+    for plan in plans:
+        if plan.get('backend_update_pending') and Path(plan['python']).resolve() in needed:
+            raise ValueError('A busy GPU MCP backend shares the interpreter whose dependencies need updating: '
+                             + str(plan['repo_root']) + '. Finish its work before installing dependencies.')
     selected = {p['root'] for p in plans}
     bases = {home / 'gpu-mcp/state/codex'} | {p.parent for p in selected}
     for base in bases:
@@ -284,6 +293,7 @@ def upgrade(runtime, *, repos=(), home=None, codex_home=None, store=None, previe
     for plan in plans:
         print(f'{plan["repo_root"]}: ' + ('update registration' if plan['changed'] else 'registration current')
               + ('; refresh idle backend' if plan['backend'] else '')
+              + ('; keep busy backend available, refresh after its work finishes' if plan['backend_update_pending'] else '')
               + ('; install Python dependencies' if plan['probe']['missing'] else ''), flush=True)
     if preview:
         print('Preview only. Ctrl+G setup will also be checked and installed.')
@@ -300,8 +310,13 @@ def upgrade(runtime, *, repos=(), home=None, codex_home=None, store=None, previe
         for plan in plans:
             plan['backend'] = backend_to_refresh(plan, plan['probe'])
         for plan in plans:
-            if plan['backend']:
-                stop_idle(plan['backend'])
+            if plan['backend'] and not stop_idle(plan['backend']):
+                if compatible_refresh(plan, plan['backend']):
+                    plan['backend_update_pending'] = True
+                else:
+                    raise ValueError('GPU MCP became busy; finish its jobs/requests before changing '
+                                     'dependencies, runtime settings or the connection protocol.')
+        check_shared_interpreters(plans, home)
         installed = set()
         for plan in plans:
             if plan['probe']['missing'] and plan['python'] not in installed:
@@ -321,13 +336,18 @@ def upgrade(runtime, *, repos=(), home=None, codex_home=None, store=None, previe
     print(terminal_result['activation'])
     pending = [p for p in processes if not p['shared'] and Path(p['runtime']).resolve() == runtime
                and Path(p['repo_root']).resolve() in repos]
+    pending_backends = [str(p['repo_root']) for p in plans if p.get('backend_update_pending')]
     if pending:
         print('Runtime updated; activation incomplete. Old per-session controllers are still running. '
               'Finish their jobs, then quit/resume those conversations. Existing configurations will use the shared backend.')
+    elif pending_backends:
+        print('Files updated. Busy backends remain available with their current tools. '
+              'The next connection after their work finishes automatically loads the update.')
     else:
         print('Upgrade complete. Quit and resume existing Codex conversations once to refresh their MCP tools.')
-    print('New sessions use the update automatically. The Codex daemon was not restarted or reconfigured.')
-    return dict(result, terminal=terminal_result, ssh_repair=repairs, pending_legacy_sessions=pending)
+    print('Sessions connect automatically. The Codex daemon was not restarted or reconfigured.')
+    return dict(result, terminal=terminal_result, ssh_repair=repairs, pending_legacy_sessions=pending,
+                pending_backend_updates=pending_backends)
 
 
 def main(argv=None):

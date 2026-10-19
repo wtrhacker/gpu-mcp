@@ -28,6 +28,26 @@ The launcher starts the backend automatically or reuses the existing instance.
 Concurrent startups share a lock. Connection processes forward requests; they
 do not own jobs. No manual HTTP startup or open monitor is required.
 
+Restarting a Codex session opens a new connection; it does not erase job state.
+After an update, the launcher keeps using a healthy, compatible backend while
+that backend has active jobs, unresolved launches or requests in progress. Its
+current tools remain available. Once it is idle, the next connection restarts
+it with the installed code. Completed jobs, ownership and pending notifications
+survive that refresh. Concurrent connections perform only one refresh.
+
+To see which code is installed and which code the backend is using:
+
+```bash
+python /absolute/gpu-mcp-runtime/gpu_mcp_codex_launcher.py \
+  --config /absolute/research-repo/gpu-mcp.toml --status
+```
+
+This read-only command reports both code hashes and `update_pending`; it does
+not start or stop a backend. An installation copied with `rsync` can retain an
+old `.git` directory, so its `git log` does not reliably identify deployed code.
+The backend advertises its actual tool schema while an update is pending; new
+features become available after the idle refresh and client reconnection.
+
 The control host needs MCP SDK v1, Uvicorn, `websocket-client`, and a running
 Codex app-server daemon. GPU MCP connects to the existing daemon; it does not
 restart it. Native Codex request metadata supplies the conversation identity.
@@ -88,6 +108,15 @@ grace. Persistent identity failures retry every thirty seconds; late result
 reads remain independent of that deadline. The monitor shows uncertainty while
 recovery is pending. A persistent problem then produces one owner alert; a
 verified job failure keeps its normal notification. No timeout frees a GPU.
+
+A launch first checks that the execution host can see the project directory.
+A missing mount is reported before a GPU is reserved. If setup then fails before
+a supervisor starts, the launcher reports that failure explicitly; the job is
+recorded as failed and its reservation is released. MPS also saves a private
+failure receipt on the execution host,
+so a later check can recover a lost failure reply. A missing reply alone is
+still uncertainty: elapsed time triggers verification, not a declaration that a
+possibly running job has stopped. Terminal records remain available for inspection.
 
 For a finished SSH job, a missing local result also triggers a bounded read on
 the execution host. The result must match the saved job, attempt, host, GPU,

@@ -636,10 +636,36 @@ def validate_outcome(spec, state):
         raise ValueError('MPS aggregate result conflicts with case outcomes')
 
 
+def launch_failure(spec, error):
+    receipt = {'status': 'launch_failed', 'job_id': spec['job_id'],
+               'attempt_id': spec['active_attempt_id'], 'nonce': spec['nonce'],
+               'error': str(error)[:1000]}
+    try:
+        write_json(directory(spec) / 'launch_failed.json', receipt)
+    except OSError:
+        pass  # A successful RPC reply still proves that Popen did not succeed.
+    return receipt
+
+
+def validate_launch_failure(spec, receipt):
+    if (receipt.get('status') != 'launch_failed' or receipt.get('job_id') != spec['job_id']
+            or receipt.get('attempt_id') != spec['active_attempt_id']
+            or receipt.get('nonce') != spec['nonce'] or not isinstance(receipt.get('error'), str)):
+        raise ValueError('MPS pre-start failure identity changed')
+
+
 def inspect(spec):
     path, stored = authenticate(spec)
     state_file = path / 'state.json'
     if not state_file.exists():
+        failure_file = path / 'launch_failed.json'
+        if failure_file.exists():
+            receipt = read_json(failure_file)
+            validate_launch_failure(stored, receipt)
+            if (path / 'launch.json').exists():
+                raise ValueError('MPS launch and pre-start failure receipts conflict')
+            return {'state': 'gone', 'launch_failure': receipt, 'live_processes': [],
+                    'reason': receipt['error']}
         return {'state': 'unknown', 'reason': 'MPS supervisor acknowledgement is not visible'}
     state = read_json(state_file)
     if (state.get('nonce') != stored['nonce'] or state.get('active_attempt_id') != stored['active_attempt_id']
@@ -735,13 +761,21 @@ def rpc(action, spec, sources=None, request=None):
         path = directory(spec)
         spec = dict(spec, mps_log_directory=str(path / 'mps-logs'))
         path.mkdir(parents=True, mode=0o700, exist_ok=False)
-        write_json(path / 'spec.json', spec)
-        (path / 'worker.py').write_text(sources['worker'])
-        (path / 'guard.py').write_text(sources['guard'])
-        log_fd = open_log(spec['output_file'])
         try:
-            proc = subprocess.Popen([sys.executable, '-I', str(path / 'worker.py'), '--supervise', str(path)],
-                stdin=subprocess.DEVNULL, stdout=log_fd, stderr=subprocess.STDOUT, start_new_session=True)
+            write_json(path / 'spec.json', spec)
+            (path / 'worker.py').write_text(sources['worker'])
+            (path / 'guard.py').write_text(sources['guard'])
+            if not Path(spec['repo_root']).is_dir():
+                raise FileNotFoundError('Project directory is unavailable on the execution host: ' + spec['repo_root'])
+            log_fd = open_log(spec['output_file'])
+        except (OSError, ValueError) as exc:
+            return launch_failure(spec, exc)
+        try:
+            try:
+                proc = subprocess.Popen([sys.executable, '-I', str(path / 'worker.py'), '--supervise', str(path)],
+                    stdin=subprocess.DEVNULL, stdout=log_fd, stderr=subprocess.STDOUT, start_new_session=True)
+            except OSError as exc:
+                return launch_failure(spec, exc)
         finally:
             os.close(log_fd)
         write_json(path / 'launch.json', {'parent': identity(proc.pid)})

@@ -120,6 +120,7 @@ def test_upgrade_keeps_old_filename_adapter_and_live_legacy_controller(setup, mo
 def shared_backend(f, monkeypatch, *, active=False, code='older-code'):
     f.registration.write_text(f.registration.read_text().replace('gpu_mcp_server.py', 'gpu_mcp_codex_launcher.py'))
     info = {'server_instance_id': 'own', 'code_hash': code, 'runtime_signature': 'current',
+            'protocol_version': upgrade.launcher.PROTOCOL_VERSION,
             'config_path': str(f.policy), 'live': True}
     monkeypatch.setattr(upgrade.launcher, 'read_info', lambda root: info)
     monkeypatch.setattr(upgrade.launcher, 'alive', lambda value: bool(value and value.get('live')))
@@ -138,8 +139,24 @@ def shared_backend(f, monkeypatch, *, active=False, code='older-code'):
     return info, requests
 
 
-def test_old_busy_backend_blocks_without_stopping_it(setup, monkeypatch):
+def test_old_compatible_busy_backend_defers_refresh_without_blocking_upgrade(setup, monkeypatch):
     info, requests = shared_backend(setup, monkeypatch, active=True)
+    before = setup.policy.read_bytes()
+    result = setup.run()
+    assert result['pending_backend_updates'] == [str(setup.repo)]
+    assert info['live'] and '/human/stop-if-idle' not in requests
+    assert setup.policy.read_bytes() == before
+
+
+@pytest.mark.parametrize('change', ['protocol', 'runtime', 'dependencies'])
+def test_busy_backend_still_protects_incompatible_runtime_changes(setup, monkeypatch, change):
+    info, requests = shared_backend(setup, monkeypatch, active=True)
+    if change == 'protocol':
+        info['protocol_version'] = 999
+    elif change == 'runtime':
+        info['runtime_signature'] = 'another-runtime'
+    else:
+        monkeypatch.setattr(upgrade, 'probe_python', lambda *a: {'missing': ['mcp'], 'signature': 'current'})
     before = setup.registration.read_bytes()
     with pytest.raises(ValueError, match='finish 1 active job'):
         setup.run()
@@ -160,7 +177,7 @@ def test_idle_old_backend_is_refreshed_once(setup, monkeypatch):
     assert requests.count('/human/stop-if-idle') == 1
 
 
-def test_busy_race_at_shutdown_refuses_without_overwriting_config(setup, monkeypatch):
+def test_busy_race_at_shutdown_keeps_compatible_backend_available(setup, monkeypatch):
     info, requests = shared_backend(setup, monkeypatch)
     original_request = upgrade.launcher.request
 
@@ -170,10 +187,8 @@ def test_busy_race_at_shutdown_refuses_without_overwriting_config(setup, monkeyp
         return original_request(value, path, **kwargs)
 
     monkeypatch.setattr(upgrade.launcher, 'request', race)
-    before = setup.registration.read_bytes()
-    with pytest.raises(ValueError, match='became busy'):
-        setup.run()
-    assert setup.registration.read_bytes() == before and info['live']
+    result = setup.run()
+    assert result['pending_backend_updates'] == [str(setup.repo)] and info['live']
 
 
 def test_registration_edit_during_dependency_install_is_not_lost(setup, monkeypatch):
