@@ -67,6 +67,14 @@ filesystem permissions; this is not operating-system isolation between sessions.
 
 ## Quiet checks and explicit inspection
 
+The server's startup instructions and inspection-tool descriptions direct agents
+to use `cluster_info`, `check_gpus` and `check_gpu_processes` for routine GPU
+inspection. The backend performs the necessary host queries. Agents should report
+tool errors or missing information instead of falling back to shell `nvidia-smi`,
+SSH or process queries and triggering permission requests. Direct host diagnostics
+are for an explicit user request to investigate the infrastructure. Reconnect
+existing clients after a guidance update so they receive the new instructions.
+
 The backend checks outcomes once a second using local file information, and
 performs process checks when the job's saved checking time arrives. Defaults
 are five minutes for smoke jobs, one hour for main/one-off jobs, and thirty

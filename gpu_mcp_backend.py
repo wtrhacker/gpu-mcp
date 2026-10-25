@@ -3427,6 +3427,18 @@ if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "--safe-run":
 
 from mcp.server.fastmcp import FastMCP
 
+GPU_INSPECTION_GUIDANCE = (
+    "Use GPU MCP tools for routine GPU and cluster inspection: cluster_info for a host overview, "
+    "check_gpus for availability, utilization and memory, and check_gpu_processes for owners, "
+    "commands and CUDA/MPS clients across repositories. Use list_gpu_jobs and manage_gpu_job "
+    "for this conversation's managed jobs. The backend performs the required host queries. "
+    "Do not run nvidia-smi, SSH or shell process queries yourself as a substitute for these tools; "
+    "direct shell inspection can require permission and interrupt the workflow. "
+    "If an MCP call fails, is refused or lacks needed information, report that limitation and "
+    "diagnose the MCP issue rather than automatically requesting shell escalation. "
+    "Use direct host diagnostics only when the user explicitly requests them. "
+)
+
 mcp = FastMCP("gpu-cluster", json_response=True, stateless_http=True, instructions=(
     ("Codex shared mode: scheduled checks run in backend code. "
      "Short polling updates are private and do not wake an idle model. "
@@ -3434,6 +3446,7 @@ mcp = FastMCP("gpu-cluster", json_response=True, stateless_http=True, instructio
      "Use check_gpu_processes for read-only cluster process inspection, including external MPS clients. "
      "Use list_gpu_jobs for your managed jobs and manage_gpu_job(detail='full') or action='logs' for their diagnostics. "
      "Choose an early inspection only when there is a reason. " if CODEX_RUNTIME_ROOT is not None else "") +
+    GPU_INSPECTION_GUIDANCE +
     "GPU cluster management server. Provides tools to check GPU availability "
     "across configured hosts, run approved Python files on specific GPUs, "
     "identify which processes own which GPUs, and signal only GPU_MCP_USER "
@@ -3648,6 +3661,10 @@ def check_gpus(
 ):
     """Check GPU availability across the cluster with reservation overlay.
 
+    Use this tool for utilization and memory checks instead of running nvidia-smi
+    or SSH in the agent shell. Report tool failures rather than automatically
+    requesting shell escalation; direct host diagnostics require a user request.
+
     Args:
         samples: Number of utilization samples to average (default 2).
         threshold: GPU utilization % at or below which a GPU is marked AVAILABLE (default 10).
@@ -3785,6 +3802,9 @@ def check_gpu_processes(
     CUDA/MPS roles and available memory measurements. MPS client discovery uses
     NVIDIA's read-only protocol-2 interface; inaccessible details are explicit.
     Inspection does not grant managed-job access or enroll jobs in monitoring.
+    Use this tool instead of shell nvidia-smi, SSH or ps queries. Report missing
+    information rather than automatically requesting shell escalation; direct
+    host diagnostics require a user request.
 
     Args:
         hosts: List of hostnames to check. Defaults to all nodes.
@@ -5035,6 +5055,11 @@ def run_python_on_gpu(
 @_requires_active_policy
 def cluster_info():
     """Get a quick overview of the entire cluster: which nodes are reachable, GPU counts, load.
+
+    Use this tool instead of shell nvidia-smi or SSH queries. Use check_gpus for
+    utilization and memory, and check_gpu_processes for owners and CUDA/MPS clients.
+    Report tool failures rather than automatically requesting shell escalation;
+    direct host diagnostics require a user request.
 
     Returns:
         Summary table of all cluster nodes.
