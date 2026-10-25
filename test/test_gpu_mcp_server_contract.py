@@ -3616,7 +3616,7 @@ def test_check_gpu_processes_builds_gpu_map_per_host(repo_fixture, monkeypatch):
 
     def fake_host_run(host, cmd, user=server.GPU_MCP_USER, timeout=15):
         if "query-compute-apps" in cmd:
-            return f"{host[-1]}234, GPU-{host[-1]}, 42, python"
+            return f"{1234 if host == 'gpu-a' else 2234}, GPU-{host[-1]}, 42, python"
         if "query-gpu=index,uuid" in cmd:
             return ("0, GPU-a" if host == "gpu-a" else "1, GPU-b")
         if cmd.startswith("ps -p"):
@@ -3628,9 +3628,9 @@ def test_check_gpu_processes_builds_gpu_map_per_host(repo_fixture, monkeypatch):
     result = server.check_gpu_processes(hosts=["gpu-a", "gpu-b"], user_filter=None)
 
     assert "[gpu-a]" in result
-    assert "GPU 0 | PID a234" in result
+    assert "GPU 0 | PID 1234" in result
     assert "[gpu-b]" in result
-    assert "GPU 1 | PID b234" in result
+    assert "GPU 1 | PID 2234" in result
 
 
 def test_remote_host_run_propagates_timeout(repo_fixture, monkeypatch):

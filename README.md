@@ -25,8 +25,9 @@ talk to the AI normally; it uses these functions when it needs a GPU.
   planned check time. The shared Codex backend checks quietly and sends useful
   events to the conversation that launched the job.
 - **Conversations keep their own jobs.** Codex sessions in one repository share
-  a backend while each sees and manages only its own jobs. A separate human
-  terminal monitor can show the repository's jobs.
+  a backend while managed records and controls belong to the launching session.
+  Agents can explicitly inspect cluster processes; a separate human terminal
+  monitor can show the repository's saved jobs and logs.
 - **Stopping is deliberate.** GPU MCP first shows the process owner, command,
   GPU, and start time. It stops the process only on a second call with the same
   fingerprint, after confirming that nothing changed.
@@ -39,7 +40,7 @@ talk to the AI normally; it uses these functions when it needs a GPU.
 | --- | --- |
 | `cluster_info` | Gives a quick summary of the GPU machines. |
 | `check_gpus` | Shows which GPUs are busy, their memory use, and GPU MCP reservations. |
-| `check_gpu_processes` | Shows the programs currently using the GPUs. |
+| `check_gpu_processes` | Read-only process inspection across configured hosts and repositories, including external MPS clients. |
 | `run_python_on_gpu` | Reserves one GPU and starts an allowed Python file. It returns a job ID. |
 | `build_python_artifact` | Builds a reusable artifact on a configured host, using CPU only or a reserved GPU. Optional policy capability. |
 | `manage_gpu_job` | Checks, retries, stops, or finishes a job using its job ID. |

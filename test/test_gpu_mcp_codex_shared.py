@@ -130,10 +130,54 @@ def test_listing_implicit_selection_smoke_and_pid_do_not_cross_sessions(shared):
         assert own["job_id"] in json.dumps(result)
         assert foreign["job_id"] not in json.dumps(result)
     assert call(shared, "manage_gpu_job")["job_id"] == own["job_id"]
-    assert call(shared, "check_gpu_processes", hosts=["fixture"])["status"] == "refused"
     assert call(shared, "kill_gpu_process", host="fixture", pid=foreign["remote_pid"])["status"] == "refused"
     result = call(shared, "run_python_on_gpu", host="fixture", gpu_index=2, script_path="jobs/task.py", smoke_job_id=foreign["job_id"])
     assert result == {"status": "refused", "reason": "job unavailable to this session"}
+
+
+def test_cluster_process_inspection_does_not_grant_job_access_or_monitor_external_jobs(shared):
+    foreign = gpu_job(shared, origin=Origin(str(uuid.uuid4())))
+    before = shared.runtime.store.records()
+    events = shared.runtime.store.events()
+    owned_keys = shared.server.HEARTBEAT_MANAGER.owned_keys()
+
+    def host_run(host, command, **kwargs):
+        assert host == 'fixture'
+        if 'query-compute-apps' in command:
+            return f"{foreign['remote_pid']}, GPU-a, 100, python\n9000, GPU-a, 500, nvidia-cuda-mps-server"
+        if 'query-gpu=index,uuid' in command:
+            return '0, GPU-a'
+        if 'inspect_mps_servers' in command:
+            return json.dumps({'servers': [{'pid': 9000, 'clients': [{'pid': 9001, 'gpu_uuid_prefixes': ['GPU-a']}]}]})
+        if command.startswith('ps -p'):
+            pid = int(command.split()[2])
+            return {foreign['remote_pid']: 'colleague python /other-repo/train.py',
+                    9000: 'researcher nvidia-cuda-mps-server',
+                    9001: 'researcher python /human-managed/simulation.py'}[pid]
+        pytest.fail(f'unexpected inspection command: {command}')
+
+    shared.monkeypatch.setattr(shared.server, '_host_run', host_run)
+    result = shared.server.check_gpu_processes(hosts=['fixture'], user_filter='')
+    assert 'colleague' in result and '/other-repo/train.py' in result
+    assert 'role=mps-client (server PID 9000)' in result and '/human-managed/simulation.py' in result
+    assert foreign['job_id'] not in result
+    assert call(shared, 'list_gpu_jobs')['jobs'] == []
+    assert call(shared, 'manage_gpu_job', job_id=foreign['job_id'], detail='full')['status'] == 'refused'
+    for pid in (foreign['remote_pid'], 9000, 9001):
+        assert call(shared, 'kill_gpu_process', host='fixture', pid=pid)['status'] == 'refused'
+    assert shared.runtime.store.records() == before
+    assert shared.runtime.store.events() == events
+    assert shared.server.HEARTBEAT_MANAGER.owned_keys() == owned_keys
+    assert shared.daemon.sent == []
+
+
+def test_cluster_process_inspection_still_requires_caller_identity_and_active_policy(shared):
+    shared.monkeypatch.setattr(shared.server, '_host_run', lambda *a, **k: pytest.fail('unexpected host inspection'))
+    shared.actor.clear()
+    assert call(shared, 'check_gpu_processes', hosts=['fixture'])['status'] == 'refused'
+    shared.actor['threadId'] = shared.owner.thread_id
+    shared.monkeypatch.setattr(shared.server, '_stale_policy_refusal', lambda: 'policy approval required')
+    assert shared.server.check_gpu_processes(hosts=['fixture']) == 'policy approval required'
 
 
 def test_missing_identity_and_new_fork_fail_closed_but_resume_retains_owner(shared):

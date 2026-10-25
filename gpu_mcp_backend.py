@@ -13,12 +13,14 @@ The launcher owns startup. This module is not a direct stdio MCP server.
 
 import sys, os, json, time, subprocess, re, shlex, hashlib, signal as signal_lib, secrets, shutil, threading, atexit, functools
 import contextlib
+import csv
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
 import gpu_mcp_guard
 import gpu_mcp_builds
+import gpu_mcp_mps_inspection
 import gpu_mcp_reservations as reservations
 from gpu_mcp_codex_state import STALE_AFTER_SEC
 from gpu_mcp_config import ConfigError, GpuMcpPolicy, load_policy_snapshot
@@ -3429,7 +3431,8 @@ mcp = FastMCP("gpu-cluster", json_response=True, stateless_http=True, instructio
     ("Codex shared mode: scheduled checks run in backend code. "
      "Short polling updates are private and do not wake an idle model. "
      "Completion and persistent problems return to the launching conversation automatically. "
-     "Use list_gpu_jobs for your jobs and manage_gpu_job(detail='full') or action='logs' for explicit diagnostics. "
+     "Use check_gpu_processes for read-only cluster process inspection, including external MPS clients. "
+     "Use list_gpu_jobs for your managed jobs and manage_gpu_job(detail='full') or action='logs' for their diagnostics. "
      "Choose an early inspection only when there is a reason. " if CODEX_RUNTIME_ROOT is not None else "") +
     "GPU cluster management server. Provides tools to check GPU availability "
     "across configured hosts, run approved Python files on specific GPUs, "
@@ -3775,10 +3778,13 @@ def check_gpu_processes(
     hosts: Optional[list[str]] = None,
     user_filter: Optional[str] = None,
 ):
-    """Identify which processes are using GPUs and who owns them.
+    """Read-only inspection of existing GPU processes on approved hosts.
 
-    This is the reliable way to check if YOUR code is running on a GPU,
-    rather than just checking utilization percentage.
+    Read-only cluster visibility includes other conversations and external jobs,
+    such as human-managed MPS clients. Reports owners, commands, GPU assignments,
+    CUDA/MPS roles and available memory measurements. MPS client discovery uses
+    NVIDIA's read-only protocol-2 interface; inaccessible details are explicit.
+    Inspection does not grant managed-job access or enroll jobs in monitoring.
 
     Args:
         hosts: List of hostnames to check. Defaults to all nodes.
@@ -3786,7 +3792,7 @@ def check_gpu_processes(
                      Set to empty string to show all users.
 
     Returns:
-        Per-host report of GPU-owning processes with PID, user, command, and memory usage.
+        Per-host process report, with MPS services distinguished from clients.
     """
     if hosts is not None and (
         not isinstance(hosts, list) or any(not isinstance(host, str) for host in hosts)
@@ -3812,52 +3818,136 @@ def check_gpu_processes(
         if not _is_allowed_host(host):
             lines.append(f"[{host}] rejected: host is not in GPU MCP NODES")
             continue
-        proc_raw = _host_run(host, proc_query)
-        uuid_raw = _host_run(host, uuid_query)
+        try:
+            canonical_host = _canonical_policy_host(host)
+        except ValueError as exc:
+            lines.append(f'[{host}] rejected: {exc}')
+            continue
+        node = next(n for n in NODES if reservations.canonical_host_component(n.split('@')[-1]) == canonical_host)
+        ssh_user, target_host = _node_user_host(node)
+        proc_raw = _host_run(target_host, proc_query, user=ssh_user)
+        uuid_raw = _host_run(target_host, uuid_query, user=ssh_user)
 
         if proc_raw is None or uuid_raw is None:
-            reason = _host_run_error(host, proc_query) or _host_run_error(host, uuid_query)
+            reason = _host_run_error(target_host, proc_query) or _host_run_error(target_host, uuid_query)
             suffix = f": {reason}" if reason else ""
             lines.append(f"[{host}] SSH/nvidia-smi failed{suffix}")
             continue
 
         # Build UUID → index map
         uuid_to_idx = {}
-        for row in uuid_raw.strip().splitlines():
-            parts = [p.strip() for p in row.split(",")]
+        for parts in csv.reader(uuid_raw.splitlines(), skipinitialspace=True):
+            parts = [p.strip() for p in parts]
             if len(parts) >= 2:
                 parsed_index = _parse_optional_int(parts[0])
                 if parsed_index is not None:
                     uuid_to_idx[parts[1]] = parsed_index
 
-        if not proc_raw.strip():
-            lines.append(f"[{host}] no GPU compute processes running")
-            continue
-
-        lines.append(f"[{host}]")
-        for row in proc_raw.strip().splitlines():
-            parts = [p.strip() for p in row.split(",")]
-            if len(parts) < 4:
+        processes = {}
+        malformed = False
+        for parts in csv.reader(proc_raw.splitlines(), skipinitialspace=True):
+            parts = [p.strip() for p in parts]
+            if not parts:
                 continue
-            pid, gpu_uuid, mem_mib, proc_name = parts[0], parts[1], parts[2], parts[3]
-            gpu_idx = uuid_to_idx.get(gpu_uuid, "?")
+            if (len(parts) < 4 or not parts[0].isascii() or not parts[0].isdecimal()
+                    or int(parts[0]) <= 0):
+                malformed = True
+                continue
+            pid, gpu_uuid, mem_mib, proc_name = int(parts[0]), parts[1], parts[2], parts[3]
+            processes[(pid, gpu_uuid)] = {'pid': pid, 'gpu_uuid': gpu_uuid, 'memory': mem_mib,
+                'name': proc_name, 'role': 'mps-server' if Path(proc_name).name == 'nvidia-cuda-mps-server' else 'cuda'}
 
-            # Get the owning user and full command via ps
-            ps_raw = _host_run(host, f"ps -p {pid} -o user=,args=")
-            if ps_raw:
-                ps_parts = ps_raw.split(None, 1)
-                owner = ps_parts[0] if ps_parts else "?"
-                cmd = ps_parts[1] if len(ps_parts) > 1 else proc_name
-            else:
-                owner = "?"
-                cmd = proc_name
+        server_pids = sorted({p['pid'] for p in processes.values() if p['role'] == 'mps-server'})
+        notes = []
+        mps_membership_unknown = False
+        if server_pids:
+            source = Path(gpu_mcp_mps_inspection.__file__).read_text()
+            command = shlex.join([PYTHON, '-I', '-c', source, json.dumps(server_pids)])
+            raw = _host_run(target_host, command, user=ssh_user, timeout=15)
+            try:
+                reports = json.loads(raw)['servers']
+                if (not isinstance(reports, list)
+                        or any(not isinstance(r, dict) or type(r.get('pid')) is not int for r in reports)
+                        or {r['pid'] for r in reports} != set(server_pids)
+                        or len(reports) != len(server_pids)):
+                    raise ValueError('incomplete MPS probe response')
+            except (TypeError, ValueError, KeyError):
+                reports = [{'pid': pid, 'error': 'MPS inspection probe failed or returned invalid data'} for pid in server_pids]
+            for report in reports:
+                server_pid = report['pid']
+                if report.get('error'):
+                    mps_membership_unknown = True
+                    notes.append(f"MPS server PID {server_pid}: client information unavailable ({report['error']})")
+                    continue
+                server_gpus = {p['gpu_uuid'] for p in processes.values()
+                               if p['pid'] == server_pid and p['role'] == 'mps-server'}
+                clients = report.get('clients')
+                if not isinstance(clients, list):
+                    mps_membership_unknown = True
+                    notes.append(f'MPS server PID {server_pid}: client information unavailable (invalid response)')
+                    continue
+                if not clients:
+                    notes.append(f'MPS server PID {server_pid}: no attached clients at inspection time')
+                for client in clients:
+                    pid = client.get('pid') if isinstance(client, dict) else None
+                    prefixes = client.get('gpu_uuid_prefixes', []) if isinstance(client, dict) else None
+                    if (type(pid) is not int or pid <= 0 or not isinstance(prefixes, list)
+                            or any(not isinstance(prefix, str) or not prefix.startswith(('GPU-', 'MIG-')) for prefix in prefixes)):
+                        mps_membership_unknown = True
+                        notes.append(f'MPS server PID {server_pid}: invalid client PID; client information incomplete')
+                        continue
+                    # Modern drivers may also report the client directly. Keep
+                    # those measured rows and never copy server memory to a client.
+                    direct = [p for p in processes.values() if p['pid'] == pid]
+                    for process in direct:
+                        process.update(role='mps-client', mps_server_pid=server_pid)
+                    mapped = set()
+                    for prefix in prefixes:
+                        matches = [uuid for uuid in uuid_to_idx if uuid.startswith(prefix)]
+                        if len(matches) == 1:
+                            mapped.add(matches[0])
+                    if not mapped and not direct:
+                        mapped = {None}
+                        gpu_indices = ', '.join(str(uuid_to_idx.get(uuid, '?')) for uuid in sorted(server_gpus))
+                        notes.append(f'MPS client PID {pid}: per-client GPU unavailable; server PID {server_pid} observed on GPU(s) {gpu_indices}')
+                    for gpu_uuid in mapped:
+                        processes.setdefault((pid, gpu_uuid), {'pid': pid, 'gpu_uuid': gpu_uuid,
+                            'memory': 'N/A', 'name': '(process exited or command unavailable)',
+                            'role': 'mps-client', 'mps_server_pid': server_pid})
 
+        lines.append(f'[{host}]')
+        owners = {}
+        shown = 0
+        for process in processes.values():
+            pid = process['pid']
+            if pid not in owners:
+                ps_raw = _host_run(target_host, f'ps -p {pid} -o user:64=,args=', user=ssh_user)
+                parts = ps_raw.split(None, 1) if ps_raw else []
+                owners[pid] = (parts[0] if parts else '?', parts[1] if len(parts) > 1 else None)
+            owner, cmd = owners[pid]
             if user_filter and owner != user_filter:
+                if owner == '?':
+                    notes.append(f'PID {pid}: owner unavailable; could not apply user filter')
                 continue
+            gpu_idx = uuid_to_idx.get(process['gpu_uuid'], '?')
+            memory = process['memory']
+            memory_text = f'{memory} MiB' if _parse_optional_int(memory) is not None else 'unavailable'
+            role = process['role']
+            if role == 'cuda' and mps_membership_unknown:
+                role += ' (MPS membership unknown)'
+            if process.get('mps_server_pid'):
+                role += f" (server PID {process['mps_server_pid']})"
+            cmd = ' '.join((cmd or process['name']).splitlines())[:2000]
 
             lines.append(
-                f"  GPU {gpu_idx} | PID {pid} | user={owner} | mem={mem_mib} MiB | {cmd}"
+                f"  GPU {gpu_idx} | PID {pid} | user={owner} | mem={memory_text} | role={role} | {cmd}"
             )
+            shown += 1
+        if malformed:
+            notes.append('Malformed GPU process rows were skipped; process information is incomplete')
+        if not shown:
+            lines.append('  No matching GPU processes found.' if processes or malformed else '  no GPU compute processes running')
+        lines.extend(f'  {note}' for note in dict.fromkeys(notes))
 
     return "\n".join(lines) if lines else "No matching GPU processes found."
 

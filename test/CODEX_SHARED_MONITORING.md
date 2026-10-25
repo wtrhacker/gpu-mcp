@@ -13,7 +13,8 @@ fixtures or required inputs to this suite.
 | Test file | What it establishes |
 | --- | --- |
 | `test_gpu_mcp_codex_state.py` | Native identity, immutable ownership, GPU/CPU result-event transactions, injected event-write failure, restart persistence, attempt conflicts and per-job locks. |
-| `test_gpu_mcp_codex_shared.py` | Real server tools with controlled process facts: foreign reads/mutations, listings, smoke/PID boundaries, fixed stale timing, quiet checks, result-before-release, CPU builds, concurrency, policy drift and scoped alerts. |
+| `test_gpu_mcp_codex_shared.py` | Real server tools with controlled process facts: foreign managed reads/mutations, read-only cluster inspection without enrollment or control, listings, smoke/PID boundaries, fixed stale timing, quiet checks, result-before-release, CPU builds, concurrency, policy drift and scoped alerts. |
+| `test_gpu_mcp_process_inspection.py` | Ordinary and external MPS process discovery, read-only control commands, private endpoints, user/host filters, client/device attribution, measured memory and explicit unavailable information. |
 | `test_gpu_mcp_restart_recovery.py` | Fresh server imports with old completed GPU jobs: direct/shared status, automatic owner recovery, cached results, missing/replaced bookings, fresh/alive/uncertain reservations, transaction failures, locked identity races and a new booking's heartbeat after recovery. |
 | `test_gpu_mcp_remote_outcomes.py` | Independent producer/control filesystem views, bounded execution-host reads, result identity checks, unavailable replies, regular-file constraints, retries after alert grace and current process diagnostics. |
 | `test_gpu_mcp_codex_delivery.py` | Queued delivery shape, archived/unloaded threads, acknowledgement reconciliation, private success/visible failure instructions and display adaptation. |

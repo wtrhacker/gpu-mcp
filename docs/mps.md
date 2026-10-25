@@ -1,5 +1,12 @@
 # Managed MPS sweeps
 
+For a read-only view of existing MPS work, including jobs launched by an external
+human-managed queue, use `check_gpu_processes(hosts=[...], user_filter="")`.
+It identifies MPS services and accessible protocol-2 clients with owners,
+commands and GPU assignments. Missing information is reported explicitly.
+This inspection requires no knowledge of the external queue and grants no control
+over it. The launch and management API below applies to GPU MCP's own sweeps.
+
 MPS lets independent CUDA processes share one reserved GPU. GPU MCP starts the
 declared runs, limits how many run together, and keeps their logs and outcomes
 separate. A normal Python failure affects that run; healthy siblings continue.

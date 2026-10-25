@@ -12,6 +12,8 @@ Amended on 2026-10-09: normal polling results reach the owner privately, pending
 idle updates are combined, and transient verification has a ten-second alert grace.
 Amended on 2026-10-11: tmux/Byobu receives a foreground-Codex shortcut so existing
 panes do not depend on inherited editor variables.
+Amended on 2026-10-25: restore read-only cluster process inspection, including
+external MPS clients, separately from managed-job access and automatic monitoring.
 
 An isolated live probe against Codex CLI and app-server 0.160.1 demonstrated
 shared HTTP MCP access, native caller identity, private model context, and
@@ -48,7 +50,8 @@ available separately from this conversation.
 ## Decision
 
 Use one job-owning GPU MCP backend per repository through the Codex app-server
-integration. Keep each session's jobs private to that session. Perform routine
+integration. Keep managed-job access and notifications scoped to the originating
+session. Preserve explicit read-only cluster process inspection. Perform routine
 checks in backend code, deliver useful events to the originating session, and
 provide an optional human monitor over the same saved job information.
 
@@ -150,18 +153,24 @@ metadata. Record it as the job's originating thread in service-owned persistent
 state. The probe also observed `sessionId` and `windowId`; those fields are
 useful context but do not replace the actual thread identity for authorization.
 
-Every agent-facing job operation must enforce the same origin check before
+Every agent-facing managed-job operation must enforce the same origin check before
 returning information or changing state. This includes listing, status, logs,
 artifacts, progress, smoke evidence, stop, retry, finish, and timing updates.
-Knowing another job's ID must not grant inspection. A new or forked conversation
+Knowing another job's ID must not grant managed-job access. A new or forked conversation
 does not acquire another thread's jobs merely by sharing its repo or history.
 Resuming the same originating thread retains its association.
 
-Agent-visible resource reports may indicate that a GPU is unavailable without
-disclosing another session's job IDs, process details, logs, or output paths.
-Apply this boundary to all tools that could reveal managed-job information,
-not only `manage_gpu_job`. Policy recovery remains subject to its existing
-approval rules.
+There are three distinct layers: cluster inspection, managed-job operations,
+and automatic monitoring. `cluster_info` and `check_gpus` report shared resource
+facts. `check_gpu_processes` provides read-only process details across conversations
+and repositories on approved hosts, including work launched outside GPU MCP.
+It reports process owners, commands, GPU assignments, CUDA/MPS roles and available
+memory measurements. MPS discovery uses NVIDIA's read-only protocol-2 interface,
+not external queue state; unavailable details remain explicit. This visibility
+does not grant managed-job access, change reservations or enroll external jobs
+in monitoring. Managed records, logs, artifacts and lifecycle operations retain
+origin checks; automatic checks and events retain their owner routing. Policy
+recovery remains subject to its existing approval rules.
 
 Origin identity must come from the trusted Codex integration, not a
 model-supplied tool argument or an unrestricted HTTP client's assertion.
@@ -444,7 +453,8 @@ to release an unproven GPU or retry over a live process.
 Implement incrementally within the Codex path:
 
 1. Capture authoritative origin identity and enforce it on every agent-facing
-   read and mutation. Establish explicit handling of legacy jobs with no origin.
+   managed-job read and mutation. Keep cluster process inspection read-only.
+   Establish explicit handling of legacy jobs with no origin.
 2. Add automatic shared-backend startup/reconnect and internal scheduled checks,
    retaining the reservation protocol and existing lifecycle implementations.
 3. Persist owner events and integrate private delivery, concise diagnostics, and
@@ -458,10 +468,13 @@ Required acceptance evidence includes:
 - Two simultaneous sessions in one repo automatically reach one job-owning
   backend; different repos retain their policies and coordinate GPU claims
   through the shared registry. Users perform no manual server startup.
-- Own-job operations succeed; foreign-job operations reveal no job details,
-  including ID guesses, listings, smoke references, process queries, retries,
+- Own-job operations succeed; foreign managed-job operations reveal no saved job details,
+  including ID guesses, listings, smoke references, retries,
   log/artifact reads, and forged caller fields. Verify new, resumed, forked,
   and delegated threads rather than assuming their IDs are interchangeable.
+- Explicit cluster process inspection includes other sessions and external MPS
+  clients without changing job access, reservations, monitoring or notifications.
+  Verify approved-host/user filters and partial inspection failures.
 - Opening/closing sessions and the monitor does not lose active leases or
   notification state. Backend death, restart, policy drift, missing identity,
   and unsupported daemon versions produce bounded, actionable behavior.
@@ -492,8 +505,9 @@ Required acceptance evidence includes:
   recipient and ordinary notification behavior.
 - Shortening every agent-issued polling response leaves visible tool activity
   and repeated model work. Use backend checks and event delivery instead.
-- Sharing the backend while exposing every repo job to every agent violates
-  session isolation. Reserve repo-wide inspection for the human viewer.
+- Exposing all saved managed jobs and logs to every agent would violate their
+  ownership boundary. The human viewer retains that broader saved-state view;
+  agents can explicitly inspect cluster process facts through `check_gpu_processes`.
 - Adopting the full Scientific Workflow runtime would replace substantially
   more execution infrastructure than this monitoring interface requires.
 - Requiring manual HTTP startup would violate the normal session-opening flow.

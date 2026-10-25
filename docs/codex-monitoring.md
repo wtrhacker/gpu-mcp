@@ -1,7 +1,8 @@
 # Shared Codex jobs and monitoring
 
 Several Codex conversations can use GPU MCP in one repository. They connect to
-one backend, and each conversation sees and manages only the jobs it launched.
+one backend, and managed-job access belongs to the conversation that launched
+the job. Read-only cluster process inspection remains available across repositories.
 The backend checks jobs quietly. Completion reaches the originating conversation;
 failures produce a concise alert there. See [ADR 0008](../ADR/0008-shared-codex-server-and-quiet-monitoring.md).
 
@@ -144,6 +145,7 @@ and arguments already come from saved launch metadata.
 
 | Request | Result |
 | --- | --- |
+| `check_gpu_processes(hosts=[...], user_filter="")` | Read-only GPU process inspection on approved hosts across conversations and repositories, including externally launched MPS clients. Empty user filter includes all users. |
 | `list_gpu_jobs()` | This conversation's running and completed jobs, including CPU builds. |
 | `manage_gpu_job(job_id=...)` | Concise status and output pointer. |
 | `manage_gpu_job(job_id=..., detail="full")` | Saved job and process/lease diagnostics; an early response remains a local read. |
@@ -154,10 +156,23 @@ and arguments already come from saved launch metadata.
 
 Stop, retry, finish and checking-time updates keep their existing process proof
 and policy gates. Foreign job IDs, reservation keys, smoke references and PIDs
-grant no inspection. `list_gpu_reservations(scope="all")` still returns only the
+grant no access to managed records, logs or control. `list_gpu_reservations(scope="all")` still returns only the
 calling conversation's jobs. `check_gpus` reports physical availability without
-foreign job details. In this integration, use an owned job's detailed status
-instead of the repo-wide `check_gpu_processes` tool.
+foreign managed-job details.
+
+`check_gpu_processes` is the explicit exception for cluster process visibility:
+it reports owners, commands, GPU assignments, CUDA/MPS roles and available memory
+measurements even when a process belongs to another conversation, repository or
+external manager. Its default user filter is `GPU_MCP_USER`. Inspection uses only
+approved hosts and ordinary OS permissions; the processes need no MCP job record
+or approved script path. It does not read external queue files, grant job control,
+change reservations or enroll processes in automatic monitoring.
+
+MPS protocol-2 discovery uses NVIDIA's read-only server/client listings and
+process information. Services and clients are separate rows. Unavailable client
+details, ambiguous device assignments and unmeasured client memory remain explicit;
+server memory is never copied onto each client. External managers such as
+`mps-manager` remain human managed.
 
 [Managed MPS sweeps](mps.md) use the same ownership and quiet monitoring.
 Counts summarize the parent; `case_id` selects a run for status, logs, stop or

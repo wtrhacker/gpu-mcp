@@ -193,9 +193,6 @@ class CodexRuntime:
                     arguments["job_id"] = record["job_id"]
                     with self.operation(record):
                         result = function(**arguments)
-                elif name == "check_gpu_processes":
-                    return json.dumps({"status": "refused", "reason":
-                        "Inspect this session's jobs with manage_gpu_job(detail='full')."})
                 elif name == "kill_gpu_process":
                     pid, host = arguments.get("pid"), arguments.get("host")
                     own = [r for r in self.records() if r.get("remote_pid") == pid and
